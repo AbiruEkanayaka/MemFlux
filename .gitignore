@@ -1,0 +1,15 @@
+/target
+MemFlux
+memflux.wal
+memflux.snapshot
+Cargo.lock
+
+# Random files used in dev
+a.py
+.env
+/idk
+*/__pycache__
+x.sh
+r.md
+s.md
+x.py
