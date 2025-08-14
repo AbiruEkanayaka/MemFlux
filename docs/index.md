@@ -1,0 +1,96 @@
+# MemFlux Documentation
+
+Welcome to the official documentation for MemFlux, a high-performance, in-memory database inspired by Redis, but with the added power of a feature-rich SQL query engine for JSON data.
+
+## Overview
+
+MemFlux is designed to provide the speed and versatility of a key-value store with the structured query capabilities of a traditional database. It uses the RESP protocol for standard commands, making it compatible with many Redis clients, while also offering a powerful SQL interface for complex queries on schemaless JSON objects.
+
+Persistence is built-in, with a Write-Ahead Log (WAL) for durability and automatic snapshotting for fast recovery.
+
+## Core Features
+
+*   **Multi-Data Model:** Supports raw bytes, lists (deque), sets, and complex JSON documents as values.
+*   **Redis-like API:** Implements a subset of common Redis commands (e.g., `SET`, `GET`, `LPUSH`, `SADD`) over the RESP protocol.
+*   **Powerful SQL Engine:** A custom-built SQL query engine allows for complex queries on JSON data, including:
+    *   DDL: `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE` to define virtual schemas.
+    *   DML: `INSERT`, `UPDATE`, `DELETE` statements.
+    *   Advanced `SELECT`: `JOIN`s, aggregates (`COUNT`, `SUM`, `AVG`), `GROUP BY`, `ORDER BY`, `LIMIT`, subqueries, and `CASE` expressions.
+*   **JSON Indexing:** Create indexes on specific JSON fields to accelerate query performance.
+*   **Durable Persistence:** Uses a Write-Ahead Log (WAL) for command logging and automatic background snapshotting to ensure data safety and fast restarts.
+*   **Built-in Functions:** A library of SQL functions for string manipulation, numeric operations, and date/time processing.
+
+## Getting Started
+
+### Running the Server
+
+The server is a single binary built from the Rust source code.
+
+1.  **Build the project:**
+    ```sh
+    cargo build --release
+    ```
+2.  **Run the server:**
+    ```sh
+    ./target/release/memflux
+    ```
+
+By default, the server listens on `127.0.0.1:6380`.
+
+### Interacting with MemFlux
+
+You can interact with MemFlux using any RESP-compliant client or the provided Python test client.
+
+**Interactive CLI:**
+
+The `test.py` script can be used as an interactive client for sending commands.
+
+1.  **Run the client in interactive mode:**
+    ```sh
+    python3 test.py
+    ```
+2.  **Enter commands at the prompt:**
+    ```
+    > SET mykey "hello world"
+    +OK
+    Send: 0.04ms, Latency: 0.13ms, Total: 0.17ms
+    > GET mykey
+    $11
+    hello world
+    Send: 0.02ms, Latency: 0.07ms, Total: 0.09ms
+    > SQL SELECT * FROM user WHERE age > 30
+    *1
+    $48
+    {"age":35,"city":"SF","id":"5","name":"Carol"}
+    Send: 0.04ms, Latency: 0.41ms, Total: 0.45ms
+    ```
+
+**Running Tests & Benchmarks:**
+
+The `test.py` script is also the entry point for running unit tests and benchmarks.
+
+*   **Run all unit tests:**
+    ```sh
+    python3 test.py unit all
+    ```
+*   **Run a specific test suite (e.g., SQL tests):**
+    ```sh
+    python3 test.py unit sql
+    ```
+*   **Run a benchmark:**
+    ```sh
+    # Run a command 10,000 times
+    python3 test.py bench 10000 SET foo bar
+
+    # Benchmark operations/second for 10 seconds
+    python3 test.py bench-ops 10 LPUSH mylist item
+    ```
+
+## Documentation Structure
+
+This documentation is organized into the following sections:
+
+*   **[Commands](./commands.md):** Detailed reference for all non-SQL, Redis-style commands.
+*   **[SQL Reference](./sql.md):** An introduction to the SQL engine and links to detailed sections.
+*   **[Persistence](./persistence.md):** An explanation of how data durability is achieved through WAL and snapshots.
+*   **[Indexing](./indexing.md):** Guide to creating and using indexes for JSON data.
