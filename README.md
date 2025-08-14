@@ -173,6 +173,19 @@ $29
 {"user.name":"Bob","orders.item":"Mouse"}
 ```
 
+## Full Documentation
+
+While this README provides a quick start, the complete documentation contains a detailed reference for every command, SQL feature, and internal system.
+
+**[---> Start with the Documentation Index](./docs/index.md) <---**
+
+Key sections include:
+
+*   **[Commands](./docs/commands.md):** Detailed reference for all non-SQL, Redis-style commands.
+*   **[SQL Reference](./docs/sql.md):** An introduction to the SQL engine and links to detailed sections.
+*   **[Persistence](./docs/persistence.md):** An explanation of how data durability is achieved through WAL and snapshots.
+*   **[Indexing](./docs/indexing.md):** Guide to creating and using indexes for JSON data.
+
 ## How It Works (A Basic Overview)
 
 > **Note:** This is a simplified explanation of an alpha-stage project. The implementation details are subject to change.
