@@ -138,6 +138,7 @@ pub struct Command {
 
 pub enum Response {
     Ok,
+    SimpleString(String),
     Bytes(Vec<u8>),
     MultiBytes(Vec<Vec<u8>>),
     Integer(i64),
@@ -149,12 +150,14 @@ impl Response {
     pub fn into_protocol_format(self) -> Vec<u8> {
         match self {
             Response::Ok => b"+OK\r\n".to_vec(),
+            Response::SimpleString(s) => format!("+{}\r\n", s).into_bytes(),
             Response::Bytes(b) => {
                 let mut response = format!("${}\r\n", b.len()).into_bytes();
                 response.extend_from_slice(&b);
                 response.extend_from_slice(b"\r\n");
                 response
             }
+
             Response::MultiBytes(vals) => {
                 let mut response = format!("*{}\r\n", vals.len()).into_bytes();
                 for v in vals {

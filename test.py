@@ -15,6 +15,12 @@ from tests.test_subqueries import test_subqueries
 from tests.test_union import test_union
 from tests.test_functions import test_string_functions, test_numeric_functions, test_datetime_functions, test_cast_function
 from tests.benchmark import benchmark, benchmark_ops_sec
+from tests.test_advanced_commands import test_advanced_commands
+from tests.test_sql_operators import test_sql_comparison_operators
+from tests.test_indexing import test_index_maintenance
+from tests.test_recovery import test_recovery
+from tests.test_wrongtype_errors import test_wrongtype_errors
+
 
 # Add prompt_toolkit for better interactive input
 try:
@@ -23,6 +29,7 @@ except ImportError:
     PromptSession = None
 
 def unit_test(sock, reader, mode):
+    # Existing tests
     if mode in ("byte", "all"):
         test_byte(sock, reader)
     if mode in ("json", "all"):
@@ -54,6 +61,21 @@ def unit_test(sock, reader, mode):
         test_numeric_functions(sock, reader)
         test_datetime_functions(sock, reader)
         test_cast_function(sock, reader)
+    
+    # New tests
+    if mode in ("advanced", "all"):
+        test_advanced_commands(sock, reader)
+    if mode in ("operators", "all"):
+        test_sql_comparison_operators(sock, reader)
+    if mode in ("indexing", "all"):
+        test_index_maintenance(sock, reader)
+    if mode in ("recovery"): # Special case, requires restart
+        # This test returns new socket and reader objects
+        return test_recovery(sock, reader)
+    if mode in ("wrongtype", "all"):
+        test_wrongtype_errors(sock, reader)
+    
+    return sock, reader
 
 
 if __name__ == "__main__":
@@ -96,9 +118,9 @@ if __name__ == "__main__":
                 benchmark_ops_sec(sock, reader, parts, duration, pipeline_size)
             elif sys.argv[1] == "unit":
                 if len(sys.argv) < 3:
-                    print("Usage: python run_tests.py unit {json,byte,lists,sets,sql,snapshot,types,schema,aliases,case,like,functions,union,all}")
+                    print("Usage: python test.py unit {json,byte,lists,sets,sql,snapshot,types,schema,aliases,case,like,functions,union,advanced,operators,indexing,recovery,wrongtype,all}")
                     sys.exit(1)
-                unit_test(sock, reader, sys.argv[2].lower())
+                sock, reader = unit_test(sock, reader, sys.argv[2].lower())
 
         else:
             print("Enter commands (e.g. SET user:123 '{\"profile\":{\"name\":\"Jane Doe\"}}'):")

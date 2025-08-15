@@ -115,6 +115,35 @@ def test_schema_validation_and_sorting(sock, reader):
     send(["DELETE", "schema_test:2"])
     send(["DELETE", "schema_test:3"])
     send(["DELETE", "schema_test:4"])
+
+    # --- 5. Type-Aware Sorting for Timestamps ---
+    print("\n-- Phase 5: Type-Aware Sorting for Timestamps --")
+    send(["SQL", "DROP", "TABLE", "timestamp_test"])
+    resp = send(["SQL", "CREATE", "TABLE", "timestamp_test", "(id INTEGER, event_time TIMESTAMP)"])
+    assert_eq(resp, "+OK", "CREATE TABLE timestamp_test")
+
+    # Insert timestamps that are not in lexicographical order
+    send(["SQL", "INSERT", "INTO", "timestamp_test", "(id, event_time)", "VALUES", "(1, '2024-01-10T12:00:00Z')"])
+    send(["SQL", "INSERT", "INTO", "timestamp_test", "(id, event_time)", "VALUES", "(2, '2023-12-25T10:00:00Z')"])
+    send(["SQL", "INSERT", "INTO", "timestamp_test", "(id, event_time)", "VALUES", "(3, '2024-02-01T09:00:00Z')"])
+
+    # Sort ASC
+    results_asc = send_and_parse(["SQL", "SELECT", "event_time", "FROM", "timestamp_test", "ORDER", "BY", "event_time", "ASC"], "ORDER BY event_time ASC")
+    times_asc = get_column(results_asc, 'event_time')
+    expected_asc = ['2023-12-25T10:00:00Z', '2024-01-10T12:00:00Z', '2024-02-01T09:00:00Z']
+    assert_eq(times_asc, expected_asc, "ORDER BY event_time ASC should be chronological")
+
+    # Sort DESC
+    results_desc = send_and_parse(["SQL", "SELECT", "event_time", "FROM", "timestamp_test", "ORDER", "BY", "event_time", "DESC"], "ORDER BY event_time DESC")
+    times_desc = get_column(results_desc, 'event_time')
+    expected_desc = ['2024-02-01T09:00:00Z', '2024-01-10T12:00:00Z', '2023-12-25T10:00:00Z']
+    assert_eq(times_desc, expected_desc, "ORDER BY event_time DESC should be chronological")
+
+    # Cleanup
+    send(["SQL", "DROP", "TABLE", "timestamp_test"])
+    send(["DELETE", "timestamp_test:1", "timestamp_test:2", "timestamp_test:3"])
+    print("[PASS] Timestamp sorting tests complete")
+
     print("[PASS] Schema tests complete")
 
 

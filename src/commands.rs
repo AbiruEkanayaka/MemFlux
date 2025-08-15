@@ -34,7 +34,7 @@ macro_rules! log_and_wait {
 
 pub async fn process_command(command: Command, ctx: &AppContext) -> Response {
     match command.name.as_str() {
-        "PING" => Response::Bytes(b"PONG".to_vec()),
+        "PING" => Response::SimpleString("PONG".to_string()),
         "GET" => handle_get(command, ctx).await,
         "SET" => handle_set(command, ctx).await,
         "DELETE" => handle_delete(command, ctx).await,
@@ -899,13 +899,24 @@ async fn handle_idx_drop(command: Command, ctx: &AppContext) -> Response {
     };
 
     let mut found_key: Option<String> = None;
-    if let Some(item) = ctx
-        .index_manager
-        .indexes
-        .iter()
-        .find(|item| item.key().starts_with(&format!("{}|", index_name_to_drop)))
-    {
-        found_key = Some(item.key().clone());
+    for item in ctx.index_manager.indexes.iter() {
+        let internal_name = item.key();
+        let parts: Vec<&str> = internal_name.splitn(2, '|').collect();
+        if parts.len() == 2 {
+            let key_prefix = parts[0];
+            let json_path = parts[1];
+
+            let fabricated_name = format!(
+                "{}_{}",
+                key_prefix.trim_end_matches('*'),
+                json_path.replace('.', "_")
+            );
+
+            if fabricated_name == index_name_to_drop {
+                found_key = Some(internal_name.clone());
+                break;
+            }
+        }
     }
 
     if let Some(key) = found_key {
