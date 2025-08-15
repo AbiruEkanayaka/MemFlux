@@ -35,6 +35,7 @@ macro_rules! log_and_wait {
 pub async fn process_command(command: Command, ctx: &AppContext) -> Response {
     match command.name.as_str() {
         "PING" => Response::SimpleString("PONG".to_string()),
+        "AUTH" => Response::Error("AUTH can only be used as the first command.".to_string()),
         "GET" => handle_get(command, ctx).await,
         "SET" => handle_set(command, ctx).await,
         "DELETE" => handle_delete(command, ctx).await,

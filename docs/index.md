@@ -35,7 +35,7 @@ The server is a single binary built from the Rust source code.
     ./target/release/memflux
     ```
 
-By default, the server listens on `127.0.0.1:6380`.
+By default, the server listens on `127.0.0.1:8360`.
 
 ### Interacting with MemFlux
 

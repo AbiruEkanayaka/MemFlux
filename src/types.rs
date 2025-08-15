@@ -8,6 +8,7 @@ use std::fmt;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, RwLock};
 
+use crate::config::Config;
 use crate::indexing::IndexManager;
 use crate::schema::VirtualSchema;
 
@@ -129,6 +130,7 @@ pub struct AppContext {
     pub json_cache: JsonCache,
     pub schema_cache: SchemaCache,
     pub function_registry: Arc<FunctionRegistry>,
+    pub config: Arc<Config>,
 }
 
 pub struct Command {

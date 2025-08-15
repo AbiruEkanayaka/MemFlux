@@ -60,7 +60,7 @@ MemFlux is an experimental, high-performance, in-memory, multi-model database se
     ```sh
     cargo run --release
     ```
-The server will start and listen on `127.0.0.1:6380`.
+The server will start and listen on `127.0.0.1:8360`.
 
 ### Connecting to the Server
 

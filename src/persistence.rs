@@ -6,25 +6,27 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::commands::{apply_json_delete_to_db, apply_json_set_to_db};
+use crate::config::Config;
 use crate::types::*;
-
-const SNAPSHOT_TEMP_FILE: &str = "memflux.snapshot.tmp";
-const WAL_SIZE_THRESHOLD: u64 = 16 * 1024 * 1024; // 16 MB
 
 pub struct PersistenceEngine {
     receiver: mpsc::Receiver<LogRequest>,
     wal_path: String,
     snapshot_path: String,
+    snapshot_temp_path: String,
+    wal_size_threshold_bytes: u64,
     db: Db,
 }
 
 impl PersistenceEngine {
-    pub fn new(wal_path: &str, snapshot_path: &str, db: Db) -> (Self, Logger) {
+    pub fn new(config: &Config, db: Db) -> (Self, Logger) {
         let (tx, rx) = mpsc::channel(1024);
         let engine = PersistenceEngine {
             receiver: rx,
-            wal_path: wal_path.to_string(),
-            snapshot_path: snapshot_path.to_string(),
+            wal_path: config.wal_file.clone(),
+            snapshot_path: config.snapshot_file.clone(),
+            snapshot_temp_path: config.snapshot_temp_file.clone(),
+            wal_size_threshold_bytes: config.wal_size_threshold_mb * 1024 * 1024,
             db,
         };
         (engine, tx)
@@ -48,7 +50,7 @@ impl PersistenceEngine {
             .create(true)
             .write(true)
             .truncate(true)
-            .open(SNAPSHOT_TEMP_FILE)
+            .open(&self.snapshot_temp_path)
             .await?;
         let mut writer = tokio::io::BufWriter::new(&mut temp_file);
 
@@ -65,7 +67,7 @@ impl PersistenceEngine {
         writer.flush().await?;
         temp_file.sync_all().await?;
         drop(temp_file);
-        tokio::fs::rename(SNAPSHOT_TEMP_FILE, self.snapshot_path.as_str()).await?;
+        tokio::fs::rename(&self.snapshot_temp_path, &self.snapshot_path).await?;
         Ok(())
     }
 
@@ -112,7 +114,7 @@ impl PersistenceEngine {
                     write_result_for_ack.unwrap_err()
                 );
             }
-            if file.metadata().await?.len() > WAL_SIZE_THRESHOLD {
+            if file.metadata().await?.len() > self.wal_size_threshold_bytes {
                 println!("WAL size exceeds threshold. Triggering snapshot and compaction...");
                 file.sync_all().await?;
                 fsync_task.abort();
@@ -133,6 +135,7 @@ impl PersistenceEngine {
         Ok(())
     }
 }
+
 
 pub async fn load_db_from_disk(snapshot_path: &str, wal_path: &str) -> Result<Db> {
     let db: Db = std::sync::Arc::new(dashmap::DashMap::new());

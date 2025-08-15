@@ -74,7 +74,7 @@ def test_recovery(sock, reader):
     # Wait for server to come back online
     while True:
         try:
-            sock = socket.create_connection(("127.0.0.1", 6380), timeout=1)
+            sock = socket.create_connection(("127.0.0.1", 8360), timeout=1)
             reader = sock.makefile('rb')
             print("\n[INFO] Reconnected to server. Proceeding with verification...")
             break

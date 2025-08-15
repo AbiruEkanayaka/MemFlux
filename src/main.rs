@@ -6,6 +6,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::io::AsyncWriteExt;
 
 mod commands;
+mod config;
 mod indexing;
 mod persistence;
 mod protocol;
@@ -13,6 +14,7 @@ mod query_engine;
 mod schema;
 mod types;
 
+use config::Config;
 use indexing::IndexManager;
 use persistence::{load_db_from_disk, PersistenceEngine};
 use protocol::parse_command_from_stream;
@@ -20,17 +22,17 @@ use query_engine::functions;
 use schema::load_schemas_from_db;
 use types::{AppContext, FunctionRegistry, Response};
 
-const WAL_FILE: &str = "memflux.wal";
-const SNAPSHOT_FILE: &str = "memflux.snapshot";
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 1. Load DB state from disk (snapshot then WAL)
-    let db = load_db_from_disk(SNAPSHOT_FILE, WAL_FILE).await?;
+    // 1. Load configuration
+    let config = Arc::new(Config::load("config.json")?);
+
+    // 2. Load DB state from disk (snapshot then WAL)
+    let db = load_db_from_disk(&config.snapshot_file, &config.wal_file).await?;
     println!("Database loaded with {} top-level keys.", db.len());
 
-    // 2. Set up the persistence engine
-    let (persistence_engine, logger) = PersistenceEngine::new(WAL_FILE, SNAPSHOT_FILE, db.clone());
+    // 3. Set up the persistence engine
+    let (persistence_engine, logger) = PersistenceEngine::new(&config, db.clone());
     tokio::spawn(async move {
         if let Err(e) = persistence_engine.run().await {
             eprintln!("Fatal error in persistence engine: {}", e);
@@ -38,7 +40,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    // 3. Load virtual schemas
+    // 4. Load virtual schemas
     let schema_cache = Arc::new(DashMap::new());
     if let Err(e) = load_schemas_from_db(&db, &schema_cache).await {
         eprintln!(
@@ -51,7 +53,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 4. Set up the Application Context
+    // 5. Set up the Application Context
     let index_manager = Arc::new(IndexManager::default());
     let json_cache = Arc::new(DashMap::new());
     let mut function_registry = FunctionRegistry::new();
@@ -66,11 +68,13 @@ async fn main() -> Result<()> {
         json_cache,
         schema_cache,
         function_registry,
+        config: config.clone(),
     });
 
-    // 5. Start the server
-    let listener = TcpListener::bind("127.0.0.1:6380").await?;
-    println!("MemFlux (RESP Protocol) listening on 127.0.0.1:6380");
+    // 6. Start the server
+    let addr = format!("{}:{}", config.host, config.port);
+    let listener = TcpListener::bind(&addr).await?;
+    println!("MemFlux (RESP Protocol) listening on {}", addr);
     loop {
         let (stream, _) = listener.accept().await?;
         let context_clone = app_context.clone();
@@ -90,9 +94,29 @@ async fn main() -> Result<()> {
 async fn handle_connection(mut stream: TcpStream, ctx: Arc<AppContext>) -> Result<()> {
     let (reader, mut writer) = stream.split();
     let mut buf_reader = BufReader::new(reader);
+    let mut authenticated = ctx.config.requirepass.is_empty();
+
     loop {
         match parse_command_from_stream(&mut buf_reader).await {
             Ok(Some(command)) => {
+                if !authenticated {
+                    if command.name == "AUTH" {
+                        if command.args.len() == 2
+                            && String::from_utf8_lossy(&command.args[1]) == ctx.config.requirepass
+                        {
+                            authenticated = true;
+                            writer.write_all(&Response::Ok.into_protocol_format()).await?;
+                        } else {
+                            let response = Response::Error("Invalid password".to_string());
+                            writer.write_all(&response.into_protocol_format()).await?;
+                        }
+                    } else {
+                        let response = Response::Error("NOAUTH Authentication required.".to_string());
+                        writer.write_all(&response.into_protocol_format()).await?;
+                    }
+                    continue;
+                }
+
                 // Special-case SQL for streaming
                 if command.name == "SQL" {
                     // Stream SQL results row-by-row

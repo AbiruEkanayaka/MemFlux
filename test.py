@@ -80,7 +80,7 @@ def unit_test(sock, reader, mode):
 
 if __name__ == "__main__":
     host = "127.0.0.1"
-    port = 6380
+    port = 8360
     sock = None # define sock in the outer scope
     try:
         sock = socket.create_connection((host, port))
