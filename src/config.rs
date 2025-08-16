@@ -12,6 +12,19 @@ pub struct Config {
     pub snapshot_file: String,
     pub snapshot_temp_file: String,
     pub wal_size_threshold_mb: u64,
+    #[serde(default)]
+    pub encrypt: bool,
+    #[serde(default = "default_cert_file")]
+    pub cert_file: String,
+    #[serde(default = "default_key_file")]
+    pub key_file: String,
+}
+
+fn default_cert_file() -> String {
+    "memflux.crt".to_string()
+}
+fn default_key_file() -> String {
+    "memflux.key".to_string()
 }
 
 impl Default for Config {
@@ -24,6 +37,9 @@ impl Default for Config {
             snapshot_file: "memflux.snapshot".to_string(),
             snapshot_temp_file: "memflux.snapshot.tmp".to_string(),
             wal_size_threshold_mb: 16,
+            encrypt: false,
+            cert_file: default_cert_file(),
+            key_file: default_key_file(),
         }
     }
 }

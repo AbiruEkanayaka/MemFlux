@@ -1,7 +1,7 @@
 import os
 import time
 import socket
-from .common import send_resp_command, assert_eq
+from .common import send_resp_command, assert_eq, create_connection
 
 def test_recovery(sock, reader):
     def send(parts):
@@ -73,14 +73,12 @@ def test_recovery(sock, reader):
 
     # Wait for server to come back online
     while True:
-        try:
-            sock = socket.create_connection(("127.0.0.1", 8360), timeout=1)
-            reader = sock.makefile('rb')
+        sock, reader = create_connection(retry=True)
+        if sock:
             print("\n[INFO] Reconnected to server. Proceeding with verification...")
             break
-        except (ConnectionRefusedError, socket.timeout):
-            time.sleep(1)
-            print(".", end="", flush=True)
+        time.sleep(1)
+        print(".", end="", flush=True)
 
     # --- Phase 5: Verification ---
     print("\n-- Phase 5: Verifying Recovered State --")

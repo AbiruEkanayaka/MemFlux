@@ -1,9 +1,12 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use dashmap::DashMap;
+use std::fs::File;
+use std::io::BufReader as StdBufReader;
+use std::path::Path;
 use std::sync::Arc;
-use tokio::io::BufReader;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 
 mod commands;
 mod config;
@@ -21,6 +24,52 @@ use protocol::parse_command_from_stream;
 use query_engine::functions;
 use schema::load_schemas_from_db;
 use types::{AppContext, FunctionRegistry, Response};
+
+fn generate_self_signed_cert(cert_path: &str, key_path: &str) -> Result<()> {
+    println!("Generating self-signed certificate...");
+    let subject_alt_names = vec!["localhost".to_string()];
+    let cert = rcgen::generate_simple_self_signed(subject_alt_names)?;
+    std::fs::write(cert_path, cert.serialize_pem()?)?;
+    std::fs::write(key_path, cert.serialize_private_key_pem())?;
+    println!("Certificate created at: {}", cert_path);
+    println!("Key created at: {}", key_path);
+    Ok(())
+}
+
+fn load_tls_config(config: &Config) -> Result<Arc<rustls::ServerConfig>> {
+    let cert_path = &config.cert_file;
+    let key_path = &config.key_file;
+
+    if !Path::new(cert_path).exists() || !Path::new(key_path).exists() {
+        generate_self_signed_cert(cert_path, key_path)?;
+    }
+
+    let certs = {
+        let cert_file = File::open(cert_path)?;
+        let mut cert_reader = StdBufReader::new(cert_file);
+        rustls_pemfile::certs(&mut cert_reader)?
+            .into_iter()
+            .map(rustls::Certificate)
+            .collect()
+    };
+
+    let key = {
+        let key_file = File::open(key_path)?;
+        let mut key_reader = StdBufReader::new(key_file);
+        rustls_pemfile::pkcs8_private_keys(&mut key_reader)?
+            .into_iter()
+            .map(rustls::PrivateKey)
+            .next()
+            .ok_or_else(|| anyhow!("No private key found in {}", key_path))?
+    };
+
+    let tls_config = rustls::ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+
+    Ok(Arc::new(tls_config))
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -74,25 +123,57 @@ async fn main() -> Result<()> {
     // 6. Start the server
     let addr = format!("{}:{}", config.host, config.port);
     let listener = TcpListener::bind(&addr).await?;
+
+    let acceptor: Option<TlsAcceptor> = if config.encrypt {
+        println!("TLS encryption is enabled.");
+        let tls_config = load_tls_config(&config)?;
+        Some(TlsAcceptor::from(tls_config))
+    } else {
+        None
+    };
+
     println!("MemFlux (RESP Protocol) listening on {}", addr);
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, peer_addr) = listener.accept().await?;
         let context_clone = app_context.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, context_clone).await {
-                if e.downcast_ref::<std::io::Error>()
-                    .map_or(true, |io_err| io_err.kind() != std::io::ErrorKind::BrokenPipe)
-                {
-                    eprintln!("Connection error: {:?}", e);
+
+        if let Some(acceptor) = acceptor.clone() {
+            tokio::spawn(async move {
+                match acceptor.accept(stream).await {
+                    Ok(tls_stream) => {
+                        if let Err(e) = handle_connection(tls_stream, context_clone).await {
+                            if e.downcast_ref::<std::io::Error>().map_or(true, |io_err| {
+                                io_err.kind() != std::io::ErrorKind::BrokenPipe
+                            }) {
+                                eprintln!("Connection error from {}: {:?}", peer_addr, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("TLS handshake error from {}: {}", peer_addr, e);
+                    }
                 }
-            }
-        });
+            });
+        } else {
+            tokio::spawn(async move {
+                if let Err(e) = handle_connection(stream, context_clone).await {
+                    if e.downcast_ref::<std::io::Error>().map_or(true, |io_err| {
+                        io_err.kind() != std::io::ErrorKind::BrokenPipe
+                    }) {
+                        eprintln!("Connection error from {}: {:?}", peer_addr, e);
+                    }
+                }
+            });
+        }
     }
 }
 
 /// Handles a single client connection.
-async fn handle_connection(mut stream: TcpStream, ctx: Arc<AppContext>) -> Result<()> {
-    let (reader, mut writer) = stream.split();
+async fn handle_connection<S>(stream: S, ctx: Arc<AppContext>) -> Result<()> 
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (reader, mut writer) = tokio::io::split(stream);
     let mut buf_reader = BufReader::new(reader);
     let mut authenticated = ctx.config.requirepass.is_empty();
 
@@ -111,7 +192,8 @@ async fn handle_connection(mut stream: TcpStream, ctx: Arc<AppContext>) -> Resul
                             writer.write_all(&response.into_protocol_format()).await?;
                         }
                     } else {
-                        let response = Response::Error("NOAUTH Authentication required.".to_string());
+                        let response =
+                            Response::Error("NOAUTH Authentication required.".to_string());
                         writer.write_all(&response.into_protocol_format()).await?;
                     }
                     continue;
@@ -170,7 +252,8 @@ async fn handle_connection(mut stream: TcpStream, ctx: Arc<AppContext>) -> Resul
                         {
                             Ok(plan) => plan,
                             Err(e) => {
-                                let response = Response::Error(format!("Optimization Error: {}", e));
+                                let response =
+                                    Response::Error(format!("Optimization Error: {}", e));
                                 writer.write_all(&response.into_protocol_format()).await?;
                                 continue;
                             }
@@ -178,7 +261,8 @@ async fn handle_connection(mut stream: TcpStream, ctx: Arc<AppContext>) -> Resul
 
                     // Start streaming RESP array
                     use futures::StreamExt;
-                    let mut stream_rows = Box::pin(query_engine::execute(physical_plan, ctx.clone(), None));
+                    let mut stream_rows =
+                        Box::pin(query_engine::execute(physical_plan, ctx.clone(), None));
 
                     if is_select {
                         // For SELECT, we always stream back rows.
@@ -189,10 +273,11 @@ async fn handle_connection(mut stream: TcpStream, ctx: Arc<AppContext>) -> Resul
                             match row_result {
                                 Ok(val) => rows.push(val),
                                 Err(e) => {
-                                    let response = Response::Error(format!("Execution Error: {}", e));
+                                    let response =
+                                        Response::Error(format!("Execution Error: {}", e));
                                     writer.write_all(&response.into_protocol_format()).await?;
                                     error_occured = true;
-                                    break; 
+                                    break;
                                 }
                             }
                         }
@@ -227,7 +312,8 @@ async fn handle_connection(mut stream: TcpStream, ctx: Arc<AppContext>) -> Resul
                                     writer.write_all(&response.into_protocol_format()).await?;
                                 }
                                 Err(e) => {
-                                    let response = Response::Error(format!("Execution Error: {}", e));
+                                    let response =
+                                        Response::Error(format!("Execution Error: {}", e));
                                     writer.write_all(&response.into_protocol_format()).await?;
                                 }
                             }

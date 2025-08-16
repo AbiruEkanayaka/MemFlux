@@ -3,8 +3,8 @@
 ## Tier 1: Foundational Stability & Security
 
 ### Security Hardening
-- [ ] Implement `AUTH` command for password protection.
-- [ ] Add TLS support for encrypted client-server communication.
+- [x] Implement `AUTH` command for password protection.
+- [x] Add TLS support for encrypted client-server communication.
 
 ### Memory Management
 - [ ] Implement a `maxmemory` configuration setting.

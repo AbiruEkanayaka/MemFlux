@@ -4,6 +4,8 @@ memflux.wal
 memflux.snapshot
 Cargo.lock
 config.json
+memflux.crt
+memflux.key
 
 # Random files used in dev
 a.py
@@ -14,4 +16,5 @@ x.sh
 r.md
 s.md
 x.py
+
 

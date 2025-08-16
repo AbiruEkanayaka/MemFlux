@@ -1,8 +1,7 @@
-import socket
 import sys
 import shlex
 
-from tests.common import send_resp_command
+from tests.common import send_resp_command, create_connection
 from tests.test_commands import test_byte, test_json, test_lists, test_sets
 from tests.test_sql import test_sql
 from tests.test_aliases import test_sql_aliases
@@ -79,13 +78,9 @@ def unit_test(sock, reader, mode):
 
 
 if __name__ == "__main__":
-    host = "127.0.0.1"
-    port = 8360
     sock = None # define sock in the outer scope
     try:
-        sock = socket.create_connection((host, port))
-        reader = sock.makefile('rb')
-        print("Connected to the db")
+        sock, reader = create_connection()
 
         if len(sys.argv) > 1:
             if sys.argv[1] == "bench":

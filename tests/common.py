@@ -1,8 +1,64 @@
 import socket
-import socket
 import sys
 import time
 import json
+import ssl
+
+
+def create_connection(retry=False):
+    host = "127.0.0.1"
+    port = 8360
+    sock = None
+
+    config = {}
+    try:
+        # Assuming config.json is in the root of the project, where test.py is run from.
+        with open('config.json', 'r') as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        if not retry:
+            print("config.json not found, proceeding with defaults.")
+
+    try:
+        sock = socket.create_connection((host, port))
+
+        if config.get('encrypt'):
+            if not retry: print("Encryption enabled, wrapping socket...")
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            sock = context.wrap_socket(sock, server_hostname=host)
+            if not retry: print("Socket wrapped with TLS.")
+
+        reader = sock.makefile('rb')
+        if not retry: print("Connected to the db")
+
+        password = config.get('requirepass')
+        if password and password != "":
+            if not retry: print("Password required, sending AUTH command.")
+            resp, _, _, _ = send_resp_command(sock, reader, ["AUTH", password])
+            if "OK" not in resp:
+                if not retry:
+                    print(f"Authentication failed: {resp.strip()}")
+                sock.close()
+                if not retry:
+                    sys.exit(1)
+                else:
+                    return None, None
+            if not retry: print("Authentication successful.")
+        
+        return sock, reader
+
+    except Exception as e:
+        if not retry:
+            print(f"Failed to connect or authenticate: {e}")
+        if sock:
+            sock.close()
+        if not retry:
+            sys.exit(1)
+        else:
+            return None, None
+
 
 def read_resp_response(reader):
     """
@@ -111,11 +167,3 @@ def extract_json_from_bulk(resp):
             print(f"[ERROR] Failed to extract JSON from {resp!r}: {e}")
             return None
     return None
-
-
-
-
-
-
-
-

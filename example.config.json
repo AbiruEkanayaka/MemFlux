@@ -5,5 +5,8 @@
   "wal_file": "memflux.wal",
   "snapshot_file": "memflux.snapshot",
   "snapshot_temp_file": "memflux.snapshot.tmp",
-  "wal_size_threshold_mb": 16
+  "wal_size_threshold_mb": 16,
+  "encrypt": false,
+  "cert_file": "memflux.crt",
+  "key_file": "memflux.key"
 }

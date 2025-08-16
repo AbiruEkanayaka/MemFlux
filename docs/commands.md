@@ -9,6 +9,11 @@ Checks if the server is responsive.
 - **Syntax:** `PING`
 - **Returns:** A simple string `PONG` if the server is alive.
 
+#### `AUTH <password>`
+Authenticates the client to the server. This is only required if `requirepass` is set in the server configuration. It must be the first command sent by a client.
+- **Syntax:** `AUTH <password>`
+- **Returns:** `+OK` on success, or an error if the password is incorrect.
+
 #### `FLUSHDB`
 Deletes all keys from the current database. This operation is instantaneous and also clears all indexes and caches.
 - **Syntax:** `FLUSHDB`

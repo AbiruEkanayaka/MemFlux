@@ -90,6 +90,7 @@ The `test.py` script is also the entry point for running unit tests and benchmar
 
 This documentation is organized into the following sections:
 
+*   **[Configuration](./configuration.md):** How to configure the server, including TLS.
 *   **[Commands](./commands.md):** Detailed reference for all non-SQL, Redis-style commands.
 *   **[SQL Reference](./sql.md):** An introduction to the SQL engine and links to detailed sections.
 *   **[Persistence](./persistence.md):** An explanation of how data durability is achieved through WAL and snapshots.
