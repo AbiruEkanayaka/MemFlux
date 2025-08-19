@@ -6,12 +6,12 @@ Cargo.lock
 config.json
 memflux.crt
 memflux.key
+*/__pycache__
 
 # Random files used in dev
 a.py
 .env
 /idk
-*/__pycache__
 x.sh
 r.md
 s.md
