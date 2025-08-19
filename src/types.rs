@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 
 use crate::config::Config;
 use crate::indexing::IndexManager;
+use crate::memory::MemoryManager;
 use crate::schema::VirtualSchema;
 
 // --- Core Data Structures ---
@@ -115,6 +116,7 @@ impl FunctionRegistry {
         self.functions.insert(name.to_uppercase(), func);
     }
 
+
     pub fn get(&self, name: &str) -> Option<&ScalarFunction> {
         self.functions.get(&name.to_uppercase())
     }
@@ -131,6 +133,7 @@ pub struct AppContext {
     pub schema_cache: SchemaCache,
     pub function_registry: Arc<FunctionRegistry>,
     pub config: Arc<Config>,
+    pub memory: Arc<MemoryManager>,
 }
 
 pub struct Command {

@@ -11,6 +11,7 @@ use tokio_rustls::TlsAcceptor;
 mod commands;
 mod config;
 mod indexing;
+mod memory;
 mod persistence;
 mod protocol;
 mod query_engine;
@@ -19,6 +20,7 @@ mod types;
 
 use config::Config;
 use indexing::IndexManager;
+use memory::MemoryManager;
 use persistence::{load_db_from_disk, PersistenceEngine};
 use protocol::parse_command_from_stream;
 use query_engine::functions;
@@ -102,8 +104,66 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 5. Set up the Application Context
+    // 5. Set up Memory Manager and calculate initial usage
+    let memory_manager = Arc::new(MemoryManager::new(config.maxmemory_mb));
+    if memory_manager.is_enabled() {
+        println!(
+            "Maxmemory policy is enabled ({}MB).",
+            config.maxmemory_mb
+        );
+    }
+    println!("Calculating initial memory usage...");
+    let mut initial_mem: u64 = 0;
+    let mut keys = Vec::new();
+    for item in db.iter() {
+        let key_size = item.key().len() as u64;
+        let value_size = memory::estimate_db_value_size(item.value()).await;
+        initial_mem += key_size + value_size;
+        keys.push(item.key().clone());
+    }
+    memory_manager.increase_memory(initial_mem);
+    if memory_manager.is_enabled() {
+        memory_manager.prime_lru(keys).await;
+    }
+    println!(
+        "Initial memory usage: {} MB",
+        memory_manager.current_memory() / 1024 / 1024
+    );
+
+    // 6. Set up Index Manager
     let index_manager = Arc::new(IndexManager::default());
+
+    // 7. Enforce memory limit at startup if needed
+    if memory_manager.is_enabled() && memory_manager.current_memory() > memory_manager.max_memory() {
+        println!(
+            "Initial memory usage ({}MB) exceeds maxmemory ({}MB). Evicting keys...",
+            memory_manager.current_memory() / 1024 / 1024,
+            memory_manager.max_memory() / 1024 / 1024
+        );
+        
+        // Create a temporary context for eviction
+        let temp_ctx = AppContext {
+            db: db.clone(),
+            logger: logger.clone(),
+            index_manager: index_manager.clone(),
+            json_cache: Arc::new(DashMap::new()), // Not needed for eviction
+            schema_cache: schema_cache.clone(), // Not needed for eviction
+            function_registry: Arc::new(FunctionRegistry::new()), // Not needed for eviction
+            config: config.clone(),
+            memory: memory_manager.clone(),
+        };
+
+        if let Err(e) = memory_manager.ensure_memory_for(0, &temp_ctx).await {
+            eprintln!("Error during initial eviction: {}. Server may be over memory limit.", e);
+        } else {
+            println!(
+                "Memory usage after initial eviction: {} MB",
+                memory_manager.current_memory() / 1024 / 1024
+            );
+        }
+    }
+
+    // 8. Set up the Application Context
     let json_cache = Arc::new(DashMap::new());
     let mut function_registry = FunctionRegistry::new();
     functions::register_string_functions(&mut function_registry);
@@ -118,9 +178,10 @@ async fn main() -> Result<()> {
         schema_cache,
         function_registry,
         config: config.clone(),
+        memory: memory_manager,
     });
 
-    // 6. Start the server
+    // 9. Start the server
     let addr = format!("{}:{}", config.host, config.port);
     let listener = TcpListener::bind(&addr).await?;
 

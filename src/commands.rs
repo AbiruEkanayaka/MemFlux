@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
 
 use crate::indexing::Index;
-
+use crate::memory;
 use crate::types::*;
 
 macro_rules! log_and_wait {
@@ -56,6 +56,7 @@ pub async fn process_command(command: Command, ctx: &AppContext) -> Response {
         "KEYS" => handle_keys(command, ctx).await,
         "FLUSHDB" => handle_flushdb(command, ctx).await,
         "SAVE" => handle_save(command, ctx).await,
+        "MEMUSAGE" => handle_memory_usage(command, ctx).await,
         "CREATEINDEX" => handle_createindex(command, ctx).await,
         "IDX.CREATE" => handle_idx_create(command, ctx).await,
         "IDX.DROP" => handle_idx_drop(command, ctx).await,
@@ -72,6 +73,11 @@ async fn handle_get(command: Command, ctx: &AppContext) -> Response {
         Ok(k) => k,
         Err(_) => return Response::Error("Invalid key".to_string()),
     };
+
+    if ctx.memory.is_enabled() {
+        ctx.memory.track_access(&key).await;
+    }
+
     match ctx.db.get(&key) {
         Some(entry) => match entry.value() {
             DbValue::Bytes(b) => Response::Bytes(b.clone()),
@@ -93,6 +99,19 @@ async fn handle_set(command: Command, ctx: &AppContext) -> Response {
     };
     let value = command.args[2].clone();
 
+    let mut old_size = 0;
+    if let Some(entry) = ctx.db.get(&key) {
+        old_size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
+    }
+
+    if ctx.memory.is_enabled() {
+        let new_size = key.len() as u64 + value.len() as u64;
+        let needed = new_size.saturating_sub(old_size);
+        if let Err(e) = ctx.memory.ensure_memory_for(needed, ctx).await {
+            return Response::Error(e.to_string());
+        }
+    }
+
     let log_entry = LogEntry::SetBytes {
         key: key.clone(),
         value: value.clone(),
@@ -100,7 +119,13 @@ async fn handle_set(command: Command, ctx: &AppContext) -> Response {
     let ack_response = log_and_wait!(ctx.logger, log_entry).await;
 
     if let Response::Ok = ack_response {
-        ctx.db.insert(key, DbValue::Bytes(value));
+        ctx.db.insert(key.clone(), DbValue::Bytes(value.clone()));
+        let new_size = key.len() as u64 + value.len() as u64;
+        ctx.memory.decrease_memory(old_size);
+        ctx.memory.increase_memory(new_size);
+        if ctx.memory.is_enabled() {
+            ctx.memory.track_access(&key).await;
+        }
     }
     ack_response
 }
@@ -115,6 +140,11 @@ async fn handle_delete(command: Command, ctx: &AppContext) -> Response {
             Ok(k) => k,
             Err(_) => continue,
         };
+
+        let mut old_size = 0;
+        if let Some(entry) = ctx.db.get(&key) {
+            old_size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
+        }
 
         let old_value: Option<Value> = ctx.db.get(&key).and_then(|entry| match entry.value() {
             DbValue::Json(v) => Some(v.clone()),
@@ -136,6 +166,10 @@ async fn handle_delete(command: Command, ctx: &AppContext) -> Response {
         match ack_rx.await {
             Ok(Ok(())) => {
                 if ctx.db.remove(&key).is_some() {
+                    ctx.memory.decrease_memory(old_size);
+                    if ctx.memory.is_enabled() {
+                        ctx.memory.forget_key(&key).await;
+                    }
                     if let Some(ref old_val) = old_value {
                         ctx.index_manager
                             .remove_key_from_indexes(&key, old_val)
@@ -179,9 +213,15 @@ pub fn apply_json_set_to_db(db: &Db, path: &str, value: Value) -> Result<()> {
                 // Create path if it doesn't exist
                 let mut current = v;
                 for part in inner_path.split('.') {
-                    if part.is_empty() { continue; }
+                    if part.is_empty() {
+                        continue;
+                    }
                     if current.is_object() {
-                        current = current.as_object_mut().unwrap().entry(part).or_insert(json!({}));
+                        current = current
+                            .as_object_mut()
+                            .unwrap()
+                            .entry(part)
+                            .or_insert(json!({}));
                     } else {
                         bail!("Path creation failed: part is not an object");
                     }
@@ -246,6 +286,20 @@ async fn handle_json_set(command: Command, ctx: &AppContext) -> Response {
         return Response::Error("Invalid path: missing key".to_string());
     }
 
+    let mut old_size = 0;
+    if let Some(entry) = ctx.db.get(&key) {
+        old_size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
+    }
+
+    if ctx.memory.is_enabled() {
+        // This is an estimation. The actual size after modification might be different.
+        let new_size = key.len() as u64 + value.to_string().len() as u64;
+        let needed = new_size.saturating_sub(old_size);
+        if let Err(e) = ctx.memory.ensure_memory_for(needed, ctx).await {
+            return Response::Error(e.to_string());
+        }
+    }
+
     let old_value: Option<Value> = ctx.db.get(&key).and_then(|entry| match entry.value() {
         DbValue::Json(v) => Some(v.clone()),
         _ => None,
@@ -260,6 +314,16 @@ async fn handle_json_set(command: Command, ctx: &AppContext) -> Response {
     if let Response::Ok = ack_response {
         if let Err(e) = apply_json_set_to_db(&ctx.db, &path, value) {
             return Response::Error(e.to_string());
+        }
+
+        if let Some(entry) = ctx.db.get(&key) {
+            let new_size =
+                key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
+            ctx.memory.decrease_memory(old_size);
+            ctx.memory.increase_memory(new_size);
+            if ctx.memory.is_enabled() {
+                ctx.memory.track_access(&key).await;
+            }
         }
 
         if let Some(ref old_val) = old_value {
@@ -292,6 +356,10 @@ async fn handle_json_get(command: Command, ctx: &AppContext) -> Response {
     };
     let inner_path = parts.next().unwrap_or("");
 
+    if ctx.memory.is_enabled() {
+        ctx.memory.track_access(key).await;
+    }
+
     match ctx.db.get(key) {
         Some(entry) => match entry.value() {
             DbValue::Json(v) => {
@@ -321,6 +389,11 @@ async fn handle_json_del(command: Command, ctx: &AppContext) -> Response {
         return Response::Error("Invalid path: missing key".to_string());
     }
 
+    let mut old_size = 0;
+    if let Some(entry) = ctx.db.get(&key) {
+        old_size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
+    }
+
     let old_value: Option<Value> = ctx.db.get(&key).and_then(|entry| match entry.value() {
         DbValue::Json(v) => Some(v.clone()),
         _ => None,
@@ -332,6 +405,21 @@ async fn handle_json_del(command: Command, ctx: &AppContext) -> Response {
     if let Response::Ok = ack_response {
         match apply_json_delete_to_db(&ctx.db, &path) {
             Ok(true) => {
+                if let Some(entry) = ctx.db.get(&key) {
+                    let new_size =
+                        key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
+                    ctx.memory.decrease_memory(old_size);
+                    ctx.memory.increase_memory(new_size);
+                    if ctx.memory.is_enabled() {
+                        ctx.memory.track_access(&key).await;
+                    }
+                } else {
+                    // The whole key was deleted
+                    ctx.memory.decrease_memory(old_size);
+                    if ctx.memory.is_enabled() {
+                        ctx.memory.forget_key(&key).await;
+                    }
+                }
                 if let Some(ref old_val) = old_value {
                     ctx.index_manager
                         .remove_key_from_indexes(&key, old_val)
@@ -357,6 +445,23 @@ async fn handle_lpush(command: Command, ctx: &AppContext) -> Response {
     };
     let values: Vec<Vec<u8>> = command.args[2..].to_vec();
 
+    let mut old_size = 0;
+    if let Some(entry) = ctx.db.get(&key) {
+        old_size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
+    }
+
+    if ctx.memory.is_enabled() {
+        let added_size: u64 = values.iter().map(|v| v.len() as u64).sum();
+        let needed = if old_size == 0 {
+            key.len() as u64 + added_size
+        } else {
+            added_size
+        };
+        if let Err(e) = ctx.memory.ensure_memory_for(needed, ctx).await {
+            return Response::Error(e.to_string());
+        }
+    }
+
     let log_entry = LogEntry::LPush {
         key: key.clone(),
         values: values.clone(),
@@ -366,12 +471,19 @@ async fn handle_lpush(command: Command, ctx: &AppContext) -> Response {
     if let Response::Ok = ack_response {
         let entry = ctx
             .db
-            .entry(key)
+            .entry(key.clone())
             .or_insert_with(|| DbValue::List(RwLock::new(VecDeque::new())));
         if let DbValue::List(list_lock) = entry.value() {
             let mut list = list_lock.write().await;
             for v in values {
                 list.push_front(v);
+            }
+            let new_size =
+                key.len() as u64 + list.iter().map(|v| v.len() as u64).sum::<u64>();
+            ctx.memory.decrease_memory(old_size);
+            ctx.memory.increase_memory(new_size);
+            if ctx.memory.is_enabled() {
+                ctx.memory.track_access(&key).await;
             }
             Response::Integer(list.len() as i64)
         } else {
@@ -392,6 +504,23 @@ async fn handle_rpush(command: Command, ctx: &AppContext) -> Response {
     };
     let values: Vec<Vec<u8>> = command.args[2..].to_vec();
 
+    let mut old_size = 0;
+    if let Some(entry) = ctx.db.get(&key) {
+        old_size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
+    }
+
+    if ctx.memory.is_enabled() {
+        let added_size: u64 = values.iter().map(|v| v.len() as u64).sum();
+        let needed = if old_size == 0 {
+            key.len() as u64 + added_size
+        } else {
+            added_size
+        };
+        if let Err(e) = ctx.memory.ensure_memory_for(needed, ctx).await {
+            return Response::Error(e.to_string());
+        }
+    }
+
     let log_entry = LogEntry::RPush {
         key: key.clone(),
         values: values.clone(),
@@ -401,12 +530,19 @@ async fn handle_rpush(command: Command, ctx: &AppContext) -> Response {
     if let Response::Ok = ack_response {
         let entry = ctx
             .db
-            .entry(key)
+            .entry(key.clone())
             .or_insert_with(|| DbValue::List(RwLock::new(VecDeque::new())));
         if let DbValue::List(list_lock) = entry.value() {
             let mut list = list_lock.write().await;
             for v in values {
                 list.push_back(v);
+            }
+            let new_size =
+                key.len() as u64 + list.iter().map(|v| v.len() as u64).sum::<u64>();
+            ctx.memory.decrease_memory(old_size);
+            ctx.memory.increase_memory(new_size);
+            if ctx.memory.is_enabled() {
+                ctx.memory.track_access(&key).await;
             }
             Response::Integer(list.len() as i64)
         } else {
@@ -435,6 +571,11 @@ async fn handle_lpop(command: Command, ctx: &AppContext) -> Response {
         1
     };
 
+    let mut old_size = 0;
+    if let Some(entry) = ctx.db.get(&key) {
+        old_size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
+    }
+
     let log_entry = LogEntry::LPop {
         key: key.clone(),
         count,
@@ -453,6 +594,15 @@ async fn handle_lpop(command: Command, ctx: &AppContext) -> Response {
                         break;
                     }
                 }
+
+                let new_size =
+                    key.len() as u64 + list.iter().map(|v| v.len() as u64).sum::<u64>();
+                ctx.memory.decrease_memory(old_size);
+                ctx.memory.increase_memory(new_size);
+                if ctx.memory.is_enabled() {
+                    ctx.memory.track_access(&key).await;
+                }
+
                 if popped.is_empty() {
                     Response::Nil
                 } else if !was_count_provided {
@@ -489,6 +639,11 @@ async fn handle_rpop(command: Command, ctx: &AppContext) -> Response {
         1
     };
 
+    let mut old_size = 0;
+    if let Some(entry) = ctx.db.get(&key) {
+        old_size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
+    }
+
     let log_entry = LogEntry::RPop {
         key: key.clone(),
         count,
@@ -507,6 +662,15 @@ async fn handle_rpop(command: Command, ctx: &AppContext) -> Response {
                         break;
                     }
                 }
+
+                let new_size =
+                    key.len() as u64 + list.iter().map(|v| v.len() as u64).sum::<u64>();
+                ctx.memory.decrease_memory(old_size);
+                ctx.memory.increase_memory(new_size);
+                if ctx.memory.is_enabled() {
+                    ctx.memory.track_access(&key).await;
+                }
+
                 if popped.is_empty() {
                     Response::Nil
                 } else if !was_count_provided {
@@ -533,6 +697,11 @@ async fn handle_llen(command: Command, ctx: &AppContext) -> Response {
         Ok(k) => k,
         Err(_) => return Response::Error("Invalid key".to_string()),
     };
+
+    if ctx.memory.is_enabled() {
+        ctx.memory.track_access(&key).await;
+    }
+
     match ctx.db.get(&key) {
         Some(entry) => {
             if let DbValue::List(list_lock) = entry.value() {
@@ -554,14 +723,24 @@ async fn handle_lrange(command: Command, ctx: &AppContext) -> Response {
         Ok(k) => k,
         Err(_) => return Response::Error("Invalid key".to_string()),
     };
-    let start = match str::from_utf8(&command.args[2]).unwrap_or("").parse::<i64>() {
+    let start = match str::from_utf8(&command.args[2])
+        .unwrap_or("")
+        .parse::<i64>()
+    {
         Ok(s) => s,
         Err(_) => return Response::Error("Invalid start index".to_string()),
     };
-    let stop = match str::from_utf8(&command.args[3]).unwrap_or("").parse::<i64>() {
+    let stop = match str::from_utf8(&command.args[3])
+        .unwrap_or("")
+        .parse::<i64>()
+    {
         Ok(s) => s,
         Err(_) => return Response::Error("Invalid stop index".to_string()),
     };
+
+    if ctx.memory.is_enabled() {
+        ctx.memory.track_access(&key).await;
+    }
 
     match ctx.db.get(&key) {
         Some(entry) => {
@@ -603,6 +782,23 @@ async fn handle_sadd(command: Command, ctx: &AppContext) -> Response {
     };
     let members: Vec<Vec<u8>> = command.args[2..].to_vec();
 
+    let mut old_size = 0;
+    if let Some(entry) = ctx.db.get(&key) {
+        old_size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
+    }
+
+    if ctx.memory.is_enabled() {
+        let added_size: u64 = members.iter().map(|v| v.len() as u64).sum();
+        let needed = if old_size == 0 {
+            key.len() as u64 + added_size
+        } else {
+            added_size
+        };
+        if let Err(e) = ctx.memory.ensure_memory_for(needed, ctx).await {
+            return Response::Error(e.to_string());
+        }
+    }
+
     let log_entry = LogEntry::SAdd {
         key: key.clone(),
         members: members.clone(),
@@ -612,7 +808,7 @@ async fn handle_sadd(command: Command, ctx: &AppContext) -> Response {
     if let Response::Ok = ack_response {
         let entry = ctx
             .db
-            .entry(key)
+            .entry(key.clone())
             .or_insert_with(|| DbValue::Set(RwLock::new(HashSet::new())));
         if let DbValue::Set(set_lock) = entry.value() {
             let mut set = set_lock.write().await;
@@ -621,6 +817,13 @@ async fn handle_sadd(command: Command, ctx: &AppContext) -> Response {
                 if set.insert(m) {
                     added_count += 1;
                 }
+            }
+            let new_size =
+                key.len() as u64 + set.iter().map(|v| v.len() as u64).sum::<u64>();
+            ctx.memory.decrease_memory(old_size);
+            ctx.memory.increase_memory(new_size);
+            if ctx.memory.is_enabled() {
+                ctx.memory.track_access(&key).await;
             }
             Response::Integer(added_count)
         } else {
@@ -641,6 +844,11 @@ async fn handle_srem(command: Command, ctx: &AppContext) -> Response {
     };
     let members: Vec<Vec<u8>> = command.args[2..].to_vec();
 
+    let mut old_size = 0;
+    if let Some(entry) = ctx.db.get(&key) {
+        old_size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
+    }
+
     let log_entry = LogEntry::SRem {
         key: key.clone(),
         members: members.clone(),
@@ -657,6 +865,15 @@ async fn handle_srem(command: Command, ctx: &AppContext) -> Response {
                         removed_count += 1;
                     }
                 }
+
+                let new_size =
+                    key.len() as u64 + set.iter().map(|v| v.len() as u64).sum::<u64>();
+                ctx.memory.decrease_memory(old_size);
+                ctx.memory.increase_memory(new_size);
+                if ctx.memory.is_enabled() {
+                    ctx.memory.track_access(&key).await;
+                }
+
                 Response::Integer(removed_count)
             } else {
                 Response::Error("WRONGTYPE Operation against a non-set value".to_string())
@@ -677,6 +894,11 @@ async fn handle_smembers(command: Command, ctx: &AppContext) -> Response {
         Ok(k) => k,
         Err(_) => return Response::Error("Invalid key".to_string()),
     };
+
+    if ctx.memory.is_enabled() {
+        ctx.memory.track_access(&key).await;
+    }
+
     match ctx.db.get(&key) {
         Some(entry) => {
             if let DbValue::Set(set_lock) = entry.value() {
@@ -699,6 +921,11 @@ async fn handle_scard(command: Command, ctx: &AppContext) -> Response {
         Ok(k) => k,
         Err(_) => return Response::Error("Invalid key".to_string()),
     };
+
+    if ctx.memory.is_enabled() {
+        ctx.memory.track_access(&key).await;
+    }
+
     match ctx.db.get(&key) {
         Some(entry) => {
             if let DbValue::Set(set_lock) = entry.value() {
@@ -721,6 +948,11 @@ async fn handle_sismember(command: Command, ctx: &AppContext) -> Response {
         Err(_) => return Response::Error("Invalid key".to_string()),
     };
     let member = &command.args[2];
+
+    if ctx.memory.is_enabled() {
+        ctx.memory.track_access(&key).await;
+    }
+
     match ctx.db.get(&key) {
         Some(entry) => {
             if let DbValue::Set(set_lock) = entry.value() {
@@ -788,11 +1020,17 @@ async fn handle_save(command: Command, _ctx: &AppContext) -> Response {
     Response::Ok
 }
 
+async fn handle_memory_usage(command: Command, ctx: &AppContext) -> Response {
+    if command.args.len() != 1 {
+        return Response::Error("MEMORY.USAGE takes no arguments".to_string());
+    }
+    let usage = ctx.memory.current_memory();
+    Response::Integer(usage as i64)
+}
+
 async fn handle_createindex(command: Command, ctx: &AppContext) -> Response {
     if command.args.len() != 4 || String::from_utf8_lossy(&command.args[2]).to_uppercase() != "ON" {
-        return Response::Error(
-            "Usage: CREATEINDEX <key-prefix> ON <json-path>".to_string(),
-        );
+        return Response::Error("Usage: CREATEINDEX <key-prefix> ON <json-path>".to_string());
     }
     let key_prefix = match String::from_utf8(command.args[1].clone()) {
         Ok(p) => p,
@@ -944,12 +1182,3 @@ async fn handle_idx_list(command: Command, ctx: &AppContext) -> Response {
         .collect();
     Response::MultiBytes(index_names)
 }
-
-
-
-
-
-
-
-
-
