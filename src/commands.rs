@@ -1046,7 +1046,7 @@ async fn handle_save(command: Command, _ctx: &AppContext) -> Response {
 
 async fn handle_memory_usage(command: Command, ctx: &AppContext) -> Response {
     if command.args.len() != 1 {
-        return Response::Error("MEMORY.USAGE takes no arguments".to_string());
+        return Response::Error("MEMUSAGE takes no arguments".to_string());
     }
     let usage = ctx.memory.current_memory();
     Response::Integer(usage as i64)

@@ -13,11 +13,11 @@ pub async fn estimate_db_value_size(value: &DbValue) -> u64 {
         DbValue::Bytes(b) => b.len() as u64,
         DbValue::List(lock) => {
             let list = lock.read().await;
-            list.iter().map(|v| v.len() as u64).sum()
+            list.iter().fold(0u64, |acc, v| acc.saturating_add(v.len() as u64))
         }
         DbValue::Set(lock) => {
             let set = lock.read().await;
-            set.iter().map(|v| v.len() as u64).sum()
+            set.iter().fold(0u64, |acc, v| acc.saturating_add(v.len() as u64))
         }
     }
 }
@@ -50,11 +50,35 @@ impl MemoryManager {
     }
 
     pub fn increase_memory(&self, amount: u64) {
-        self.estimated_memory.fetch_add(amount, Ordering::Relaxed);
+        // Use a loop to ensure saturating behavior
+        loop {
+            let current = self.estimated_memory.load(Ordering::Relaxed);
+            let new = current.saturating_add(amount);
+            if self.estimated_memory.compare_exchange_weak(
+                current,
+                new,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ).is_ok() {
+                break;
+            }
+        }
     }
 
     pub fn decrease_memory(&self, amount: u64) {
-        self.estimated_memory.fetch_sub(amount, Ordering::Relaxed);
+        // Use a loop to ensure saturating behavior
+        loop {
+            let current = self.estimated_memory.load(Ordering::Relaxed);
+            let new = current.saturating_sub(amount);
+            if self.estimated_memory.compare_exchange_weak(
+                current,
+                new,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ).is_ok() {
+                break;
+            }
+        }
     }
 
     pub async fn prime_lru(&self, keys: Vec<String>) {

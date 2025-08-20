@@ -98,7 +98,7 @@ def fill_db(sock, reader, mbs):
     for i in range(num_writes):
         key = f"fill_key:{i}"
         send_resp_command(sock, reader, ["SET", key, large_value])
-        if (i + 1) % 10 == 0 or i == num_writes -1:
+        if (i + 1) % 10 == 0 or i == num_writes - 1:
             print(f"  ... {i+1}/{num_writes} writes completed.", end='\r')
     
     end_time = time.time()
