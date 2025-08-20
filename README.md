@@ -185,6 +185,7 @@ Key sections include:
 *   **[SQL Reference](./docs/sql.md):** An introduction to the SQL engine and links to detailed sections.
 *   **[Persistence](./docs/persistence.md):** An explanation of how data durability is achieved through WAL and snapshots.
 *   **[Indexing](./docs/indexing.md):** Guide to creating and using indexes for JSON data.
+*   **[Memory Management](./docs/memory.md):** How to configure memory limits and the eviction policy.
 
 ## How It Works (A Basic Overview)
 

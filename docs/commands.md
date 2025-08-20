@@ -24,6 +24,11 @@ This command is provided for compatibility but is a no-op. MemFlux handles savin
 - **Syntax:** `SAVE`
 - **Returns:** `+OK`
 
+#### `MEMUSAGE`
+Reports the total memory usage in bytes. This is the sum of memory used by all keys, values, and overhead.
+- **Syntax:** `MEMUSAGE`
+- **Returns:** An integer reply with the total number of bytes used.
+
 ## Key/Value (Bytes) Commands
 
 These commands operate on simple key-value pairs where the value is a sequence of bytes (a string).
