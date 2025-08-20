@@ -120,6 +120,30 @@ async fn handle_set(command: Command, ctx: &AppContext) -> Response {
 
     if let Response::Ok = ack_response {
         ctx.db.insert(key.clone(), DbValue::Bytes(value.clone()));
+        // Only update memory after successful insertion
+        let new_size = key.len() as u64 + value.len() as u64;
+        ctx.memory.decrease_memory(old_size);
+        ctx.memory.increase_memory(new_size);
+        if ctx.memory.is_enabled() {
+            ctx.memory.track_access(&key).await;
+        }
+    } else {
+        // Rollback memory reservation if WAL write failed
+        if ctx.memory.is_enabled() {
+            let new_size = key.len() as u64 + value.len() as u64;
+            let reserved = new_size.saturating_sub(old_size);
+            ctx.memory.decrease_memory(reserved);
+        }
+    }
+
+    let log_entry = LogEntry::SetBytes {
+        key: key.clone(),
+        value: value.clone(),
+    };
+    let ack_response = log_and_wait!(ctx.logger, log_entry).await;
+
+    if let Response::Ok = ack_response {
+        ctx.db.insert(key.clone(), DbValue::Bytes(value.clone()));
         let new_size = key.len() as u64 + value.len() as u64;
         ctx.memory.decrease_memory(old_size);
         ctx.memory.increase_memory(new_size);
@@ -292,9 +316,9 @@ async fn handle_json_set(command: Command, ctx: &AppContext) -> Response {
     }
 
     if ctx.memory.is_enabled() {
-        // This is an estimation. The actual size after modification might be different.
-        let new_size = key.len() as u64 + value.to_string().len() as u64;
-        let needed = new_size.saturating_sub(old_size);
+        // Pessimistic estimation: assume the value is added to existing data
+        let added_size = value.to_string().len() as u64;
+        let needed = added_size; // Conservative: assume it's all new data
         if let Err(e) = ctx.memory.ensure_memory_for(needed, ctx).await {
             return Response::Error(e.to_string());
         }

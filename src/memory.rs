@@ -102,7 +102,7 @@ impl MemoryManager {
         }
 
         // Check if the single new item is larger than the total memory
-        if needed_size > self.max_memory_bytes && needed_size > self.current_memory() {
+        if needed_size > self.max_memory_bytes {
             return Err(anyhow!(
                 "OOM: The item is larger than the maxmemory limit"
             ));
