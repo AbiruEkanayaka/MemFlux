@@ -13,7 +13,7 @@ from tests.test_like import test_like
 from tests.test_subqueries import test_subqueries
 from tests.test_union import test_union
 from tests.test_functions import test_string_functions, test_numeric_functions, test_datetime_functions, test_cast_function
-from tests.benchmark import benchmark, benchmark_ops_sec
+from tests.benchmark import benchmark, benchmark_ops_sec, fill_db
 from tests.test_advanced_commands import test_advanced_commands
 from tests.test_sql_operators import test_sql_comparison_operators
 from tests.test_indexing import test_index_maintenance
@@ -39,7 +39,7 @@ def unit_test(sock, reader, mode):
         test_sets(sock, reader)
     if mode in ("sql", "all"):
         test_sql(sock, reader)
-    if mode in ("snapshot"):
+    if mode == "snapshot":
         test_snapshot(sock, reader)
     if mode in ("types", "all"):
         test_type_casting(sock, reader)
@@ -111,6 +111,16 @@ if __name__ == "__main__":
                         print("Invalid --pipeline argument. Usage: --pipeline <size>")
                         sys.exit(1)
                 benchmark_ops_sec(sock, reader, parts, duration, pipeline_size)
+            elif sys.argv[1] == "filldb":
+                if len(sys.argv) < 3:
+                    print("Usage: python test.py filldb <MBs>")
+                    sys.exit(1)
+                try:
+                    mbs = int(sys.argv[2])
+                except ValueError:
+                    print("Error: MBs must be an integer.")
+                    sys.exit(1)
+                fill_db(sock, reader, mbs)
             elif sys.argv[1] == "unit":
                 if len(sys.argv) < 3:
                     print("Usage: python test.py unit {json,byte,lists,sets,sql,snapshot,types,schema,aliases,case,like,functions,union,advanced,operators,indexing,recovery,wrongtype,all}")

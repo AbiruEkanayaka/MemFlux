@@ -76,8 +76,35 @@ def benchmark_ops_sec(sock, reader, parts, duration_sec, pipeline_size=1000):
 
 
 
+def fill_db(sock, reader, mbs):
+    """
+    Fills the database with a specified amount of data in MB.
+    """
+    print(f"Filling database with {mbs} MB of data...")
+    
+    # Use 256KB values
+    value_size_kb = 256
+    large_value = 'x' * (value_size_kb * 1024)
+    
+    num_writes = (mbs * 1024) // value_size_kb
+    
+    if num_writes == 0:
+        print("MB value is too low to write any key. Minimum is 1 write of 256KB.")
+        return
 
+    print(f"Will perform {num_writes} writes of {value_size_kb}KB each.")
 
-
-
-
+    start_time = time.time()
+    for i in range(num_writes):
+        key = f"fill_key:{i}"
+        send_resp_command(sock, reader, ["SET", key, large_value])
+        if (i + 1) % 10 == 0 or i == num_writes - 1:
+            print(f"  ... {i+1}/{num_writes} writes completed.", end='\r')
+    
+    end_time = time.time()
+    duration = end_time - start_time
+    
+    print(f"\n\nFinished filling database.")
+    print(f"  Total writes: {num_writes}")
+    print(f"  Total data:   ~{mbs} MB")
+    print(f"  Duration:     {duration:.2f} seconds")

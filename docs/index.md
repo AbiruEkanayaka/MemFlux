@@ -95,3 +95,4 @@ This documentation is organized into the following sections:
 *   **[SQL Reference](./sql.md):** An introduction to the SQL engine and links to detailed sections.
 *   **[Persistence](./persistence.md):** An explanation of how data durability is achieved through WAL and snapshots.
 *   **[Indexing](./indexing.md):** Guide to creating and using indexes for JSON data.
+*   **[Memory Management](./memory.md):** How to configure memory limits and the eviction policy.
