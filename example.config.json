@@ -7,6 +7,7 @@
   "snapshot_temp_file": "memflux.snapshot.tmp",
   "wal_size_threshold_mb": 16,
   "maxmemory_mb": 0,
+  "eviction_policy": "lru",
   "encrypt": false,
   "cert_file": "memflux.crt",
   "key_file": "memflux.key"

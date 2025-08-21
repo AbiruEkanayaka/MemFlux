@@ -105,11 +105,14 @@ async fn main() -> Result<()> {
     }
 
     // 5. Set up Memory Manager and calculate initial usage
-    let memory_manager = Arc::new(MemoryManager::new(config.maxmemory_mb));
+    let memory_manager = Arc::new(MemoryManager::new(
+        config.maxmemory_mb,
+        config.eviction_policy.clone(),
+    ));
     if memory_manager.is_enabled() {
         println!(
-            "Maxmemory policy is enabled ({}MB).",
-            config.maxmemory_mb
+            "Maxmemory policy is enabled ({}MB) with '{:?}' eviction policy.",
+            config.maxmemory_mb, config.eviction_policy
         );
     }
     println!("Calculating initial memory usage...");
@@ -123,7 +126,7 @@ async fn main() -> Result<()> {
     }
     memory_manager.increase_memory(initial_mem);
     if memory_manager.is_enabled() {
-        memory_manager.prime_lru(keys).await;
+        memory_manager.prime(keys).await;
     }
     println!(
         "Initial memory usage: {} MB",

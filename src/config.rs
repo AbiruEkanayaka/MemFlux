@@ -3,6 +3,19 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EvictionPolicy {
+    LRU,
+    LFU,
+}
+
+impl Default for EvictionPolicy {
+    fn default() -> Self {
+        EvictionPolicy::LRU
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
     pub host: String,
@@ -14,6 +27,8 @@ pub struct Config {
     pub wal_size_threshold_mb: u64,
     #[serde(default = "default_maxmemory_mb")]
     pub maxmemory_mb: u64,
+    #[serde(default)]
+    pub eviction_policy: EvictionPolicy,
     #[serde(default)]
     pub encrypt: bool,
     #[serde(default = "default_cert_file")]
@@ -44,6 +59,7 @@ impl Default for Config {
             snapshot_temp_file: "memflux.snapshot.tmp".to_string(),
             wal_size_threshold_mb: 16,
             maxmemory_mb: default_maxmemory_mb(),
+            eviction_policy: EvictionPolicy::default(),
             encrypt: false,
             cert_file: default_cert_file(),
             key_file: default_key_file(),
