@@ -39,7 +39,7 @@ def unit_test(sock, reader, mode):
         test_sets(sock, reader)
     if mode in ("sql", "all"):
         test_sql(sock, reader)
-    if mode in ("snapshot"):
+    if mode == "snapshot":
         test_snapshot(sock, reader)
     if mode in ("types", "all"):
         test_type_casting(sock, reader)

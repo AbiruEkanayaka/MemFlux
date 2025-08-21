@@ -74,17 +74,18 @@ async fn handle_get(command: Command, ctx: &AppContext) -> Response {
         Err(_) => return Response::Error("Invalid key".to_string()),
     };
 
-    if ctx.memory.is_enabled() {
-        ctx.memory.track_access(&key).await;
-    }
-
     match ctx.db.get(&key) {
-        Some(entry) => match entry.value() {
-            DbValue::Bytes(b) => Response::Bytes(b.clone()),
-            DbValue::Json(v) => Response::Bytes(v.to_string().into_bytes()),
-            DbValue::List(_) => Response::Error("WRONGTYPE Operation against a list".to_string()),
-            DbValue::Set(_) => Response::Error("WRONGTYPE Operation against a set".to_string()),
-        },
+        Some(entry) => {
+            if ctx.memory.is_enabled() {
+                ctx.memory.track_access(&key).await;
+            }
+            match entry.value() {
+                DbValue::Bytes(b) => Response::Bytes(b.clone()),
+                DbValue::Json(v) => Response::Bytes(v.to_string().into_bytes()),
+                DbValue::List(_) => Response::Error("WRONGTYPE Operation against a list".to_string()),
+                DbValue::Set(_) => Response::Error("WRONGTYPE Operation against a set".to_string()),
+            }
+        }
         None => Response::Nil,
     }
 }
@@ -109,30 +110,6 @@ async fn handle_set(command: Command, ctx: &AppContext) -> Response {
         let needed = new_size.saturating_sub(old_size);
         if let Err(e) = ctx.memory.ensure_memory_for(needed, ctx).await {
             return Response::Error(e.to_string());
-        }
-    }
-
-    let log_entry = LogEntry::SetBytes {
-        key: key.clone(),
-        value: value.clone(),
-    };
-    let ack_response = log_and_wait!(ctx.logger, log_entry).await;
-
-    if let Response::Ok = ack_response {
-        ctx.db.insert(key.clone(), DbValue::Bytes(value.clone()));
-        // Only update memory after successful insertion
-        let new_size = key.len() as u64 + value.len() as u64;
-        ctx.memory.decrease_memory(old_size);
-        ctx.memory.increase_memory(new_size);
-        if ctx.memory.is_enabled() {
-            ctx.memory.track_access(&key).await;
-        }
-    } else {
-        // Rollback memory reservation if WAL write failed
-        if ctx.memory.is_enabled() {
-            let new_size = key.len() as u64 + value.len() as u64;
-            let reserved = new_size.saturating_sub(old_size);
-            ctx.memory.decrease_memory(reserved);
         }
     }
 
@@ -380,21 +357,22 @@ async fn handle_json_get(command: Command, ctx: &AppContext) -> Response {
     };
     let inner_path = parts.next().unwrap_or("");
 
-    if ctx.memory.is_enabled() {
-        ctx.memory.track_access(key).await;
-    }
-
     match ctx.db.get(key) {
-        Some(entry) => match entry.value() {
-            DbValue::Json(v) => {
-                let pointer = json_path_to_pointer(inner_path);
-                match v.pointer(&pointer) {
-                    Some(val) => Response::Bytes(val.to_string().into_bytes()),
-                    None => Response::Nil,
-                }
+        Some(entry) => {
+            if ctx.memory.is_enabled() {
+                ctx.memory.track_access(key).await;
             }
-            _ => Response::Error("WRONGTYPE Operation against a non-JSON value".to_string()),
-        },
+            match entry.value() {
+                DbValue::Json(v) => {
+                    let pointer = json_path_to_pointer(inner_path);
+                    match v.pointer(&pointer) {
+                        Some(val) => Response::Bytes(val.to_string().into_bytes()),
+                        None => Response::Nil,
+                    }
+                }
+                _ => Response::Error("WRONGTYPE Operation against a non-JSON value".to_string()),
+            }
+        }
         None => Response::Nil,
     }
 }
@@ -722,12 +700,11 @@ async fn handle_llen(command: Command, ctx: &AppContext) -> Response {
         Err(_) => return Response::Error("Invalid key".to_string()),
     };
 
-    if ctx.memory.is_enabled() {
-        ctx.memory.track_access(&key).await;
-    }
-
     match ctx.db.get(&key) {
         Some(entry) => {
+            if ctx.memory.is_enabled() {
+                ctx.memory.track_access(&key).await;
+            }
             if let DbValue::List(list_lock) = entry.value() {
                 let list = list_lock.read().await;
                 Response::Integer(list.len() as i64)
@@ -762,12 +739,11 @@ async fn handle_lrange(command: Command, ctx: &AppContext) -> Response {
         Err(_) => return Response::Error("Invalid stop index".to_string()),
     };
 
-    if ctx.memory.is_enabled() {
-        ctx.memory.track_access(&key).await;
-    }
-
     match ctx.db.get(&key) {
         Some(entry) => {
+            if ctx.memory.is_enabled() {
+                ctx.memory.track_access(&key).await;
+            }
             if let DbValue::List(list_lock) = entry.value() {
                 let list = list_lock.read().await;
                 let len = list.len() as i64;
@@ -919,12 +895,11 @@ async fn handle_smembers(command: Command, ctx: &AppContext) -> Response {
         Err(_) => return Response::Error("Invalid key".to_string()),
     };
 
-    if ctx.memory.is_enabled() {
-        ctx.memory.track_access(&key).await;
-    }
-
     match ctx.db.get(&key) {
         Some(entry) => {
+            if ctx.memory.is_enabled() {
+                ctx.memory.track_access(&key).await;
+            }
             if let DbValue::Set(set_lock) = entry.value() {
                 let set = set_lock.read().await;
                 let members: Vec<Vec<u8>> = set.iter().cloned().collect();
@@ -946,12 +921,11 @@ async fn handle_scard(command: Command, ctx: &AppContext) -> Response {
         Err(_) => return Response::Error("Invalid key".to_string()),
     };
 
-    if ctx.memory.is_enabled() {
-        ctx.memory.track_access(&key).await;
-    }
-
     match ctx.db.get(&key) {
         Some(entry) => {
+            if ctx.memory.is_enabled() {
+                ctx.memory.track_access(&key).await;
+            }
             if let DbValue::Set(set_lock) = entry.value() {
                 let set = set_lock.read().await;
                 Response::Integer(set.len() as i64)
@@ -973,12 +947,11 @@ async fn handle_sismember(command: Command, ctx: &AppContext) -> Response {
     };
     let member = &command.args[2];
 
-    if ctx.memory.is_enabled() {
-        ctx.memory.track_access(&key).await;
-    }
-
     match ctx.db.get(&key) {
         Some(entry) => {
+            if ctx.memory.is_enabled() {
+                ctx.memory.track_access(&key).await;
+            }
             if let DbValue::Set(set_lock) = entry.value() {
                 let set = set_lock.read().await;
                 if set.contains(member) {
