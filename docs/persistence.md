@@ -36,7 +36,7 @@ Snapshots (`memflux.snapshot`) provide a baseline for recovery.
 
 A new snapshot is automatically triggered when the WAL file size exceeds a predefined threshold.
 
-*   **`WAL_SIZE_THRESHOLD`:** This is currently set to **16 MB**.
+*   **`WAL_SIZE_THRESHOLD`:** This is currently set to **128 MB**.
 
 As demonstrated in `tests/test_persistence.py`, writing a large amount of data will cause the WAL file to grow, triggering the snapshot and subsequent compaction of the WAL.
 

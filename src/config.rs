@@ -57,7 +57,7 @@ impl Default for Config {
             wal_file: "memflux.wal".to_string(),
             snapshot_file: "memflux.snapshot".to_string(),
             snapshot_temp_file: "memflux.snapshot.tmp".to_string(),
-            wal_size_threshold_mb: 16,
+            wal_size_threshold_mb: 128,
             maxmemory_mb: default_maxmemory_mb(),
             eviction_policy: EvictionPolicy::default(),
             encrypt: false,

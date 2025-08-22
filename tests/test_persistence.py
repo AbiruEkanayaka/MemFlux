@@ -22,9 +22,9 @@ def test_snapshot(sock, reader):
         # A proper test would restart the server.
         print(f"[WARN] WAL file exists (size: {os.path.getsize('memflux.wal')}). Test results may vary.")
 
-    # The WAL threshold is 16MB. Let's write more than that.
+    # The WAL threshold is 128MB. Let's write more than that.
     # A large value to write repeatedly. 256KB.
-    # 16 * 1024 * 1024 / (256 * 1024) = 64 writes. Let's do 70 to be safe.
+    # 128 * 1024 * 1024 / (256 * 1024) = 64 writes. Let's do 70 to be safe.
     large_value = 'x' * (256 * 1024) # 256 KB
     num_writes = 70
     all_keys_to_clean = []
