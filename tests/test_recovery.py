@@ -34,7 +34,7 @@ def test_recovery(sock, reader):
     print("\n-- Phase 2: Trigger Snapshot --")
     # Write enough data to trigger a snapshot (threshold is 128MB)
     large_value = 's' * (256 * 1024) # 256 KB
-    num_writes = 70
+    num_writes = 130 * 1024 * 1024 // (256 * 1024) 
     print(f"[INFO] Writing {num_writes} * 256KB to trigger snapshot...")
     for i in range(num_writes):
         send(["SET", f"snapshot_trigger_{i}", large_value])

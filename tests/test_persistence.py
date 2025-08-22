@@ -24,9 +24,8 @@ def test_snapshot(sock, reader):
 
     # The WAL threshold is 128MB. Let's write more than that.
     # A large value to write repeatedly. 256KB.
-    # 128 * 1024 * 1024 / (256 * 1024) = 64 writes. Let's do 70 to be safe.
     large_value = 'x' * (256 * 1024) # 256 KB
-    num_writes = 70
+    num_writes = 130 * 1024 * 1024 // (256 * 1024)
     all_keys_to_clean = []
 
     # --- Trigger First Snapshot ---
