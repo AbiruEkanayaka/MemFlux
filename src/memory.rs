@@ -33,6 +33,10 @@ pub struct MemoryManager {
     lru_keys: RwLock<VecDeque<String>>,
     // For LFU: A HashMap tracking access frequency.
     lfu_freqs: RwLock<HashMap<String, u64>>,
+    // For LFU: A HashMap mapping frequency to a list of keys.
+    lfu_freq_keys: RwLock<HashMap<u64, VecDeque<String>>>,
+    // For LFU: The minimum frequency currently in the cache.
+    lfu_min_freq: RwLock<u64>,
 }
 
 impl MemoryManager {
@@ -43,6 +47,8 @@ impl MemoryManager {
             policy,
             lru_keys: RwLock::new(VecDeque::new()),
             lfu_freqs: RwLock::new(HashMap::new()),
+            lfu_freq_keys: RwLock::new(HashMap::new()),
+            lfu_min_freq: RwLock::new(0),
         }
     }
 
@@ -97,8 +103,14 @@ impl MemoryManager {
             }
             EvictionPolicy::LFU => {
                 let mut lfu = self.lfu_freqs.write().await;
+                let mut freq_keys = self.lfu_freq_keys.write().await;
+                let mut min_freq = self.lfu_min_freq.write().await;
                 for key in keys {
-                    lfu.insert(key, 1); // Start with a frequency of 1
+                    lfu.insert(key.clone(), 1); // Start with a frequency of 1
+                    freq_keys.entry(1).or_default().push_back(key);
+                }
+                if !lfu.is_empty() {
+                    *min_freq = 1;
                 }
             }
         }
@@ -122,8 +134,35 @@ impl MemoryManager {
                 }
             }
             EvictionPolicy::LFU => {
-                let mut lfu = self.lfu_freqs.write().await;
-                *lfu.entry(key.to_string()).or_insert(0) += 1;
+                let mut freqs = self.lfu_freqs.write().await;
+                let mut freq_keys = self.lfu_freq_keys.write().await;
+                let mut min_freq = self.lfu_min_freq.write().await;
+
+                let old_freq = freqs.get(key).copied().unwrap_or(0);
+                let new_freq = old_freq + 1;
+
+                freqs.insert(key.to_string(), new_freq);
+
+                if old_freq > 0 {
+                    if let Some(keys) = freq_keys.get_mut(&old_freq) {
+                        if let Some(pos) = keys.iter().position(|k| k == key) {
+                            keys.remove(pos);
+                        }
+                        if keys.is_empty() {
+                            freq_keys.remove(&old_freq);
+                            if old_freq == *min_freq {
+                                *min_freq = new_freq;
+                            }
+                        }
+                    }
+                } else {
+                    *min_freq = 1;
+                }
+
+                freq_keys
+                    .entry(new_freq)
+                    .or_default()
+                    .push_back(key.to_string());
             }
         }
     }
@@ -141,14 +180,45 @@ impl MemoryManager {
                 }
             }
             EvictionPolicy::LFU => {
-                let mut lfu = self.lfu_freqs.write().await;
-                lfu.remove(key);
+                let mut freqs = self.lfu_freqs.write().await;
+                if let Some(freq) = freqs.remove(key) {
+                    let mut freq_keys = self.lfu_freq_keys.write().await;
+                    if let Some(keys) = freq_keys.get_mut(&freq) {
+                        if let Some(pos) = keys.iter().position(|k| k == key) {
+                            keys.remove(pos);
+                        }
+                        if keys.is_empty() {
+                            freq_keys.remove(&freq);
+                        }
+                    }
+                }
             }
         }
     }
 
     pub fn max_memory(&self) -> u64 {
         self.max_memory_bytes
+    }
+
+    /// Restores an evicted key back into the cache tracking structures.
+    pub async fn restore_evicted_key(&self, key: String, old_freq: Option<u64>) {
+        match self.policy {
+            EvictionPolicy::LRU => {
+                self.lru_keys.write().await.push_back(key);
+            }
+            EvictionPolicy::LFU => {
+                let freq = old_freq.unwrap_or(1);
+                let mut freqs = self.lfu_freqs.write().await;
+                let mut freq_keys = self.lfu_freq_keys.write().await;
+                let mut min_freq = self.lfu_min_freq.write().await;
+
+                freqs.insert(key.clone(), freq);
+                freq_keys.entry(freq).or_default().push_back(key);
+                if freq < *min_freq || *min_freq == 0 {
+                    *min_freq = freq;
+                }
+            }
+        }
     }
 
     // Evicts keys until there is enough space for `needed_size`.
@@ -169,14 +239,32 @@ impl MemoryManager {
                 EvictionPolicy::LRU => self.lru_keys.write().await.pop_back().map(|k| (k, None)),
                 EvictionPolicy::LFU => {
                     let mut freqs = self.lfu_freqs.write().await;
-                    // This is inefficient (O(n)), but simple. A real LFU uses more complex data structures.
-                    let key_to_evict = freqs.iter().min_by_key(|&(_, v)| v).map(|(k, _)| k.clone());
-
-                    if let Some(key) = key_to_evict {
-                        let freq = freqs.remove(&key);
-                        Some((key, freq))
-                    } else {
+                    if freqs.is_empty() {
                         None
+                    } else {
+                        let mut freq_keys = self.lfu_freq_keys.write().await;
+                        let mut min_freq = self.lfu_min_freq.write().await;
+
+                        loop {
+                            // Safety check: if min_freq exceeds a reasonable threshold, break
+                            if *min_freq > 1_000_000 {
+                                break None;
+                            }
+                            match freq_keys.get_mut(&min_freq) {
+                                Some(keys) if !keys.is_empty() => {
+                                    let key = keys.pop_front().unwrap();
+                                    if keys.is_empty() {
+                                        freq_keys.remove(&min_freq);
+                                    }
+                                    let freq = freqs.remove(&key);
+                                    break Some((key, freq));
+                                }
+                                _ => {
+                                    freq_keys.remove(&min_freq);
+                                    *min_freq += 1;
+                                }
+                            }
+                        }
                     }
                 }
             };
@@ -201,15 +289,7 @@ impl MemoryManager {
                 {
                     // If persistence is down, we probably shouldn't evict.
                     // Put the key back and return an error.
-                    match self.policy {
-                        EvictionPolicy::LRU => self.lru_keys.write().await.push_back(key),
-                        EvictionPolicy::LFU => {
-                            self.lfu_freqs
-                                .write()
-                                .await
-                                .insert(key, old_freq.unwrap_or(1));
-                        }
-                    }
+                    self.restore_evicted_key(key, old_freq).await;
                     return Err(anyhow!("Persistence engine is down, cannot evict"));
                 }
                 match ack_rx.await {
@@ -228,27 +308,11 @@ impl MemoryManager {
                         }
                     }
                     Ok(Err(e)) => {
-                        match self.policy {
-                            EvictionPolicy::LRU => self.lru_keys.write().await.push_back(key),
-                            EvictionPolicy::LFU => {
-                                self.lfu_freqs
-                                    .write()
-                                    .await
-                                    .insert(key, old_freq.unwrap_or(1));
-                            }
-                        }
+                        self.restore_evicted_key(key, old_freq).await;
                         return Err(anyhow!("WAL write error during eviction: {}", e));
                     }
                     Err(_) => {
-                        match self.policy {
-                            EvictionPolicy::LRU => self.lru_keys.write().await.push_back(key),
-                            EvictionPolicy::LFU => {
-                                self.lfu_freqs
-                                    .write()
-                                    .await
-                                    .insert(key, old_freq.unwrap_or(1));
-                            }
-                        }
+                        self.restore_evicted_key(key, old_freq).await;
                         return Err(anyhow!(
                             "Persistence engine dropped ACK channel during eviction"
                         ));

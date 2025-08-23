@@ -16,6 +16,7 @@ Here is an example `config.json` with all available options:
   "snapshot_temp_file": "memflux.snapshot.tmp",
   "wal_size_threshold_mb": 128,
   "maxmemory_mb": 0,
+  "eviction_policy": "lru",
   "encrypt": false,
   "cert_file": "memflux.crt",
   "key_file": "memflux.key"
@@ -31,7 +32,8 @@ Here is an example `config.json` with all available options:
 -   `snapshot_file` (string): The path to the database snapshot file. Default: `"memflux.snapshot"`.
 -   `snapshot_temp_file` (string): A temporary file used during snapshot creation. Default: `"memflux.snapshot.tmp"`.
 -   `wal_size_threshold_mb` (number): The size in megabytes the WAL file must reach to trigger a new snapshot. Default: `128`.
--   `maxmemory_mb` (number): The maximum memory usage limit in megabytes. If set to `0`, the limit is disabled. When the limit is reached, the server will evict the least recently used (LRU) keys to make space. Default: `0`.
+-   `maxmemory_mb` (number): The maximum memory usage limit in megabytes. If set to `0`, the limit is disabled. When the limit is reached, the server will evict keys to make space. Default: `0`.
+-   `eviction_policy` (string): The policy to use when evicting keys to stay under `maxmemory`. Can be `"lru"` (Least Recently Used) or `"lfu"` (Least Frequently Used). Default: `"lru"`.
 -   `encrypt` (boolean): Enables or disables TLS encryption for client connections. Default: `false`.
 -   `cert_file` (string): The path to the TLS certificate file (in PEM format). Default: `"memflux.crt"`.
 -   `key_file` (string): The path to the TLS private key file (in PEM format). Default: `"memflux.key"`.

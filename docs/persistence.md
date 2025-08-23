@@ -20,17 +20,12 @@ The WAL (`memflux.wal`) is the primary mechanism for durability.
 
 Snapshots (`memflux.snapshot`) provide a baseline for recovery.
 
-*   **Format:** A snapshot is a text-based file where each line is a JSON object representing a single key-value pair from the database. This format is human-readable and robust.
-    ```json
-    {"key":"mykey","value":{"Bytes":"aGVsbG8="}}
-    {"key":"user:1","value":{"Json":{"name":"Alice"}}}
-    {"key":"mylist","value":{"List":["a","b","c"]}}
-    ```
+*   **Format:** A snapshot is a compressed binary file. Each key-value pair is first serialized into a compact binary representation using `bincode`. The entire stream of serialized entries is then compressed using **LZ4**. This format is optimized for fast loading and a small disk footprint, not for human readability.
 *   **Creation:** The snapshotting process is as follows:
     1.  A temporary file (`memflux.snapshot.tmp`) is created.
-    2.  The entire in-memory database is iterated, and each key-value pair is serialized into the temporary file.
+    2.  The entire in-memory database is iterated. Each key-value pair is serialized and written to a compressed stream in the temporary file.
     3.  The temporary file is synced to disk to ensure its contents are fully written.
-    4.  The temporary file is atomically renamed to `memflux.snapshot`, replacing the old snapshot.
+    4.  The temporary file is atomically renamed to `memflux.snapshot`, atomically replacing the old snapshot.
 
 ### Snapshot Triggering
 
