@@ -11,15 +11,29 @@ The `maxmemory_mb` option in `config.json` sets a hard limit on the total memory
 
 When this limit is enabled, MemFlux will actively monitor its estimated memory usage. If a new write command would cause the server to exceed the `maxmemory` limit, it will first attempt to free up space by evicting existing keys.
 
-## Eviction Policy: LRU
+## Eviction Policies
 
-MemFlux uses a **Least Recently Used (LRU)** eviction policy. This means that when memory needs to be freed, the server will delete the key that has not been accessed for the longest time.
+When the `maxmemory` limit is reached, MemFlux evicts keys to free up space. The eviction behavior is determined by the `eviction_policy` setting in `config.json`.
+
+### LRU (Least Recently Used)
+
+This is the default policy (`"eviction_policy": "lru"`). It evicts the key that has not been accessed for the longest time.
 
 -   **How it works:** The server maintains a list of keys in the order they were last accessed.
 -   **Access:** Any read (`GET`, `JSON.GET`, etc.) or write (`SET`, `LPUSH`, etc.) operation on a key marks it as "recently used" by moving it to the front of the LRU list.
 -   **Eviction:** When memory is full, keys are evicted from the tail of the list—the ones that have been idle the longest.
 
-This policy ensures that frequently accessed, "hot" data is likely to remain in memory, while "cold" data is evicted first.
+This policy is a good general-purpose choice, ensuring that frequently accessed, "hot" data is likely to remain in memory.
+
+### LFU (Least Frequently Used)
+
+This policy (`"eviction_policy": "lfu"`) evicts the key that has been accessed the fewest number of times.
+
+-   **How it works:** The server tracks an access frequency counter for each key.
+-   **Access:** Each time a key is accessed, its frequency counter is incremented.
+-   **Eviction:** When memory is full, the key with the lowest frequency count is evicted.
+
+This policy can be more effective than LRU in use cases where some data is accessed very frequently for a short period (bursty traffic) but isn't important long-term. LFU will correctly identify and retain the truly popular items, even if they haven't been accessed recently.
 
 ## Monitoring Memory
 

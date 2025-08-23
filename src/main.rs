@@ -79,7 +79,12 @@ async fn main() -> Result<()> {
     let config = Arc::new(Config::load("config.json")?);
 
     // 2. Load DB state from disk (snapshot then WAL)
-    let db = load_db_from_disk(&config.snapshot_file, &config.wal_file).await?;
+    let db = load_db_from_disk(
+        &config.snapshot_file,
+        &config.wal_file,
+        &config.wal_overflow_file,
+    )
+    .await?;
     println!("Database loaded with {} top-level keys.", db.len());
 
     // 3. Set up the persistence engine
@@ -105,11 +110,14 @@ async fn main() -> Result<()> {
     }
 
     // 5. Set up Memory Manager and calculate initial usage
-    let memory_manager = Arc::new(MemoryManager::new(config.maxmemory_mb));
+    let memory_manager = Arc::new(MemoryManager::new(
+        config.maxmemory_mb,
+        config.eviction_policy.clone(),
+    ));
     if memory_manager.is_enabled() {
         println!(
-            "Maxmemory policy is enabled ({}MB).",
-            config.maxmemory_mb
+            "Maxmemory policy is enabled ({}MB) with '{:?}' eviction policy.",
+            config.maxmemory_mb, config.eviction_policy
         );
     }
     println!("Calculating initial memory usage...");
@@ -123,7 +131,7 @@ async fn main() -> Result<()> {
     }
     memory_manager.increase_memory(initial_mem);
     if memory_manager.is_enabled() {
-        memory_manager.prime_lru(keys).await;
+        memory_manager.prime(keys).await;
     }
     println!(
         "Initial memory usage: {} MB",

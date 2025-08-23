@@ -22,7 +22,7 @@ IDX.CREATE <index-name> <key-prefix> <json-path>
 CREATEINDEX <key-prefix> ON <json-path>
 ```
 
-*   `<index-name>`: A unique name for your index.
+*   `<index-name>`: A unique name for your index. **Note:** This is only provided for `IDX.CREATE`.
 *   `<key-prefix>`: A key pattern with a trailing `*` that specifies which keys this index applies to. For example, `user:*` would apply to `user:1`, `user:100`, etc.
 *   `<json-path>`: The dot-notation path to the field within the JSON object you want to index.
 
@@ -51,6 +51,7 @@ Or using the alias:
 > CREATEINDEX user:* ON profile.city
 +OK
 ```
+The `CREATEINDEX` alias automatically generates an index name for you based on the key prefix and path. The generated name is created by joining the prefix (without the trailing `*`) and the path with underscores (e.g., `user_profile_city`). You will need this name if you want to drop the index later.
 
 When an index is created, MemFlux automatically **backfills** it by scanning all existing keys matching the prefix and adding them to the index.
 
@@ -61,21 +62,26 @@ To see all created indexes, use `IDX.LIST`.
 ```
 > IDX.LIST
 *1
-$29
-user:
-*|profile.city
+$19
+user:*|profile.city
 ```
-The response is an array of the full internal index names, which are composed of the key prefix and the JSON path.
+The response is an array of the full **internal** index names, which are composed of the key prefix and the JSON path, separated by a `|`. Note that this internal name is for informational purposes and is **not** the name used to drop the index.
 
 ### Dropping an Index
 
-To remove an index, use `IDX.DROP`.
+To remove an index, use `IDX.DROP` with the name you used to create it.
 
 ```
 > IDX.DROP user_city_idx
 :1
 ```
 This will remove the index and free up the memory it was using. It returns the number of indexes dropped (1 or 0).
+
+**Important:** To drop an index created with the `CREATEINDEX` alias, you must use its auto-generated name. For the example `CREATEINDEX user:* ON profile.city`, the name would be `user_profile_city`, so you would run:
+```
+> IDX.DROP user_profile_city
+:1
+```
 
 ## Automatic Maintenance
 
