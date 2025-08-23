@@ -1,9 +1,11 @@
 use anyhow::{anyhow, bail, Result};
-use std::io::SeekFrom;
+use lz4_flex;
+use rayon::prelude::*;
+use std::io::{Read, SeekFrom, Write};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::task::{self, JoinHandle};
 
 use crate::commands::{apply_json_delete_to_db, apply_json_set_to_db};
 use crate::config::Config;
@@ -46,27 +48,48 @@ impl PersistenceEngine {
     }
 
     async fn create_snapshot(&self) -> Result<()> {
-        let mut temp_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.snapshot_temp_path)
-            .await?;
-        let mut writer = tokio::io::BufWriter::new(&mut temp_file);
+        let temp_path = self.snapshot_temp_path.clone();
+        let (tx, mut rx) = mpsc::channel::<SnapshotEntry>(128);
 
-        for item in self.db.iter() {
-            let serializable_value = SerializableDbValue::from_db_value(item.value()).await;
-            let entry = SnapshotEntry {
-                key: item.key().clone(),
-                value: serializable_value,
-            };
-            let mut data = serde_json::to_vec(&entry)?;
-            data.push(b'\n');
-            writer.write_all(&data).await?;
-        }
-        writer.flush().await?;
-        temp_file.sync_all().await?;
-        drop(temp_file);
+        let writer_task = task::spawn_blocking(move || -> anyhow::Result<()> {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&temp_path)?;
+            let writer = std::io::BufWriter::new(file);
+            let mut lz4_writer = lz4_flex::frame::FrameEncoder::new(writer);
+
+            while let Some(entry) = rx.blocking_recv() {
+                let data = bincode::serialize(&entry)?;
+                let len = data.len() as u32;
+                lz4_writer.write_all(&len.to_le_bytes())?;
+                lz4_writer.write_all(&data)?;
+            }
+
+            let mut writer = lz4_writer.finish()?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+            Ok(())
+        });
+
+        let db_clone = self.db.clone();
+        let reader_task = async move {
+            for item in db_clone.iter() {
+                let serializable_value = SerializableDbValue::from_db_value(item.value()).await;
+                let entry = SnapshotEntry {
+                    key: item.key().clone(),
+                    value: serializable_value,
+                };
+                if tx.send(entry).await.is_err() {
+                    break;
+                }
+            }
+        };
+
+        let (writer_result, _) = tokio::join!(writer_task, reader_task);
+        writer_result??;
+
         tokio::fs::rename(&self.snapshot_temp_path, &self.snapshot_path).await?;
         Ok(())
     }
@@ -159,29 +182,58 @@ pub async fn load_db_from_disk(snapshot_path: &str, wal_path: &str) -> Result<Db
 }
 
 async fn load_from_snapshot(snapshot_path: &str, db: &Db) -> Result<()> {
-    let file = match File::open(snapshot_path).await {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    println!(
-        "Loading database state from snapshot file: {}",
-        snapshot_path
-    );
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
-    let mut count = 0;
-    loop {
-        line.clear();
-        let bytes_read = reader.read_line(&mut line).await?;
-        if bytes_read == 0 {
-            break;
+    let snapshot_path_owned = snapshot_path.to_string();
+    let db_clone = db.clone();
+
+    let count = task::spawn_blocking(move || -> anyhow::Result<i32> {
+        let file = match std::fs::File::open(&snapshot_path_owned) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        
+        let reader = std::io::BufReader::new(file);
+        let mut lz4_reader = lz4_flex::frame::FrameDecoder::new(reader);
+        let mut total_count = 0;
+        const BATCH_SIZE: usize = 4096;
+
+        loop {
+            let mut batch = Vec::with_capacity(BATCH_SIZE);
+            for _ in 0..BATCH_SIZE {
+                let mut len_buf = [0u8; 4];
+                match lz4_reader.read_exact(&mut len_buf) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e.into()),
+                }
+                let entry_len = u32::from_le_bytes(len_buf) as usize;
+                let mut entry_buf = vec![0u8; entry_len];
+                lz4_reader.read_exact(&mut entry_buf)?;
+                let entry: SnapshotEntry = bincode::deserialize(&entry_buf)?;
+                batch.push(entry);
+            }
+
+            if batch.is_empty() {
+                break;
+            }
+
+            let batch_count = batch.len();
+            batch.into_par_iter().for_each(|entry| {
+                db_clone.insert(entry.key, entry.value.into_db_value());
+            });
+            total_count += batch_count as i32;
         }
-        let entry: SnapshotEntry = serde_json::from_str(&line)?;
-        db.insert(entry.key, entry.value.into_db_value());
-        count += 1;
+        
+        Ok(total_count)
+    }).await??;
+
+    if count > 0 {
+        println!(
+            "Successfully loaded {} entries from snapshot file: {}",
+            count, snapshot_path
+        );
     }
-    println!("Successfully loaded {} entries from snapshot.", count);
+
     Ok(())
 }
 
