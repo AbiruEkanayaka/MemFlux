@@ -12,6 +12,7 @@ Here is an example `config.json` with all available options:
   "port": 8360,
   "requirepass": "",
   "wal_file": "memflux.wal",
+  "wal_overflow_file": "memflux.wal.overflow",
   "snapshot_file": "memflux.snapshot",
   "snapshot_temp_file": "memflux.snapshot.tmp",
   "wal_size_threshold_mb": 128,
@@ -29,6 +30,7 @@ Here is an example `config.json` with all available options:
 -   `port` (number): The port to listen on. Default: `8360`.
 -   `requirepass` (string): If set to a non-empty string, clients must send the `AUTH <password>` command before any other commands. Default: `""` (disabled).
 -   `wal_file` (string): The path to the Write-Ahead Log file. Default: `"memflux.wal"`.
+-   `wal_overflow_file` (string): The path to the secondary WAL file used during compaction to prevent blocking writes. Default: `"memflux.wal.overflow"`.
 -   `snapshot_file` (string): The path to the database snapshot file. Default: `"memflux.snapshot"`.
 -   `snapshot_temp_file` (string): A temporary file used during snapshot creation. Default: `"memflux.snapshot.tmp"`.
 -   `wal_size_threshold_mb` (number): The size in megabytes the WAL file must reach to trigger a new snapshot. Default: `128`.

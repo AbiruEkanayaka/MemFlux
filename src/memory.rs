@@ -243,7 +243,6 @@ impl MemoryManager {
                         None
                     } else {
                         let mut freq_keys = self.lfu_freq_keys.write().await;
-                        let mut min_freq = self.lfu_min_freq.write().await;
 
                         // Acquire and prepare to scan starting from the current min frequency
                         let mut min_freq = self.lfu_min_freq.write().await;

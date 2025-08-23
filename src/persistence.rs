@@ -1,9 +1,9 @@
 use anyhow::{anyhow, bail, Result};
 use lz4_flex;
 use rayon::prelude::*;
-use std::io::{Read, SeekFrom, Write};
+use std::io::{Read, Write};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio::task::{self, JoinHandle};
 
@@ -13,7 +13,8 @@ use crate::types::*;
 
 pub struct PersistenceEngine {
     receiver: mpsc::Receiver<LogRequest>,
-    wal_path: String,
+    primary_wal_path: String,
+    overflow_wal_path: String,
     snapshot_path: String,
     snapshot_temp_path: String,
     wal_size_threshold_bytes: u64,
@@ -25,7 +26,8 @@ impl PersistenceEngine {
         let (tx, rx) = mpsc::channel(1024);
         let engine = PersistenceEngine {
             receiver: rx,
-            wal_path: config.wal_file.clone(),
+            primary_wal_path: config.wal_file.clone(),
+            overflow_wal_path: config.wal_overflow_file.clone(),
             snapshot_path: config.snapshot_file.clone(),
             snapshot_temp_path: config.snapshot_temp_file.clone(),
             wal_size_threshold_bytes: config.wal_size_threshold_mb * 1024 * 1024,
@@ -47,112 +49,225 @@ impl PersistenceEngine {
         }
     }
 
-    async fn create_snapshot(&self) -> Result<()> {
-        let temp_path = self.snapshot_temp_path.clone();
-        let (tx, mut rx) = mpsc::channel::<SnapshotEntry>(128);
+    fn spawn_snapshot_task(
+        db_clone: Db,
+        snapshot_path: String,
+        snapshot_temp_path: String,
+        wal_to_compact: String,
+    ) -> JoinHandle<Result<String>> {
+        tokio::spawn(async move {
+            let temp_path = snapshot_temp_path.clone();
+            let (tx, mut rx) = mpsc::channel::<SnapshotEntry>(128);
 
-        let writer_task = task::spawn_blocking(move || -> anyhow::Result<()> {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&temp_path)?;
-            let writer = std::io::BufWriter::new(file);
-            let mut lz4_writer = lz4_flex::frame::FrameEncoder::new(writer);
+            let writer_task = task::spawn_blocking(move || -> anyhow::Result<()> {
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&temp_path)?;
+                let writer = std::io::BufWriter::new(file);
+                let mut lz4_writer = lz4_flex::frame::FrameEncoder::new(writer);
 
-            while let Some(entry) = rx.blocking_recv() {
-                let data = bincode::serialize(&entry)?;
-                let len = data.len() as u32;
-                lz4_writer.write_all(&len.to_le_bytes())?;
-                lz4_writer.write_all(&data)?;
-            }
-
-            let mut writer = lz4_writer.finish()?;
-            writer.flush()?;
-            writer.get_ref().sync_all()?;
-            Ok(())
-        });
-
-        let db_clone = self.db.clone();
-        let reader_task = async move {
-            for item in db_clone.iter() {
-                let serializable_value = SerializableDbValue::from_db_value(item.value()).await;
-                let entry = SnapshotEntry {
-                    key: item.key().clone(),
-                    value: serializable_value,
-                };
-                if tx.send(entry).await.is_err() {
-                    break;
+                while let Some(entry) = rx.blocking_recv() {
+                    let data = bincode::serialize(&entry)?;
+                    let len = data.len() as u32;
+                    lz4_writer.write_all(&len.to_le_bytes())?;
+                    lz4_writer.write_all(&data)?;
                 }
-            }
-        };
 
-        let (writer_result, _) = tokio::join!(writer_task, reader_task);
-        writer_result??;
+                let mut writer = lz4_writer.finish()?;
+                writer.flush()?;
+                writer.get_ref().sync_all()?;
+                Ok(())
+            });
 
-        tokio::fs::rename(&self.snapshot_temp_path, &self.snapshot_path).await?;
-        Ok(())
+            let reader_task = async move {
+                for item in db_clone.iter() {
+                    let serializable_value =
+                        SerializableDbValue::from_db_value(item.value()).await;
+                    let entry = SnapshotEntry {
+                        key: item.key().clone(),
+                        value: serializable_value,
+                    };
+                    if tx.send(entry).await.is_err() {
+                        break;
+                    }
+                }
+            };
+
+            let (writer_result, _) = tokio::join!(writer_task, reader_task);
+            writer_result??;
+
+            tokio::fs::rename(&snapshot_temp_path, &snapshot_path).await?;
+            println!("Snapshot created successfully at {}", snapshot_path);
+
+            let wal_file_to_truncate = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&wal_to_compact)
+                .await?;
+            wal_file_to_truncate.set_len(0).await?;
+
+            println!(
+                "Compacted WAL file {} has been truncated.",
+                &wal_to_compact
+            );
+
+            Ok(wal_to_compact)
+        })
     }
 
     pub async fn run(mut self) -> Result<()> {
+        // --- Startup: Ensure both WAL files exist to allow for swift switching ---
+        if !tokio::fs::try_exists(&self.primary_wal_path).await? {
+            File::create(&self.primary_wal_path).await?;
+        }
+        if !tokio::fs::try_exists(&self.overflow_wal_path).await? {
+            File::create(&self.overflow_wal_path).await?;
+        }
+
+        let mut active_wal_path = self.primary_wal_path.clone();
+        let mut inactive_wal_path = self.overflow_wal_path.clone();
+
         let mut file = OpenOptions::new()
-            .create(true)
             .append(true)
-            .open(&self.wal_path)
+            .open(&active_wal_path)
             .await?;
         println!(
             "PersistenceEngine started, writing to {} with async fsync batching.",
-            self.wal_path
+            active_wal_path
         );
+
         let (mut fsync_notify_tx, fsync_notify_rx) = mpsc::channel::<()>(1);
         let mut fsync_task: JoinHandle<()> =
             tokio::spawn(Self::fsync_loop(file.try_clone().await?, fsync_notify_rx));
-        let mut write_buffer = Vec::with_capacity(8192);
 
-        while let Some(first_req) = self.receiver.recv().await {
-            write_buffer.clear();
-            let mut batch = vec![first_req];
-            while batch.len() < 256 {
-                if let Ok(req) = self.receiver.try_recv() {
-                    batch.push(req);
+        let mut write_buffer = Vec::with_capacity(8192);
+        let mut compaction_task: Option<JoinHandle<Result<String>>> = None;
+        let mut pending_compaction_path: Option<String> = None;
+
+        loop {
+            tokio::select! {
+                // Branch 1: A compaction task finishes. This can happen even if the DB is idle.
+                res = async { compaction_task.as_mut().unwrap().await }, if compaction_task.is_some() => {
+                    compaction_task = None; // Consume the task before handling the result
+                    match res? { // res is Result<Result<String, Error>, JoinError>
+                        Ok(truncated_wal_path) => {
+                            if truncated_wal_path == self.primary_wal_path {
+                                // Phase 1 complete: Primary WAL was just compacted. We were writing to overflow.
+                                // Now, switch back to primary immediately.
+                                println!("Primary WAL compacted. Switching back to primary WAL.");
+                                file.sync_all().await?;
+                                fsync_task.abort();
+
+                                std::mem::swap(&mut active_wal_path, &mut inactive_wal_path);
+                                file = OpenOptions::new().append(true).open(&active_wal_path).await?;
+                                println!("Switched writes to new WAL: {}", active_wal_path);
+
+                                let (new_tx, new_rx) = mpsc::channel::<()>(1);
+                                fsync_notify_tx = new_tx;
+                                fsync_task = tokio::spawn(Self::fsync_loop(file.try_clone().await?, new_rx));
+
+                                // The overflow WAL (now inactive) contains new data and needs to be compacted next.
+                                pending_compaction_path = Some(inactive_wal_path.clone());
+                            } else {
+                                // Phase 2 complete: Overflow WAL was just compacted. Cycle is complete.
+                                println!("Overflow WAL compacted. Compaction cycle complete.");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("FATAL: Background snapshot task failed: {}. Shutting down persistence engine.", e);
+                            bail!("Background snapshot failed: {}", e);
+                        }
+                    }
+                },
+
+                // Branch 2: A new write request comes in.
+                maybe_req = self.receiver.recv() => {
+                    let first_req = match maybe_req {
+                        Some(req) => req,
+                        None => break, // Channel closed, shutdown.
+                    };
+
+                    write_buffer.clear();
+                    let mut batch = vec![first_req];
+                    while batch.len() < 256 {
+                        if let Ok(req) = self.receiver.try_recv() {
+                            batch.push(req);
+                        } else {
+                            break;
+                        }
+                    }
+                    for req in &batch {
+                        let data = bincode::serialize(&req.entry)?;
+                        let len = data.len() as u32;
+                        write_buffer.extend_from_slice(&len.to_le_bytes());
+                        write_buffer.extend_from_slice(&data);
+                    }
+                    let write_result = file.write_all(&write_buffer).await.map_err(|e| anyhow!(e));
+                    let _ = fsync_notify_tx.try_send(());
+                    let write_result_for_ack = write_result.map_err(|e| e.to_string());
+                    for req in batch {
+                        let _ = req.ack.send(write_result_for_ack.clone());
+                    }
+                    if write_result_for_ack.is_err() {
+                        bail!(
+                            "Failed to write to WAL: {}",
+                            write_result_for_ack.unwrap_err()
+                        );
+                    }
+
+                    // Check if we need to trigger the start of a new compaction cycle
+                    if active_wal_path == self.primary_wal_path
+                        && file.metadata().await?.len() > self.wal_size_threshold_bytes
+                        && compaction_task.is_none()
+                        && pending_compaction_path.is_none()
+                    {
+                        println!(
+                            "WAL size exceeds threshold. Switching to overflow WAL and triggering compaction."
+                        );
+
+                        file.sync_all().await?;
+                        fsync_task.abort();
+
+                        std::mem::swap(&mut active_wal_path, &mut inactive_wal_path);
+                        println!("Switching writes to new WAL: {}", active_wal_path);
+
+                        file = OpenOptions::new()
+                            .write(true)
+                            .truncate(true)
+                            .open(&active_wal_path)
+                            .await?;
+
+                        let (new_tx, new_rx) = mpsc::channel::<()>(1);
+                        fsync_notify_tx = new_tx;
+                        fsync_task = tokio::spawn(Self::fsync_loop(file.try_clone().await?, new_rx));
+
+                        let wal_to_compact = inactive_wal_path.clone();
+                        compaction_task = Some(Self::spawn_snapshot_task(
+                            self.db.clone(),
+                            self.snapshot_path.clone(),
+                            self.snapshot_temp_path.clone(),
+                            wal_to_compact,
+                        ));
+                    }
+                }
+            }
+
+            // After the select, check if a pending compaction needs to be started.
+            // This is crucial for kicking off the second phase of the cycle.
+            if let Some(wal_to_compact) = pending_compaction_path.take() {
+                if compaction_task.is_none() {
+                    println!("Starting compaction for overflow WAL: {}", wal_to_compact);
+                    compaction_task = Some(Self::spawn_snapshot_task(
+                        self.db.clone(),
+                        self.snapshot_path.clone(),
+                        self.snapshot_temp_path.clone(),
+                        wal_to_compact,
+                    ));
                 } else {
-                    break;
+                    // This shouldn't happen, but as a safeguard, put it back.
+                    pending_compaction_path = Some(wal_to_compact);
                 }
-            }
-            for req in &batch {
-                let data = bincode::serialize(&req.entry)?;
-                let len = data.len() as u32;
-                write_buffer.extend_from_slice(&len.to_le_bytes());
-                write_buffer.extend_from_slice(&data);
-            }
-            let write_result = file.write_all(&write_buffer).await.map_err(|e| anyhow!(e));
-            let _ = fsync_notify_tx.try_send(());
-            let write_result_for_ack = write_result.map_err(|e| e.to_string());
-            for req in batch {
-                let _ = req.ack.send(write_result_for_ack.clone());
-            }
-            if write_result_for_ack.is_err() {
-                bail!(
-                    "Failed to write to WAL: {}",
-                    write_result_for_ack.unwrap_err()
-                );
-            }
-            if file.metadata().await?.len() > self.wal_size_threshold_bytes {
-                println!("WAL size exceeds threshold. Triggering snapshot and compaction...");
-                file.sync_all().await?;
-                fsync_task.abort();
-                if let Err(e) = self.create_snapshot().await {
-                    eprintln!("FATAL: Snapshot creation failed: {}. Shutting down persistence engine to prevent data loss.", e);
-                    bail!("Snapshot creation failed: {}", e);
-                }
-                println!("Snapshot created successfully at {}", self.snapshot_path);
-                file.set_len(0).await?;
-                file.seek(SeekFrom::Start(0)).await?;
-                println!("WAL file {} has been truncated.", self.wal_path);
-                let (new_tx, new_rx) = mpsc::channel::<()>(1);
-                fsync_notify_tx = new_tx;
-                fsync_task = tokio::spawn(Self::fsync_loop(file.try_clone().await?, new_rx));
-                println!("Fsync task restarted for new WAL.");
             }
         }
         Ok(())
@@ -160,7 +275,11 @@ impl PersistenceEngine {
 }
 
 
-pub async fn load_db_from_disk(snapshot_path: &str, wal_path: &str) -> Result<Db> {
+pub async fn load_db_from_disk(
+    snapshot_path: &str,
+    primary_wal_path: &str,
+    overflow_wal_path: &str,
+) -> Result<Db> {
     let db: Db = std::sync::Arc::new(dashmap::DashMap::new());
     if let Err(e) = load_from_snapshot(snapshot_path, &db).await {
         if e.downcast_ref::<std::io::Error>()
@@ -172,10 +291,18 @@ pub async fn load_db_from_disk(snapshot_path: &str, wal_path: &str) -> Result<Db
             );
         }
     }
-    if let Err(e) = replay_wal(wal_path, &db).await {
+    // It's important to replay the primary WAL first, then the overflow,
+    // to ensure the correct order of operations is restored.
+    if let Err(e) = replay_wal(primary_wal_path, &db).await {
         eprintln!(
             "Error replaying WAL file '{}': {}. State may be incomplete.",
-            wal_path, e
+            primary_wal_path, e
+        );
+    }
+    if let Err(e) = replay_wal(overflow_wal_path, &db).await {
+        eprintln!(
+            "Error replaying WAL file '{}': {}. State may be incomplete.",
+            overflow_wal_path, e
         );
     }
     Ok(db)

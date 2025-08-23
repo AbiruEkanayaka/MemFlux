@@ -79,7 +79,12 @@ async fn main() -> Result<()> {
     let config = Arc::new(Config::load("config.json")?);
 
     // 2. Load DB state from disk (snapshot then WAL)
-    let db = load_db_from_disk(&config.snapshot_file, &config.wal_file).await?;
+    let db = load_db_from_disk(
+        &config.snapshot_file,
+        &config.wal_file,
+        &config.wal_overflow_file,
+    )
+    .await?;
     println!("Database loaded with {} top-level keys.", db.len());
 
     // 3. Set up the persistence engine

@@ -6,6 +6,7 @@ Cargo.lock
 config.json
 memflux.crt
 memflux.key
+memflux.wal.overflow
 */__pycache__
 
 # Random files used in dev
