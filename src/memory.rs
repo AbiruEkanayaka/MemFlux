@@ -245,9 +245,15 @@ impl MemoryManager {
                         let mut freq_keys = self.lfu_freq_keys.write().await;
                         let mut min_freq = self.lfu_min_freq.write().await;
 
+                        // Acquire and prepare to scan starting from the current min frequency
+                        let mut min_freq = self.lfu_min_freq.write().await;
+                        let mut iterations = 0;
+                        const MAX_ITERATIONS: u32 = 10000;
                         loop {
-                            // Safety check: if min_freq exceeds a reasonable threshold, break
-                            if *min_freq > 1_000_000 {
+                            iterations += 1;
+                            // Safety check: if min_freq exceeds a reasonable threshold, or
+                            // we’ve looped too many times, give up
+                            if *min_freq > 1_000_000 || iterations > MAX_ITERATIONS {
                                 break None;
                             }
                             match freq_keys.get_mut(&min_freq) {
