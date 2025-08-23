@@ -251,8 +251,9 @@ impl MemoryManager {
                         loop {
                             iterations += 1;
                             // Safety check: if min_freq exceeds a reasonable threshold, or
-                            // we’ve looped too many times, give up
+                            // we've looped too many times, give up
                             if *min_freq > 1_000_000 || iterations > MAX_ITERATIONS {
+                                eprintln!("WARNING: LFU eviction safety limit reached - min_freq: {}, iterations: {}", *min_freq, iterations);
                                 break None;
                             }
                             match freq_keys.get_mut(&min_freq) {

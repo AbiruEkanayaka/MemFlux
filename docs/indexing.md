@@ -62,7 +62,7 @@ To see all created indexes, use `IDX.LIST`.
 ```
 > IDX.LIST
 *1
-$21
+$19
 user:*|profile.city
 ```
 The response is an array of the full **internal** index names, which are composed of the key prefix and the JSON path, separated by a `|`. Note that this internal name is for informational purposes and is **not** the name used to drop the index.

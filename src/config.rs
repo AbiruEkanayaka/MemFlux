@@ -22,6 +22,7 @@ pub struct Config {
     pub port: u16,
     pub requirepass: String,
     pub wal_file: String,
+    #[serde(default = "default_wal_overflow_file")]
     pub wal_overflow_file: String,
     pub snapshot_file: String,
     pub snapshot_temp_file: String,
@@ -48,6 +49,11 @@ fn default_cert_file() -> String {
 fn default_key_file() -> String {
     "memflux.key".to_string()
 }
+
+fn default_wal_overflow_file() -> String {
+    "memflux.wal.overflow".to_string()
+}
+
 
 impl Default for Config {
     fn default() -> Self {
