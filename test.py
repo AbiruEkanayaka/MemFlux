@@ -91,15 +91,15 @@ if __name__ == "__main__":
                 parts = shlex.split(" ".join(sys.argv[3:]))
                 benchmark(sock, reader, parts, count)
             elif sys.argv[1] == "bench-ops":
-                if len(sys.argv) < 4:
-                    print("Usage: python run_tests.py bench-ops DURATION_SEC COMMAND [ARGS...]")
+                if len(sys.argv) < 5:
+                    print("Usage: python run_tests.py bench-ops PIPELINE_SIZE DURATION_SEC COMMAND [ARGS...]")
                     sys.exit(1)
-                duration = int(sys.argv[2])
+                pipeline_size = int(sys.argv[2])
+                duration = int(sys.argv[3])
                 # Join args and then split to handle quoted arguments correctly
-                cmd_line = " ".join(sys.argv[3:])
+                cmd_line = " ".join(sys.argv[4:])
                 parts = shlex.split(cmd_line)
                 
-                pipeline_size = 50000
                 if '--pipeline' in parts:
                     try:
                         idx = parts.index('--pipeline')
