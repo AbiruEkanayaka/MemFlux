@@ -14,7 +14,7 @@ futures = "0.3"
 async-stream = "0.3.6"
 uuid = { version = "1.8.0", features = ["v4"] }
 pin-project-lite = "0.2.16"
-regex = { version = "1.10.5", default-features = false, features = ["std"] }
+regex = { version = "1.10.5", features = ["std"] }
 chrono = { version = "0.4", features = ["serde"] }
 tokio-rustls = "0.24"
 rustls = "0.21"
