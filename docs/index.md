@@ -20,6 +20,12 @@ Persistence is built-in, with a Write-Ahead Log (WAL) for durability and automat
 *   **Durable Persistence:** Uses a Write-Ahead Log (WAL) for command logging and automatic background snapshotting to ensure data safety and fast restarts.
 *   **Built-in Functions:** A library of SQL functions for string manipulation, numeric operations, and date/time processing.
 
+## For Developers
+
+For developers interested in the internal architecture of MemFlux, the following documents provide a deeper dive into the source code and design decisions.
+
+*   **[Internals Index](./internals/index.md)**
+
 ## Getting Started
 
 ### Running the Server

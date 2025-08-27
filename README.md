@@ -15,6 +15,7 @@
 
 ## Table of Contents
 *   [What is MemFlux?](#what-is-memflux)
+*   [Full Documentation](#full-documentation)
 *   [How to Use It](#how-to-use-it)
     *   [Running the Server](#running-the-server)
     *   [Connecting to the Server](#connecting-to-the-server)
@@ -42,10 +43,27 @@ MemFlux is an experimental, high-performance, in-memory, multi-model database se
     *   Data Definition Language (DDL): `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE` for managing "virtual schemas".
     *   Advanced features like subqueries, `CASE` statements, and a rich function library (`LOWER`, `NOW()`, `ABS()`, etc.).
 *   **Redis (RESP) Compatible Protocol:** Use your favorite Redis client or the provided interactive script to connect and issue commands.
-*   **Persistence:** Durability is achieved through a Write-Ahead Log (WAL) and periodic snapshotting, ensuring your data is safe even if the server restarts.
+*   **Durable Persistence:** Durability is achieved through a Write-Ahead Log (WAL) and periodic snapshotting, ensuring your data is safe even if the server restarts.
 *   **Secondary Indexing:** Create indexes on JSON fields to dramatically accelerate SQL query performance.
+*   **Configurable Memory Management:** Set a `maxmemory` limit and choose from multiple eviction policies (`LRU`, `LFU`, `ARC`, `LFRU`, `Random`) to control memory usage.
+*   **TLS Encryption:** Secure client connections with TLS, with automatic self-signed certificate generation for easy setup.
 
 > **Note:** As this is an alpha project, many of the features listed above are still under heavy development and may be incomplete or unstable.
+
+## Full Documentation
+
+While this README provides a quick start, the complete documentation contains a detailed reference for every command, SQL feature, and internal system.
+
+**[---> Start with the Documentation Index](./docs/index.md) <---**
+
+Key sections include:
+
+*   **[Configuration](./docs/configuration.md):** How to configure the server, including memory limits, persistence, and TLS.
+*   **[Data Types](./docs/types.md):** An overview of the core data types (JSON, Lists, Sets) and the SQL type system.
+*   **[Commands](./docs/commands.md):** Detailed reference for all non-SQL, Redis-style commands.
+*   **[SQL Reference](./docs/sql.md):** A comprehensive guide to the SQL engine, from DDL to complex `SELECT` queries.
+*   **[Persistence](./docs/persistence.md):** An explanation of how data durability is achieved.
+*   **[Indexing](./docs/indexing.md):** Guide to creating and using indexes for performance.
 
 ## How to Use It
 
@@ -71,7 +89,7 @@ You can connect using any Redis-compatible client. Alternatively, the project in
 pip install prompt-toolkit
 
 # Run the interactive client
-python test.py
+python3 test.py
 ```
 
 You can now enter commands at the `>` prompt.
@@ -173,20 +191,6 @@ $29
 {"user.name":"Bob","orders.item":"Mouse"}
 ```
 
-## Full Documentation
-
-While this README provides a quick start, the complete documentation contains a detailed reference for every command, SQL feature, and internal system.
-
-**[---> Start with the Documentation Index](./docs/index.md) <---**
-
-Key sections include:
-
-*   **[Commands](./docs/commands.md):** Detailed reference for all non-SQL, Redis-style commands.
-*   **[SQL Reference](./docs/sql.md):** An introduction to the SQL engine and links to detailed sections.
-*   **[Persistence](./docs/persistence.md):** An explanation of how data durability is achieved through WAL and snapshots.
-*   **[Indexing](./docs/indexing.md):** Guide to creating and using indexes for JSON data.
-*   **[Memory Management](./docs/memory.md):** How to configure memory limits and the eviction policy.
-
 ## How It Works (A Basic Overview)
 
 > **Note:** This is a simplified explanation of an alpha-stage project. The implementation details are subject to change.
@@ -201,8 +205,9 @@ Key sections include:
 
 4.  **Persistence Engine:** To prevent data loss, every write operation is first serialized and written to a **Write-Ahead Log (WAL)** file (`memflux.wal`) on disk.
     *   The client receives an "OK" confirmation only after the write has been committed to the WAL.
-    *   When the WAL file grows beyond a certain threshold, the server performs a **snapshot**: it writes the entire current state of the in-memory database to a new snapshot file (`memflux.snapshot`) and then truncates the WAL.
-    *   On startup, the server restores its state by loading the latest snapshot and then replaying any subsequent entries from the WAL.
+    *   When the WAL file grows beyond a certain threshold, the server performs a **non-blocking snapshot**. It switches writes to a secondary overflow WAL (`memflux.wal.overflow`) while a background task writes the entire current database state to a new snapshot file (`memflux.snapshot`).
+    *   After the snapshot is successfully created, the original, now-inactive WAL is truncated. This two-file approach ensures that I/O-intensive snapshotting never blocks incoming write commands.
+    *   On startup, the server restores its state by loading the latest snapshot and then replaying any subsequent entries from the WAL files.
 
 5.  **SQL Query Engine Pipeline:**
     *   **Parser:** The raw SQL string is tokenized and parsed into an **Abstract Syntax Tree (AST)**, which is a tree-like representation of the query structure.
@@ -213,6 +218,8 @@ Key sections include:
 ## Development Guide
 
 > **Disclaimer:** This is a solo, pre-alpha project. The development process is informal. Contributions are highly encouraged!
+
+For a deeper understanding of the project's architecture, see the **[Internals Documentation](./docs/internals/index.md)**.
 
 ### Prerequisites
 *   The Rust programming language toolchain (`rustc`, `cargo`). You can install it from [rust-lang.org](https://www.rust-lang.org/).
@@ -241,10 +248,10 @@ cargo run
 # --- In another terminal ---
 
 # Run all unit tests
-python test.py unit all
+python3 test.py unit all
 
 # Run a specific test suite (e.g., just the SQL tests)
-python test.py unit sql
+python3 test.py unit sql
 
 # Available suites: byte, json, lists, sets, sql, snapshot, types,
 # schema, aliases, case, like, subqueries, union, functions
