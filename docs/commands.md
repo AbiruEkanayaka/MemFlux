@@ -74,10 +74,11 @@ Retrieves a value from a JSON document.
 - **Example:** `JSON.GET user:1.profile`
 
 #### `JSON.DEL <key-path>`
-Deletes a value from a JSON document.
+Deletes a value from a JSON document. If the path is just a key, the entire key is deleted.
 - **Syntax:** `JSON.DEL <key-path>`
-- **Returns:** An integer reply: `1` if the path existed and was deleted, `0` otherwise.
-- **Example:** `JSON.DEL user:1.profile.age`
+- **Returns:** An integer reply: `1` if the path/key existed and was deleted, `0` otherwise.
+- **Example (field):** `JSON.DEL user:1.profile.age`
+- **Example (key):** `JSON.DEL user:1`
 
 ## List Commands
 

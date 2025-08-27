@@ -92,6 +92,7 @@ This documentation is organized into the following sections:
 
 *   **[Configuration](./configuration.md):** How to configure the server, including TLS.
 *   **[Commands](./commands.md):** Detailed reference for all non-SQL, Redis-style commands.
+*   **[Data Types](./types.md):** An overview of the core data types and the SQL type system.
 *   **[SQL Reference](./sql.md):** An introduction to the SQL engine and links to detailed sections.
 *   **[Persistence](./persistence.md):** An explanation of how data durability is achieved through WAL and snapshots.
 *   **[Indexing](./indexing.md):** Guide to creating and using indexes for JSON data.

@@ -8,6 +8,9 @@ use std::path::Path;
 pub enum EvictionPolicy {
     LRU,
     LFU,
+    LFRU,
+    ARC,
+    Random,
 }
 
 impl Default for EvictionPolicy {

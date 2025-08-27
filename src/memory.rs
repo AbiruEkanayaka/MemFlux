@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Result};
+use rand::Rng;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{oneshot, RwLock};
 
+use crate::arc::ArcCache;
 use crate::config::EvictionPolicy;
 use crate::types::{AppContext, DbValue, LogEntry, LogRequest};
 
@@ -37,18 +39,32 @@ pub struct MemoryManager {
     lfu_freq_keys: RwLock<HashMap<u64, VecDeque<String>>>,
     // For LFU: The minimum frequency currently in the cache.
     lfu_min_freq: RwLock<u64>,
+    // For LFRU: Probationary and protected segments.
+    lfru_probationary: RwLock<VecDeque<String>>,
+    lfru_protected: RwLock<VecDeque<String>>,
+    lfru_protected_ratio: f64, // Ratio of total capacity for the protected segment
+    // For ARC
+    arc_cache: RwLock<ArcCache<String>>,
+    // For Random
+    random_keys: RwLock<Vec<String>>,
 }
 
 impl MemoryManager {
     pub fn new(maxmemory_mb: u64, policy: EvictionPolicy) -> Self {
+        let max_memory_bytes = maxmemory_mb * 1024 * 1024;
         Self {
-            max_memory_bytes: maxmemory_mb * 1024 * 1024,
+            max_memory_bytes,
             estimated_memory: AtomicU64::new(0),
             policy,
             lru_keys: RwLock::new(VecDeque::new()),
             lfu_freqs: RwLock::new(HashMap::new()),
             lfu_freq_keys: RwLock::new(HashMap::new()),
             lfu_min_freq: RwLock::new(0),
+            lfru_probationary: RwLock::new(VecDeque::new()),
+            lfru_protected: RwLock::new(VecDeque::new()),
+            lfru_protected_ratio: 0.8, // Default 80% for protected
+            arc_cache: RwLock::new(ArcCache::new(0)), // Start with 0 capacity
+            random_keys: RwLock::new(Vec::new()),
         }
     }
 
@@ -113,6 +129,24 @@ impl MemoryManager {
                     *min_freq = 1;
                 }
             }
+            EvictionPolicy::LFRU => {
+                let mut probationary = self.lfru_probationary.write().await;
+                for key in keys {
+                    probationary.push_back(key);
+                }
+            }
+            EvictionPolicy::ARC => {
+                let mut arc = self.arc_cache.write().await;
+                // Only re-initialize if capacity needs to change significantly
+                if arc.capacity == 0 || arc.capacity < keys.len() / 2 {
+                    *arc = ArcCache::new(keys.len());
+                }
+                arc.prime(keys);
+            }
+            EvictionPolicy::Random => {
+                let mut random = self.random_keys.write().await;
+                *random = keys;
+            }
         }
     }
 
@@ -164,6 +198,43 @@ impl MemoryManager {
                     .or_default()
                     .push_back(key.to_string());
             }
+            EvictionPolicy::LFRU => {
+                let mut probationary = self.lfru_probationary.write().await;
+                let mut protected = self.lfru_protected.write().await;
+
+                if let Some(pos) = probationary.iter().position(|k| k == key) {
+                    // Move from probationary to protected
+                    if let Some(k) = probationary.remove(pos) {
+                        // Check protected segment capacity
+                        let total_capacity = probationary.len() + protected.len();
+                        let max_protected = ((total_capacity as f64) * self.lfru_protected_ratio) as usize;
+                        if protected.len() >= max_protected && !protected.is_empty() {
+                            // Evict from protected to probationary
+                            if let Some(evicted) = protected.pop_back() {
+                                probationary.push_back(evicted);
+                            }
+                        }
+                        protected.push_front(k);
+                    }
+                } else if let Some(pos) = protected.iter().position(|k| k == key) {
+                    // Move to front of protected
+                    if let Some(k) = protected.remove(pos) {
+                        protected.push_front(k);
+                    }
+                } else {
+                    // New key, add to probationary
+                    probationary.push_front(key.to_string());
+                }
+            }
+            EvictionPolicy::ARC => {
+                self.arc_cache.write().await.track_access(&key.to_string());
+            }
+            EvictionPolicy::Random => {
+                let mut keys = self.random_keys.write().await;
+                if !keys.iter().any(|k| k == key) {
+                    keys.push(key.to_string());
+                }
+            }
         }
     }
 
@@ -193,6 +264,26 @@ impl MemoryManager {
                     }
                 }
             }
+            EvictionPolicy::LFRU => {
+                let mut probationary = self.lfru_probationary.write().await;
+                if let Some(pos) = probationary.iter().position(|k| k == key) {
+                    probationary.remove(pos);
+                    return;
+                }
+                let mut protected = self.lfru_protected.write().await;
+                if let Some(pos) = protected.iter().position(|k| k == key) {
+                    protected.remove(pos);
+                }
+            }
+            EvictionPolicy::ARC => {
+                self.arc_cache.write().await.forget_key(&key.to_string());
+            }
+            EvictionPolicy::Random => {
+                let mut keys = self.random_keys.write().await;
+                if let Some(pos) = keys.iter().position(|k| k == key) {
+                    keys.remove(pos);
+                }
+            }
         }
     }
 
@@ -217,6 +308,16 @@ impl MemoryManager {
                 if freq < *min_freq || *min_freq == 0 {
                     *min_freq = freq;
                 }
+            }
+            EvictionPolicy::LFRU => {
+                // Restore to probationary
+                self.lfru_probationary.write().await.push_back(key);
+            }
+            EvictionPolicy::ARC => {
+                self.arc_cache.write().await.restore_evicted_key(key);
+            }
+            EvictionPolicy::Random => {
+                self.random_keys.write().await.push(key);
             }
         }
     }
@@ -271,6 +372,32 @@ impl MemoryManager {
                                 }
                             }
                         }
+                    }
+                }
+                EvictionPolicy::LFRU => {
+                    let mut probationary = self.lfru_probationary.write().await;
+                    if let Some(key) = probationary.pop_back() {
+                        Some((key, None))
+                    } else {
+                        // Probationary is empty, move from protected to probationary
+                        let mut protected = self.lfru_protected.write().await;
+                        if let Some(key) = protected.pop_back() {
+                            probationary.push_front(key);
+                            // Now probationary has one item, so pop it
+                            probationary.pop_back().map(|k| (k, None))
+                        } else {
+                            None // Both are empty
+                        }
+                    }
+                }
+                EvictionPolicy::ARC => self.arc_cache.write().await.evict().map(|k| (k, None)),
+                EvictionPolicy::Random => {
+                    let mut keys = self.random_keys.write().await;
+                    if keys.is_empty() {
+                        None
+                    } else {
+                        let index = rand::thread_rng().gen_range(0..keys.len());
+                        Some((keys.remove(index), None))
                     }
                 }
             };

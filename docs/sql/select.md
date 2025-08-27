@@ -76,6 +76,7 @@ Sorts the result set in ascending or descending order.
 - `ASC`: Ascending order (default).
 - `DESC`: Descending order.
 - **Type-Aware Sorting:** If a virtual schema is present, sorting will be performed based on the column's data type (e.g., `20` comes after `5` for an `INTEGER` column, even if they are stored as strings).
+- **NULLs:** `NULL` values are always sorted first, regardless of `ASC` or `DESC` direction.
 
 **Example:**
 ```sql
