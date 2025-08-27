@@ -53,7 +53,7 @@ MemFlux is an experimental, high-performance, in-memory, multi-model database se
 
 1.  **Clone the repository:**
     ```sh
-    git clone <your-repo-url>
+    git clone https://github.com/AbiruEkanayaka/MemFlux.git
     cd MemFlux
     ```
 2.  **Build and run the server:**
