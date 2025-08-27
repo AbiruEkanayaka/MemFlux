@@ -20,6 +20,12 @@ Persistence is built-in, with a Write-Ahead Log (WAL) for durability and automat
 *   **Durable Persistence:** Uses a Write-Ahead Log (WAL) for command logging and automatic background snapshotting to ensure data safety and fast restarts.
 *   **Built-in Functions:** A library of SQL functions for string manipulation, numeric operations, and date/time processing.
 
+## For Developers
+
+For developers interested in the internal architecture of MemFlux, the following documents provide a deeper dive into the source code and design decisions.
+
+*   **[Internals Index](./internals/index.md)**
+
 ## Getting Started
 
 ### Running the Server
@@ -92,6 +98,7 @@ This documentation is organized into the following sections:
 
 *   **[Configuration](./configuration.md):** How to configure the server, including TLS.
 *   **[Commands](./commands.md):** Detailed reference for all non-SQL, Redis-style commands.
+*   **[Data Types](./types.md):** An overview of the core data types and the SQL type system.
 *   **[SQL Reference](./sql.md):** An introduction to the SQL engine and links to detailed sections.
 *   **[Persistence](./persistence.md):** An explanation of how data durability is achieved through WAL and snapshots.
 *   **[Indexing](./indexing.md):** Guide to creating and using indexes for JSON data.
