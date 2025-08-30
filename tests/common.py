@@ -5,6 +5,46 @@ import json
 import ssl
 
 
+# --- Test Runner ---
+class TestResult:
+    def __init__(self):
+        self.passed = 0
+        self.failed = 0
+        self.failed_tests = []
+
+    def record_pass(self, desc):
+        self.passed += 1
+        print(f"[PASS] {desc}")
+
+    def record_fail(self, actual, expected, desc):
+        self.failed += 1
+        self.failed_tests.append({'desc': desc, 'expected': expected, 'actual': actual})
+        print(f"[FAIL] {desc}")
+
+    def summary(self):
+        print("\n--- Unit Test Summary ---")
+        if self.failed == 0 and self.passed > 0:
+            print(f"All {self.passed} unit tests passed!")
+        elif self.failed == 0 and self.passed == 0:
+            print("No tests were run.")
+        else:
+            total = self.passed + self.failed
+            print(f"{self.passed}/{total} unit tests passed, {self.failed} failed.")
+            if self.failed_tests:
+                print("\nFailed tests:")
+                for failure in self.failed_tests:
+                    print(f"- {failure['desc']}")
+                    print(f"  - Expected: {failure['expected']!r}")
+                    print(f"  - Actual:   {failure['actual']!r}")
+        print("--- End of Summary ---")
+        if self.failed > 0:
+            sys.exit(1)
+
+
+# Global instance to be used by all test modules
+test_result = TestResult()
+
+
 def create_connection(retry=False):
     host = "127.0.0.1"
     port = 8360
@@ -133,10 +173,11 @@ def send_resp_command(sock, reader, parts):
     return response_bytes.decode('utf-8', errors='replace'), send_time, latency, total
 
 def assert_eq(actual, expected, desc):
+    # Use the global test_result instance
     if actual == expected:
-        print(f"[PASS] {desc}")
+        test_result.record_pass(desc)
     else:
-        print(f"[FAIL] {desc}\n  Expected: {expected!r}\n  Actual:   {actual!r}")
+        test_result.record_fail(actual, expected, desc)
 
 def extract_json_from_bulk(resp):
     """Extract JSON payload from RESP bulk string ($len\r\n...json...)"""

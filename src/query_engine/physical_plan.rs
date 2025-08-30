@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use super::ast::{AlterTableAction, ColumnDef};
+use super::ast::{AlterTableAction, ColumnDef, ForeignKeyClause};
 use super::logical_plan::*;
 use crate::indexing::IndexManager;
 
@@ -45,6 +45,9 @@ pub enum PhysicalPlan {
     CreateTable {
         table_name: String,
         columns: Vec<ColumnDef>,
+        primary_key: Vec<String>,
+        foreign_keys: Vec<ForeignKeyClause>,
+        check: Option<Expression>,
     },
     DropTable {
         table_name: String,
@@ -145,9 +148,15 @@ pub fn logical_to_physical_plan(
         LogicalPlan::CreateTable {
             table_name,
             columns,
+            primary_key,
+            foreign_keys,
+            check,
         } => Ok(PhysicalPlan::CreateTable {
             table_name,
             columns,
+            primary_key,
+            foreign_keys,
+            check,
         }),
         LogicalPlan::DropTable {
             table_name,

@@ -35,7 +35,7 @@ fn tokenize(sql: &str) -> Vec<String> {
                     current_token.clear();
                 }
             }
-            '=' | ',' | '(' | ')' | '>' | '<' | '!' => {
+            '=' | ',' | '(' | ')' | '>' | '<' | '!' | '[' | ']' => {
                 if !current_token.is_empty() {
                     tokens.push(current_token.clone());
                     current_token.clear();
@@ -49,7 +49,8 @@ fn tokenize(sql: &str) -> Vec<String> {
                 }
                 tokens.push(op);
             }
-            '.' => {
+
+            '.'=> {
                 if !current_token.is_empty() && current_token.chars().all(|c| c.is_ascii_digit()) {
                     current_token.push('.');
                 } else {
@@ -134,8 +135,7 @@ impl Parser {
                         // Implicit alias (e.g. "SELECT col1 c1")
                         if !["FROM", ",", "WHERE", "ORDER", "GROUP", "LIMIT", "OFFSET", "JOIN"]
                             .iter()
-                            .any(|k| k.eq_ignore_ascii_case(token))
-                        {
+                            .any(|k| k.eq_ignore_ascii_case(token)) {
                             alias = Some(token.to_string());
                             self.advance();
                         }
@@ -195,8 +195,7 @@ impl Parser {
         if let Some(op) = self.current() {
             if ["=", "!=", ">", "<", ">=", "<=", "LIKE", "ILIKE", "IN"]
                 .iter()
-                .any(|k| k.eq_ignore_ascii_case(op))
-            {
+                .any(|k| k.eq_ignore_ascii_case(op)) {
                 let op_str = op.to_uppercase();
                 self.advance();
 
@@ -209,12 +208,12 @@ impl Parser {
                         // This would be for a list of values, e.g. IN (1, 2, 3)
                         // For now, we only support subqueries as per the plan.
                         // We can just parse a single expression for now for `= (...)`
-                        self.parse_expression()?
+                        self.parse_expression()? 
                     };
                     self.expect(")")?;
                     expr
                 } else {
-                    self.parse_primary_expression()?
+                    self.parse_primary_expression()? 
                 };
 
                 return Ok(SimpleExpression::BinaryOp {
@@ -261,8 +260,7 @@ impl Parser {
                         if identifier.eq_ignore_ascii_case("CAST") {
                             let expr_to_cast = self.parse_expression()?;
                             self.expect("AS")?;
-                            let data_type = self.current().ok_or_else(|| anyhow!("Expected data type for CAST"))?.to_string();
-                            self.advance();
+                            let data_type = self.parse_data_type()?;
                             self.expect(")")?;
                             return Ok(SimpleExpression::Cast { expr: Box::new(expr_to_cast), data_type });
                         }
@@ -273,7 +271,7 @@ impl Parser {
                         if ["COUNT", "SUM", "AVG", "MIN", "MAX"].contains(&func_name.as_str()) {
                             let arg = self
                                 .current()
-                                .ok_or_else(|| anyhow!("Expected argument for {}", func_name))?
+                                .ok_or_else(|| anyhow!("Expected argument for {}", func_name))? 
                                 .to_string();
                             self.advance(); // consume argument
                             self.expect(")")?;
@@ -305,7 +303,7 @@ impl Parser {
                     Ok(SimpleExpression::Column(col_name))
                 }
             }
-            None => Err(anyhow!("Unexpected end of input in expression")),
+            None => Err(anyhow!("Unexpected end of input in expression"))
         }
     }
 
@@ -390,6 +388,39 @@ impl Parser {
         Ok(exprs)
     }
 
+    fn parse_data_type(&mut self) -> Result<String> {
+        let mut data_type = self.current().ok_or_else(|| anyhow!("Expected data type"))?.to_string();
+        self.advance();
+
+        if (data_type.eq_ignore_ascii_case("NUMERIC") || data_type.eq_ignore_ascii_case("VARCHAR") || data_type.eq_ignore_ascii_case("CHAR")) && self.current() == Some("(") {
+            self.advance(); // consume (
+            data_type.push('(');
+            let precision = self.current().ok_or_else(|| anyhow!("Expected precision for {}", data_type))?.to_string();
+            self.advance();
+            data_type.push_str(&precision);
+            if self.current() == Some(",") {
+                self.advance(); // consume ,
+                data_type.push(',');
+                let scale = self.current().ok_or_else(|| anyhow!("Expected scale for NUMERIC"))?.to_string();
+                self.advance();
+                data_type.push_str(&scale);
+            }
+            data_type.push(')');
+            self.expect(")")?;
+        } else if data_type.eq_ignore_ascii_case("DOUBLE") && self.current().map_or(false, |t| t.eq_ignore_ascii_case("PRECISION")) {
+            self.advance(); // consume PRECISION
+            data_type.push_str(" PRECISION");
+        }
+
+        if self.current() == Some("[") {
+            self.advance();
+            self.expect("]")?;
+            data_type.push_str("[]");
+        }
+
+        Ok(data_type)
+    }
+
     pub fn parse(&mut self) -> Result<AstStatement> {
         match self.current().map(|s| s.to_uppercase()).as_deref() {
             Some("SELECT") => Ok(AstStatement::Select(self.parse_select()?)),
@@ -420,21 +451,70 @@ impl Parser {
         self.expect("(")?;
 
         let mut columns = Vec::new();
+        let mut primary_key = Vec::new();
+        let mut foreign_keys = Vec::new();
+        let mut check = None;
+
         loop {
+            if self.current() == Some(")") {
+                break;
+            }
+
+            // Check for table-level constraints
+            if let Some(token) = self.current() {
+                let upper_token = token.to_uppercase();
+                if upper_token == "PRIMARY" || upper_token == "FOREIGN" || upper_token == "CHECK" || upper_token == "CONSTRAINT" || upper_token == "UNIQUE" {
+                    break;
+                }
+            }
+
             let column_name = self
                 .current()
-                .ok_or_else(|| anyhow!("Expected column name"))?
+                .ok_or_else(|| anyhow!("Expected column name or constraint definition"))?
                 .to_string();
             self.advance();
-            let data_type = self
-                .current()
-                .ok_or_else(|| anyhow!("Expected data type for column {}", column_name))?
-                .to_string();
-            self.advance();
+            let data_type = self.parse_data_type()?;
+
+            let mut nullable = true;
+            let mut unique = false;
+            let mut default = None;
+
+            // Loop for inline constraints
+            'inline: loop {
+                match self.current().map(|s| s.to_uppercase()).as_deref() {
+                    Some("NOT") => {
+                        self.advance();
+                        self.expect("NULL")?;
+                        nullable = false;
+                    }
+                    Some("UNIQUE") => {
+                        self.advance();
+                        unique = true;
+                    }
+                    Some("PRIMARY") => {
+                        self.advance();
+                        self.expect("KEY")?;
+                        if !primary_key.is_empty() {
+                            return Err(anyhow!("Multiple primary keys defined"));
+                        }
+                        primary_key.push(column_name.clone());
+                        nullable = false;
+                        unique = true;
+                    }
+                    Some("DEFAULT") => {
+                        self.advance();
+                        default = Some(self.parse_expression()?);
+                    }
+                    _ => break 'inline,
+                }
+            }
 
             columns.push(ColumnDef {
                 name: column_name,
                 data_type,
+                nullable,
+                unique,
+                default,
             });
 
             if self.current() == Some(",") {
@@ -444,11 +524,151 @@ impl Parser {
             }
         }
 
+        // Now parse table-level constraints
+        loop {
+            if self.current() == Some(")") {
+                break;
+            }
+            if self.current() == Some(",") {
+                self.advance();
+            }
+
+            let constraint_name = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("CONSTRAINT")) {
+                self.advance();
+                let name = self.current().ok_or_else(|| anyhow!("Expected constraint name"))?.to_string();
+                self.advance();
+                Some(name)
+            } else {
+                None
+            };
+
+            match self.current().map(|s| s.to_uppercase()).as_deref() {
+                Some("PRIMARY") => {
+                    self.advance();
+                    self.expect("KEY")?;
+                    self.expect("(")?;
+                    if !primary_key.is_empty() {
+                        return Err(anyhow!("Multiple primary keys defined"));
+                    }
+                    loop {
+                        primary_key.push(self.current().ok_or_else(|| anyhow!("Expected column name in PRIMARY KEY"))?.to_string());
+                        self.advance();
+                        if self.current() == Some(",") {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    self.expect(")")?;
+                }
+                Some("FOREIGN") => {
+                    let mut fk = self.parse_foreign_key_clause()?;
+                    fk.name = constraint_name;
+                    foreign_keys.push(fk);
+                }
+                Some("CHECK") => {
+                    self.advance();
+                    self.expect("(")?;
+                    check = Some(self.parse_expression()?);
+                    self.expect(")")?;
+                }
+                Some("UNIQUE") => {
+                    self.advance();
+                    self.expect("(")?;
+                    loop {
+                        let col_name = self.current().ok_or_else(|| anyhow!("Expected column name in UNIQUE constraint"))?.to_string();
+                        if let Some(col) = columns.iter_mut().find(|c| c.name == col_name) {
+                            col.unique = true;
+                        } else {
+                            return Err(anyhow!("Column '{}' in UNIQUE constraint not found in table definition", col_name));
+                        }
+                        self.advance();
+                        if self.current() == Some(",") {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    self.expect(")")?;
+                }
+                _ => {
+                    if self.current() == Some(")") {
+                        break;
+                    }
+                    return Err(anyhow!("Unexpected token in CREATE TABLE: {:?}", self.current()));
+                }
+            }
+        }
+
         self.expect(")")?;
 
         Ok(CreateTableStatement {
             table_name,
             columns,
+            primary_key,
+            foreign_keys,
+            check,
+        })
+    }
+
+    fn parse_foreign_key_clause(&mut self) -> Result<ForeignKeyClause> {
+        self.expect("FOREIGN")?;
+        self.expect("KEY")?;
+        self.expect("(")?;
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.current().ok_or_else(|| anyhow!("Expected column name in FOREIGN KEY"))?.to_string());
+            self.advance();
+            if self.current() == Some(",") {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(")")?;
+
+        self.expect("REFERENCES")?;
+        let references_table = self.current().ok_or_else(|| anyhow!("Expected referenced table name"))?.to_string();
+        self.advance();
+
+        self.expect("(")?;
+        let mut references_columns = Vec::new();
+        loop {
+            references_columns.push(self.current().ok_or_else(|| anyhow!("Expected referenced column name"))?.to_string());
+            self.advance();
+            if self.current() == Some(",") {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(")")?;
+
+        let mut on_delete = None;
+        if self.current().map_or(false, |t| t.eq_ignore_ascii_case("ON")) {
+            self.advance();
+            self.expect("DELETE")?;
+            let action = self.current().ok_or_else(|| anyhow!("Expected ON DELETE action"))?.to_string();
+            self.advance();
+            on_delete = Some(action);
+        }
+
+        let mut on_update = None;
+        if self.current().map_or(false, |t| t.eq_ignore_ascii_case("ON")) {
+            self.advance();
+            self.expect("UPDATE")?;
+            let action = self.current().ok_or_else(|| anyhow!("Expected ON UPDATE action"))?.to_string();
+            self.advance();
+            on_update = Some(action);
+        }
+
+        Ok(ForeignKeyClause {
+            name: None, // Will be filled in by the caller if a CONSTRAINT name was parsed
+            columns,
+            references_table,
+            references_columns,
+            on_delete,
+            on_update,
         })
     }
 
@@ -495,14 +715,13 @@ impl Parser {
                     .ok_or_else(|| anyhow!("Expected column name after ADD"))?
                     .to_string();
                 self.advance();
-                let data_type = self
-                    .current()
-                    .ok_or_else(|| anyhow!("Expected data type for column {}", column_name))?
-                    .to_string();
-                self.advance();
+                let data_type = self.parse_data_type()?;
                 AlterTableAction::AddColumn(ColumnDef {
                     name: column_name,
                     data_type,
+                    nullable: true,
+                    unique: false,
+                    default: None,
                 })
             }
             Some("DROP") => {
@@ -737,7 +956,8 @@ impl Parser {
             self.advance();
             let val_str = self
                 .current()
-                .ok_or_else(|| anyhow!("Expected value for LIMIT"))?;
+                .ok_or_else(|| anyhow!("Expected value for LIMIT"))?
+                .to_string();
             limit = Some(val_str.parse::<usize>()?);
             self.advance();
         }
@@ -747,7 +967,8 @@ impl Parser {
             self.advance();
             let val_str = self
                 .current()
-                .ok_or_else(|| anyhow!("Expected value for OFFSET"))?;
+                .ok_or_else(|| anyhow!("Expected value for OFFSET"))?
+                .to_string();
             offset = Some(val_str.parse::<usize>()?);
             self.advance();
         }
@@ -757,7 +978,8 @@ impl Parser {
             self.advance();
             let val_str = self
                 .current()
-                .ok_or_else(|| anyhow!("Expected value for LIMIT"))?;
+                .ok_or_else(|| anyhow!("Expected value for LIMIT"))?
+                .to_string();
             limit = Some(val_str.parse::<usize>()?);
             self.advance();
         }
@@ -796,12 +1018,3 @@ pub fn parse_sql(sql: &str) -> Result<AstStatement> {
     let mut parser = Parser::new(sql);
     parser.parse()
 }
-
-
-
-
-
-
-
-
-

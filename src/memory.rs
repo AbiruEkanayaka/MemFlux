@@ -24,6 +24,10 @@ pub async fn estimate_db_value_size(value: &DbValue) -> u64 {
             set.iter()
                 .fold(0u64, |acc, v| acc.saturating_add(v.len() as u64))
         }
+        DbValue::JsonB(b) => b.len() as u64,
+        DbValue::Array(a) => a.iter().fold(0u64, |acc, v| {
+            acc.saturating_add(v.to_string().len() as u64)
+        }),
     }
 }
 

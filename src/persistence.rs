@@ -397,6 +397,9 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
             LogEntry::SetBytes { key, value } => {
                 db.insert(key, DbValue::Bytes(value));
             }
+            LogEntry::SetJsonB { key, value } => {
+                db.insert(key, DbValue::JsonB(value));
+            }
             LogEntry::Delete { key } => {
                 db.remove(&key);
             }

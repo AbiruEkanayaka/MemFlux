@@ -1,10 +1,14 @@
 use anyhow::{anyhow, Result};
+use chrono::{DateTime, NaiveDate, NaiveTime};
 use regex;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
+use uuid::Uuid;
+use hex;
 
 use super::ast::*;
 use crate::schema::{DataType, VirtualSchema};
@@ -17,29 +21,117 @@ pub(crate) fn cast_value_to_type(value: Value, target_type: &DataType) -> Result
     }
 
     match target_type {
-        DataType::Integer => match value {
+        DataType::SmallInt => match value {
             Value::Number(n) => {
-                if n.is_f64() {
-                    Ok(serde_json::json!(n.as_f64().unwrap() as i64))
+                // Replace the old f64-only cast/unwrap with explicit integer and float handling:
+                if let Some(i) = n.as_i64() {
+                    if i > i16::MAX as i64 || i < i16::MIN as i64 {
+                        Err(anyhow!("Value {} out of range for SMALLINT", i))
+                    } else {
+                        Ok(serde_json::json!(i as i16))
+                    }
+                } else if let Some(f) = n.as_f64() {
+                    if f.is_nan() || f > i16::MAX as f64 || f < i16::MIN as f64 {
+                        Err(anyhow!("Value {} out of range for SMALLINT", f))
+                    } else {
+                        // Truncate toward zero rather than rounding
+                        Ok(serde_json::json!(f.trunc() as i16))
+                    }
                 } else {
-                    Ok(Value::Number(n))
+                    // Neither integer nor float: invalid JSON number
+                    Err(anyhow!("Invalid numeric value for SMALLINT"))
                 }
-            }
-            Value::String(s) => {
-                if let Ok(i) = s.parse::<i64>() {
-                    Ok(serde_json::json!(i))
-                } else if let Ok(f) = s.parse::<f64>() {
-                    Ok(serde_json::json!(f as i64))
-                } else {
-                    Err(anyhow!("Cannot cast string '{}' to INTEGER", s))
-                }
-            }
+            },
+            Value::String(s) => Ok(serde_json::json!(s.parse::<i16>()?)),
+            Value::Bool(b) => Ok(serde_json::json!(if b { 1 } else { 0 })),
+            _ => Err(anyhow!("Cannot cast {:?} to SMALLINT", value)),
+        },
+        DataType::Integer => match value {
+            Value::Number(n) => Ok(serde_json::json!(n.as_f64().unwrap_or_default() as i32)),
+            Value::String(s) => Ok(serde_json::json!(s.parse::<i32>()?)),
             Value::Bool(b) => Ok(serde_json::json!(if b { 1 } else { 0 })),
             _ => Err(anyhow!("Cannot cast {:?} to INTEGER", value)),
         },
+        DataType::BigInt => match value {
+            Value::Number(n) => Ok(serde_json::json!(n.as_f64().unwrap_or_default() as i64)),
+            Value::String(s) => Ok(serde_json::json!(s.parse::<i64>()?)),
+            Value::Bool(b) => Ok(serde_json::json!(if b { 1 } else { 0 })),
+            _ => Err(anyhow!("Cannot cast {:?} to BIGINT", value)),
+        },
+        DataType::Real => match value {
+            Value::Number(n) => Ok(serde_json::json!(n.as_f64().unwrap_or_default() as f32)),
+            Value::String(s) => Ok(serde_json::json!(s.parse::<f32>()?)),
+            _ => Err(anyhow!("Cannot cast {:?} to REAL", value)),
+        },
+        DataType::DoublePrecision => match value {
+            Value::Number(n) => Ok(serde_json::json!(n.as_f64().unwrap_or_default())),
+            Value::String(s) => Ok(serde_json::json!(s.parse::<f64>()?)),
+            _ => Err(anyhow!("Cannot cast {:?} to DOUBLE PRECISION", value)),
+        },
+        DataType::Numeric { scale, .. } => {
+            // For now, treat as f64. A proper implementation would use a decimal type.
+            let val = match value {
+                Value::Number(n) => n.as_f64().ok_or_else(|| anyhow!("Invalid numeric value"))?,
+                Value::String(s) => s.parse::<f64>()?,
+                _ => return Err(anyhow!("Cannot cast {:?} to NUMERIC", value)),
+            };
+
+            if let Some(s) = scale {
+                let multiplier = 10f64.powi(*s as i32);
+                Ok(serde_json::json!((val * multiplier).round() / multiplier))
+            } else {
+                Ok(serde_json::json!(val))
+            }
+        }
         DataType::Text => match value {
             Value::String(s) => Ok(Value::String(s)),
             other => Ok(Value::String(other.to_string())),
+        },
+        DataType::Varchar(n) => match value {
+            Value::String(s) => {
+                if s.len() > *n as usize {
+                    Err(anyhow!(
+                        "Value too long for type VARCHAR({}): len={} > max={}",
+                        n,
+                        s.len(),
+                        n
+                    ))
+                } else {
+                    Ok(Value::String(s))
+                }
+            }
+            other => {
+                let s = other.to_string();
+                if s.len() > *n as usize {
+                    Err(anyhow!(
+                        "Value too long for type VARCHAR({}): len={} > max={}",
+                        n,
+                        s.len(),
+                        n
+                    ))
+                } else {
+                    Ok(Value::String(s))
+                }
+            }
+        },
+        DataType::Char(n) => match value {
+            Value::String(s) => {
+                let n = *n as usize;
+                if s.len() > n {
+                    Ok(Value::String(s.chars().take(n).collect()))
+                } else {
+                    Ok(Value::String(format!("{:width$}", s, width = n)))
+                }
+            }
+            other => {
+                let s = other.to_string();
+                let n = *n as usize;
+                if s.len() > n {
+                    Ok(Value::String(s.chars().take(n).collect()))
+                } else {
+                    Ok(Value::String(format!("{:width$}", s, width = n)))
+                }
+            }
         },
         DataType::Boolean => match value {
             Value::Bool(b) => Ok(Value::Bool(b)),
@@ -59,17 +151,111 @@ pub(crate) fn cast_value_to_type(value: Value, target_type: &DataType) -> Result
             }
             _ => Err(anyhow!("Cannot cast {:?} to BOOLEAN", value)),
         },
-        DataType::Timestamp => {
-            // For now, we'll just expect a string and store it as text.
-            // A more robust implementation would parse it with chrono.
-            match value {
-                Value::String(s) => Ok(Value::String(s)),
-                _ => Err(anyhow!(
-                    "Cannot cast {:?} to TIMESTAMP, expected string",
-                    value
-                )),
+        DataType::Timestamp => match value {
+            Value::String(s) => {
+                if DateTime::parse_from_rfc3339(&s).is_ok() {
+                    Ok(Value::String(s))
+                } else if chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S").is_ok() {
+                    Ok(Value::String(s))
+                } else {
+                    Err(anyhow!("Invalid TIMESTAMP format for string: {}", s))
+                }
             }
-        }
+            _ => Err(anyhow!(
+                "Cannot cast {:?} to TIMESTAMP, expected string",
+                value
+            )),
+        },
+        DataType::TimestampTz => match value {
+            Value::String(s) => {
+                if DateTime::parse_from_rfc3339(&s).is_ok() {
+                    Ok(Value::String(s))
+                } else {
+                    Err(anyhow!("Invalid TIMESTAMPTZ format for string: {}", s))
+                }
+            }
+            _ => Err(anyhow!(
+                "Cannot cast {:?} to TIMESTAMPTZ, expected string",
+                value
+            )),
+        },
+        DataType::Date => match value {
+            Value::String(s) => {
+                if NaiveDate::parse_from_str(&s, "%Y-%m-%d").is_ok() {
+                    Ok(Value::String(s))
+                } else {
+                    Err(anyhow!(
+                        "Invalid DATE format for string: {}. Expected YYYY-MM-DD.",
+                        s
+                    ))
+                }
+            }
+            _ => Err(anyhow!("Cannot cast {:?} to DATE, expected string", value)),
+        },
+        DataType::Time => match value {
+            Value::String(s) => {
+                if NaiveTime::parse_from_str(&s, "%H:%M:%S").is_ok() {
+                    Ok(Value::String(s))
+                } else if NaiveTime::parse_from_str(&s, "%H:%M:%S%.f").is_ok() {
+                    Ok(Value::String(s))
+                } else {
+                    Err(anyhow!(
+                        "Invalid TIME format for string: {}. Expected HH:MM:SS[.FFF].",
+                        s
+                    ))
+                }
+            }
+            _ => Err(anyhow!("Cannot cast {:?} to TIME, expected string", value)),
+        },
+        DataType::Bytea => match value {
+            Value::String(s) => {
+                let s = s.strip_prefix("\\x").unwrap_or(&s);
+                match hex::decode(s) {
+                    Ok(bytes) => Ok(Value::String(format!("\\x{}", hex::encode(bytes)))),
+                    Err(_) => Err(anyhow!("Invalid hex string for BYTEA")),
+                }
+            }
+            _ => Err(anyhow!("Cannot cast {:?} to BYTEA, expected hex string", value)),
+        },
+        DataType::Uuid => match value {
+            Value::String(s) => match Uuid::parse_str(&s) {
+                Ok(uuid) => Ok(Value::String(uuid.to_string())),
+                Err(_) => Err(anyhow!("Invalid UUID format for string: {}", s)),
+            },
+            _ => Err(anyhow!("Cannot cast {:?} to UUID, expected string", value)),
+        },
+        DataType::Array(inner_type) => match value {
+            Value::String(s) => {
+                let s = s.trim();
+                if !s.starts_with('{') || !s.ends_with('}') {
+                    return Err(anyhow!("Invalid array literal: {}", s));
+                }
+                let s = &s[1..s.len() - 1];
+                let parts = s.split(',');
+                let mut result = Vec::new();
+                for part in parts {
+                    let part = part.trim();
+                    let val = cast_value_to_type(Value::String(part.to_string()), inner_type)?;
+                    result.push(val);
+                }
+                Ok(Value::Array(result))
+            }
+            Value::Array(arr) => {
+                let mut result = Vec::new();
+                for val in arr {
+                    result.push(cast_value_to_type(val, inner_type)?);
+                }
+                Ok(Value::Array(result))
+            }
+            _ => Err(anyhow!("Cannot cast {:?} to ARRAY", value)),
+        },
+        DataType::JsonB => match value {
+            Value::String(s) => {
+                let json_val: Value = serde_json::from_str(&s)?;
+                Ok(json_val)
+            }
+            _ => Ok(value),
+        },
     }
 }
 
@@ -363,16 +549,17 @@ fn like_to_regex(pattern: &str) -> String {
         match c {
             '%' => regex.push_str(".*"),
             '_' => regex.push('.'),
-            // FIX 1: Use '\\' to match a literal backslash character.
             '\\' => {
                 if let Some(escaped_char) = chars.next() {
-                    if ".+*?()|[]{}|^$\\".contains(escaped_char) {
-                        // FIX 2: Push an escaped backslash.
+                    if ".+*?()|[]{}|^$\\".contains(escaped_char) {  
+                        regex.push('\\');
+                    } else if escaped_char == '\\' {
+                        // This is a literal backslash, which needs to be escaped for regex
                         regex.push('\\');
                     }
                     regex.push(escaped_char);
                 } else {
-                    // This correctly pushes two backslashes to the regex string.
+                    // Trailing backslash, treat as literal
                     regex.push_str("\\\\");
                 }
             }
@@ -389,7 +576,7 @@ fn like_to_regex(pattern: &str) -> String {
     regex
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Expression {
     Column(String),
     Literal(Value),
@@ -466,7 +653,7 @@ impl fmt::Display for Expression {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LogicalOperator {
     And,
     Or,
@@ -481,7 +668,7 @@ impl fmt::Display for LogicalOperator {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Operator {
     Eq,
     NotEq,
@@ -510,7 +697,7 @@ impl fmt::Display for Operator {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LogicalPlan {
     TableScan {
         table_name: String,
@@ -546,6 +733,9 @@ pub enum LogicalPlan {
     CreateTable {
         table_name: String,
         columns: Vec<ColumnDef>,
+        primary_key: Vec<String>,
+        foreign_keys: Vec<ForeignKeyClause>,
+        check: Option<Expression>,
     },
     Insert {
         table_name: String,
@@ -574,7 +764,7 @@ pub enum LogicalPlan {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JoinType {
     Inner,
     Left,
@@ -583,7 +773,7 @@ pub enum JoinType {
     Cross,
 }
 
-fn simple_expr_to_expression(
+pub(crate) fn simple_expr_to_expression(
     expr: SimpleExpression,
     schema_cache: &SchemaCache,
     function_registry: &FunctionRegistry,
@@ -705,13 +895,7 @@ fn simple_expr_to_expression(
             })
         }
         SimpleExpression::Cast { expr, data_type } => {
-            let dt = match data_type.to_uppercase().as_str() {
-                "INTEGER" => DataType::Integer,
-                "TEXT" => DataType::Text,
-                "BOOLEAN" => DataType::Boolean,
-                "TIMESTAMP" => DataType::Timestamp,
-                _ => return Err(anyhow!("Unsupported data type for CAST: {}", data_type)),
-            };
+            let dt = DataType::from_str(&data_type)?;
             Ok(Expression::Cast {
                 expr: Box::new(simple_expr_to_expression(
                     *expr,
@@ -852,10 +1036,24 @@ pub fn ast_to_logical_plan(
     function_registry: &FunctionRegistry,
 ) -> Result<LogicalPlan> {
     match statement {
-        AstStatement::CreateTable(statement) => Ok(LogicalPlan::CreateTable {
-            table_name: statement.table_name,
-            columns: statement.columns,
-        }),
+        AstStatement::CreateTable(statement) => {
+            let check = if let Some(c) = statement.check {
+                Some(simple_expr_to_expression(
+                    c,
+                    schema_cache,
+                    function_registry,
+                )?)
+            } else {
+                None
+            };
+            Ok(LogicalPlan::CreateTable {
+                table_name: statement.table_name,
+                columns: statement.columns,
+                primary_key: statement.primary_key,
+                foreign_keys: statement.foreign_keys,
+                check,
+            })
+        }
         AstStatement::DropTable(statement) => Ok(LogicalPlan::DropTable {
             table_name: statement.table_name,
         }),
