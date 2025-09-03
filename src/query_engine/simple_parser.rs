@@ -1,6 +1,10 @@
 use anyhow::{anyhow, Result};
 
-use super::ast::*;
+use super::ast::{AlterTableAction, AstStatement, CaseExpression, ColumnDef, CreateIndexStatement,
+    CreateSchemaStatement, CreateTableStatement, CreateViewStatement, DeleteStatement,
+    DropTableStatement, DropViewStatement, ForeignKeyClause, InsertStatement, JoinClause,
+    OrderByExpression, SelectColumn, SelectStatement, SimpleExpression, SimpleValue,
+    TableConstraint, TruncateTableStatement, UnionClause, UpdateStatement, AlterTableStatement};
 
 // Very simple tokenizer
 fn tokenize(sql: &str) -> Vec<String> {
@@ -29,7 +33,7 @@ fn tokenize(sql: &str) -> Vec<String> {
             _ if in_string => {
                 current_token.push(ch);
             }
-            ' ' | '\n' | '\r' | '\t' => {
+            ' ' | '\n' | '\r' | '\t' | ';' => {
                 if !current_token.is_empty() {
                     tokens.push(current_token.clone());
                     current_token.clear();
@@ -516,142 +520,95 @@ impl Parser {
         self.expect("(")?;
 
         let mut columns = Vec::new();
-        let mut primary_key = Vec::new();
-        let mut foreign_keys = Vec::new();
-        let mut check = None;
+        let mut constraints = Vec::new();
 
         loop {
             if self.current() == Some(")") {
                 break;
             }
 
-            if let Some(token) = self.current() {
-                let upper_token = token.to_uppercase();
-                if ["PRIMARY", "FOREIGN", "CHECK", "CONSTRAINT", "UNIQUE"].contains(&upper_token.as_str()) {
-                    break;
-                }
-            }
+            let token = self.current().map(|s| s.to_uppercase());
+            if let Some(t) = token {
+                if ["PRIMARY", "FOREIGN", "CHECK", "CONSTRAINT", "UNIQUE"].contains(&t.as_str()) {
+                    // It's a table constraint
+                    let constraint = self.parse_table_constraint_definition()?;
+                    constraints.push(constraint);
+                } else {
+                    // It's a column definition
+                    let column_name = self.parse_identifier()?;
+                    let data_type = self.parse_data_type()?;
 
-            let column_name = self.parse_identifier()?;
-            let data_type = self.parse_data_type()?;
+                    let mut nullable = true;
+                    let mut default = None;
+                    let mut is_primary_key = false;
+                    let mut is_unique = false;
 
-            let mut nullable = true;
-            let mut unique = false;
-            let mut default = None;
-
-            'inline: loop {
-                match self.current().map(|s| s.to_uppercase()).as_deref() {
-                    Some("NOT") => {
-                        self.advance();
-                        self.expect("NULL")?;
-                        nullable = false;
-                    }
-                    Some("UNIQUE") => {
-                        self.advance();
-                        unique = true;
-                    }
-                    Some("PRIMARY") => {
-                        self.advance();
-                        self.expect("KEY")?;
-                        if !primary_key.is_empty() {
-                            return Err(anyhow!("Multiple primary keys defined"));
+                    'column_modifiers: loop {
+                        match self.current().map(|s| s.to_uppercase()).as_deref() {
+                            Some("NOT") => {
+                                self.advance();
+                                self.expect("NULL")?;
+                                nullable = false;
+                            }
+                            Some("DEFAULT") => {
+                                self.advance();
+                                default = Some(self.parse_expression()?);
+                            }
+                            Some("PRIMARY") => {
+                                self.advance();
+                                self.expect("KEY")?;
+                                is_primary_key = true;
+                                nullable = false; // Primary key implies NOT NULL
+                            }
+                            Some("UNIQUE") => {
+                                self.advance();
+                                is_unique = true;
+                            }
+                            Some("CHECK") => {
+                                self.advance(); // consume CHECK
+                                self.expect("(")?;
+                                let expression = self.parse_expression()?;
+                                self.expect(")")?;
+                                constraints.push(TableConstraint::Check {
+                                    name: None, // No explicit name for inline CHECK
+                                    expression,
+                                });
+                            }
+                            _ => break 'column_modifiers,
                         }
-                        primary_key.push(column_name.clone());
-                        nullable = false;
-                        unique = true;
                     }
-                    Some("DEFAULT") => {
-                        self.advance();
-                        default = Some(self.parse_expression()?);
-                    }
-                    _ => break 'inline,
-                }
-            }
 
-            columns.push(ColumnDef {
-                name: column_name,
-                data_type,
-                nullable,
-                unique,
-                default,
-            });
+                    columns.push(ColumnDef {
+                        name: column_name.clone(), // Clone for use in constraints
+                        data_type,
+                        nullable,
+                        default,
+                    });
+
+                    // If it was a column-level PRIMARY KEY or UNIQUE, add it to table constraints
+                    if is_primary_key {
+                        constraints.push(TableConstraint::PrimaryKey {
+                            name: None, // No explicit name for inline PK
+                            columns: vec![column_name.clone()],
+                        });
+                    }
+                    if is_unique {
+                        constraints.push(TableConstraint::Unique {
+                            name: None, // No explicit name for inline UNIQUE
+                            columns: vec![column_name.clone()],
+                        });
+                    }
+                }
+            } else {
+                return Err(anyhow!("Expected column definition or table constraint, found end of input"));
+            }
 
             if self.current() == Some(",") {
                 self.advance();
-            } else {
+            } else if self.current() == Some(")") {
                 break;
-            }
-        }
-
-        loop {
-            if self.current() == Some(")") {
-                break;
-            }
-            if self.current() == Some(",") {
-                self.advance();
-            }
-
-            let constraint_name = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("CONSTRAINT")) {
-                self.advance();
-                let name = self.parse_identifier()?;
-                Some(name)
             } else {
-                None
-            };
-
-            match self.current().map(|s| s.to_uppercase()).as_deref() {
-                Some("PRIMARY") => {
-                    self.advance();
-                    self.expect("KEY")?;
-                    self.expect("(")?;
-                    if !primary_key.is_empty() {
-                        return Err(anyhow!("Multiple primary keys defined"));
-                    }
-                    loop {
-                        primary_key.push(self.parse_identifier()?);
-                        if self.current() == Some(",") {
-                            self.advance();
-                        } else {
-                            break;
-                        }
-                    }
-                    self.expect(")")?;
-                }
-                Some("FOREIGN") => {
-                    let mut fk = self.parse_foreign_key_clause()?;
-                    fk.name = constraint_name;
-                    foreign_keys.push(fk);
-                }
-                Some("CHECK") => {
-                    self.advance();
-                    self.expect("(")?;
-                    check = Some(self.parse_expression()?);
-                    self.expect(")")?;
-                }
-                Some("UNIQUE") => {
-                    self.advance();
-                    self.expect("(")?;
-                    loop {
-                        let col_name = self.parse_identifier()?;
-                        if let Some(col) = columns.iter_mut().find(|c| c.name == col_name) {
-                            col.unique = true;
-                        } else {
-                            return Err(anyhow!("Column '{}' in UNIQUE constraint not found in table definition", col_name));
-                        }
-                        if self.current() == Some(",") {
-                            self.advance();
-                        } else {
-                            break;
-                        }
-                    }
-                    self.expect(")")?;
-                }
-                _ => {
-                    if self.current() == Some(")") {
-                        break;
-                    }
-                    return Err(anyhow!("Unexpected token in CREATE TABLE: {:?}", self.current()));
-                }
+                return Err(anyhow!("Expected ',', or ')', found '{}'", self.current().unwrap_or("end of input")));
             }
         }
 
@@ -660,15 +617,54 @@ impl Parser {
         Ok(CreateTableStatement {
             table_name,
             columns,
-            primary_key,
-            foreign_keys,
-            check,
             if_not_exists,
+            constraints, // New field
         })
     }
 
+    // New helper function to parse a table constraint definition
+    fn parse_table_constraint_definition(&mut self) -> Result<TableConstraint> {
+        let constraint_name = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("CONSTRAINT")) {
+            self.advance();
+            let name = self.parse_identifier()?;
+            Some(name)
+        } else {
+            None
+        };
+
+        let constraint_keyword = self.current().ok_or_else(|| anyhow!("Expected constraint keyword"))?.to_uppercase();
+        self.advance(); // Consume the constraint keyword (e.g., "PRIMARY", "FOREIGN", "CHECK", "UNIQUE")
+
+        match constraint_keyword.as_str() {
+            "PRIMARY" => {
+                self.expect("KEY")?;
+                self.expect("(")?;
+                let columns = self.parse_identifier_list()?;
+                self.expect(")")?;
+                Ok(TableConstraint::PrimaryKey { name: constraint_name, columns })
+            }
+            "FOREIGN" => {
+                let mut fk = self.parse_foreign_key_clause()?;
+                fk.name = constraint_name;
+                Ok(TableConstraint::ForeignKey(fk))
+            }
+            "CHECK" => {
+                self.expect("(")?;
+                let expression = self.parse_expression()?;
+                self.expect(")")?;
+                Ok(TableConstraint::Check { name: constraint_name, expression })
+            }
+            "UNIQUE" => {
+                self.expect("(")?;
+                let columns = self.parse_identifier_list()?;
+                self.expect(")")?;
+                Ok(TableConstraint::Unique { name: constraint_name, columns })
+            }
+            _ => Err(anyhow!("Unsupported constraint type: {:?}", constraint_keyword)),
+        }
+    }
+
     fn parse_foreign_key_clause(&mut self) -> Result<ForeignKeyClause> {
-        self.expect("FOREIGN")?;
         self.expect("KEY")?;
         self.expect("(")?;
         let mut columns = Vec::new();
@@ -750,34 +746,154 @@ impl Parser {
         let table_name = self.parse_qualified_name()?;
 
         let action = match self.current().map(|s| s.to_uppercase()).as_deref() {
+            Some("RENAME") => {
+                self.advance(); // consume RENAME
+                match self.current().map(|s| s.to_uppercase()).as_deref() {
+                    Some("TO") => {
+                        self.advance(); // consume TO
+                        let new_table_name = self.parse_qualified_name()?;
+                        AlterTableAction::RenameTable { new_table_name }
+                    }
+                    Some("COLUMN") => {
+                        self.advance(); // consume COLUMN
+                        let old_column_name = self.parse_identifier()?;
+                        self.expect("TO")?;
+                        let new_column_name = self.parse_identifier()?;
+                        AlterTableAction::RenameColumn {
+                            old_column_name,
+                            new_column_name,
+                        }
+                    }
+                    _ => return Err(anyhow!("Expected TO or COLUMN after RENAME")),
+                }
+            }
             Some("ADD") => {
                 self.advance(); // consume ADD
-                if self.current().map_or(false, |t| t.eq_ignore_ascii_case("COLUMN")) {
-                    self.advance(); // consume optional COLUMN
+                if self.current().map_or(false, |t| t.eq_ignore_ascii_case("CONSTRAINT")) {
+                    self.advance();
+                    let name = Some(self.parse_identifier()?);
+                    let constraint = self.parse_table_constraint(name)?;
+                    AlterTableAction::AddConstraint(constraint)
+                } else {
+                    if self.current().map_or(false, |t| t.eq_ignore_ascii_case("COLUMN")) {
+                        self.advance(); // consume optional COLUMN
+                    }
+                    let column_name = self.parse_identifier()?;
+                    let data_type = self.parse_data_type()?;
+                    AlterTableAction::AddColumn(ColumnDef {
+                        name: column_name,
+                        data_type,
+                        nullable: true,
+                        default: None,
+                    })
                 }
-                let column_name = self.parse_identifier()?;
-                let data_type = self.parse_data_type()?;
-                AlterTableAction::AddColumn(ColumnDef {
-                    name: column_name,
-                    data_type,
-                    nullable: true,
-                    unique: false,
-                    default: None,
-                })
             }
             Some("DROP") => {
                 self.advance(); // consume DROP
+                match self.current().map(|s| s.to_uppercase()).as_deref() {
+                    Some("COLUMN") => {
+                        self.advance(); // consume COLUMN
+                        let column_name = self.parse_identifier()?;
+                        AlterTableAction::DropColumn { column_name }
+                    }
+                    Some("CONSTRAINT") => {
+                        self.advance(); // consume CONSTRAINT
+                        let constraint_name = self.parse_identifier()?;
+                        AlterTableAction::DropConstraint { constraint_name }
+                    }
+                    _ => return Err(anyhow!("Expected COLUMN or CONSTRAINT after DROP")),
+                }
+            }
+            Some("ALTER") => {
+                self.advance(); // consume ALTER
                 if self.current().map_or(false, |t| t.eq_ignore_ascii_case("COLUMN")) {
                     self.advance(); // consume optional COLUMN
                 }
                 let column_name = self.parse_identifier()?;
-                AlterTableAction::DropColumn { column_name }
+                match self.current().map(|s| s.to_uppercase()).as_deref() {
+                    Some("SET") => {
+                        self.advance(); // consume SET
+                        self.expect("DEFAULT")?;
+                        let default_expr = self.parse_expression()?;
+                        AlterTableAction::AlterColumnSetDefault {
+                            column_name,
+                            default_expr,
+                        }
+                    }
+                    Some("DROP") => {
+                        self.advance(); // consume DROP
+                        match self.current().map(|s| s.to_uppercase()).as_deref() {
+                            Some("DEFAULT") => {
+                                self.advance();
+                                AlterTableAction::AlterColumnDropDefault { column_name }
+                            }
+                            Some("NOT") => {
+                                self.advance();
+                                self.expect("NULL")?;
+                                AlterTableAction::AlterColumnDropNotNull { column_name }
+                            }
+                            _ => return Err(anyhow!("Expected DEFAULT or NOT NULL after DROP")),
+                        }
+                    }
+                    Some("TYPE") => {
+                        self.advance(); // consume TYPE
+                        let new_data_type = self.parse_data_type()?;
+                        AlterTableAction::AlterColumnType { column_name, new_data_type }
+                    }
+                    _ => return Err(anyhow!("Unsupported ALTER COLUMN action")),
+                }
             }
             Some(other) => return Err(anyhow!("Unsupported ALTER TABLE action: {}", other)),
             None => return Err(anyhow!("Expected action for ALTER TABLE")),
         };
 
         Ok(AlterTableStatement { table_name, action })
+    }
+
+    fn parse_table_constraint(&mut self, name: Option<String>) -> Result<TableConstraint> {
+        match self.current().map(|s| s.to_uppercase()).as_deref() {
+            Some("UNIQUE") => {
+                self.advance();
+                self.expect("(")?;
+                let columns = self.parse_identifier_list()?;
+                self.expect(")")?;
+                Ok(TableConstraint::Unique { name, columns })
+            }
+            Some("PRIMARY") => {
+                self.advance();
+                self.expect("KEY")?;
+                self.expect("(")?;
+                let columns = self.parse_identifier_list()?;
+                self.expect(")")?;
+                Ok(TableConstraint::PrimaryKey { name, columns })
+            }
+            Some("FOREIGN") => {
+                let mut fk = self.parse_foreign_key_clause()?;
+                fk.name = name;
+                Ok(TableConstraint::ForeignKey(fk))
+            }
+            Some("CHECK") => {
+                self.advance();
+                self.expect("(")?;
+                let expression = self.parse_expression()?;
+                self.expect(")")?;
+                Ok(TableConstraint::Check { name, expression })
+            }
+            _ => Err(anyhow!("Unsupported constraint type")),
+        }
+    }
+
+    fn parse_identifier_list(&mut self) -> Result<Vec<String>> {
+        let mut identifiers = Vec::new();
+        loop {
+            identifiers.push(self.parse_identifier()?);
+            if self.current() == Some(",") {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(identifiers)
     }
 
     fn parse_update(&mut self) -> Result<UpdateStatement> {
@@ -835,40 +951,76 @@ impl Parser {
         self.expect("INTO")?;
         let table = self.parse_qualified_name()?;
 
-        self.expect("(")?;
         let mut columns = Vec::new();
-        loop {
-            columns.push(self.parse_identifier()?);
-            if self.current() == Some(",") {
-                self.advance();
-            } else {
-                break;
+        if self.current() == Some("(") {
+            self.advance(); // consume "("
+            // Handle empty column list `()` which is invalid.
+            if self.current() == Some(")") {
+                return Err(anyhow!("Column list cannot be empty"));
             }
+            loop {
+                columns.push(self.parse_identifier()?);
+                if self.current() == Some(",") {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            self.expect(")")?;
         }
-        self.expect(")")?;
 
         self.expect("VALUES")?;
 
-        self.expect("(")?;
-        let mut values = Vec::new();
+        let mut all_values = Vec::new();
         loop {
-            values.push(self.parse_expression()?);
+            self.expect("(")?;
+            let mut single_row_values = Vec::new();
+            if self.current() == Some(")") {
+                return Err(anyhow!("Values list cannot be empty"));
+            }
+            loop {
+                single_row_values.push(self.parse_expression()?);
+                if self.current() == Some(",") {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            self.expect(")")?;
+            all_values.push(single_row_values);
+
             if self.current() == Some(",") {
                 self.advance();
             } else {
                 break;
             }
         }
-        self.expect(")")?;
 
-        if !columns.is_empty() && columns.len() != values.len() {
-            return Err(anyhow!("INSERT has mismatch between number of columns and values"));
+        if !columns.is_empty() {
+            for row_values in &all_values {
+                if columns.len() != row_values.len() {
+                    return Err(anyhow!(
+                        "INSERT has mismatch between number of columns ({}) and values ({})",
+                        columns.len(),
+                        row_values.len()
+                    ));
+                }
+            }
+        } else if all_values.len() > 1 {
+            // If no columns are specified, all rows must have the same number of values.
+            let first_row_len = all_values[0].len();
+            if all_values.iter().any(|row| row.len() != first_row_len) {
+                return Err(anyhow!(
+                    "INSERT with multiple rows must have the same number of values in each row"
+                ));
+            }
         }
+
 
         Ok(InsertStatement {
             table,
             columns,
-            values,
+            values: all_values,
         })
     }
 

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use super::ast::{AlterTableAction, ColumnDef, ForeignKeyClause, CreateIndexStatement, SelectStatement};
+use super::ast::{AlterTableAction, ColumnDef, CreateIndexStatement, SelectStatement, TableConstraint};
 use super::logical_plan::*;
 use crate::indexing::IndexManager;
 
@@ -45,10 +45,8 @@ pub enum PhysicalPlan {
     CreateTable {
         table_name: String,
         columns: Vec<ColumnDef>,
-        primary_key: Vec<String>,
-        foreign_keys: Vec<ForeignKeyClause>,
-        check: Option<Expression>,
         if_not_exists: bool,
+        constraints: Vec<TableConstraint>,
     },
     CreateView {
         view_name: String,
@@ -70,7 +68,7 @@ pub enum PhysicalPlan {
     Insert {
         table_name: String,
         columns: Vec<String>,
-        values: Vec<Expression>,
+        values: Vec<Vec<Expression>>,
     },
     Delete {
         from: Box<PhysicalPlan>,
@@ -162,17 +160,13 @@ pub fn logical_to_physical_plan(
         LogicalPlan::CreateTable {
             table_name,
             columns,
-            primary_key,
-            foreign_keys,
-            check,
             if_not_exists,
+            constraints,
         } => Ok(PhysicalPlan::CreateTable {
             table_name,
             columns,
-            primary_key,
-            foreign_keys,
-            check,
             if_not_exists,
+            constraints,
         }),
         LogicalPlan::CreateView {
             view_name,

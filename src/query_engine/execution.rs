@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-use super::ast::AlterTableAction;
+use super::ast::{AlterTableAction, TableConstraint};
 use super::logical_plan::{cast_value_to_type, Expression, JoinType, LogicalOperator, LogicalPlan, Operator};
 use super::physical_plan::PhysicalPlan;
 use crate::schema::{ColumnDefinition, DataType, VirtualSchema, SCHEMA_PREFIX, VIEW_PREFIX};
@@ -432,7 +432,7 @@ pub fn execute<'a>(
                     yield row?;
                 }
             }
-            PhysicalPlan::CreateTable { table_name, columns, primary_key, foreign_keys, check, if_not_exists } => {
+            PhysicalPlan::CreateTable { table_name, columns, if_not_exists, constraints } => {
                 if table_name.contains('.') {
                     let schema_name = table_name.split('.').next().unwrap();
                     let schema_list_key = format!("{}{}", SCHEMALIST_PREFIX, schema_name);
@@ -451,47 +451,84 @@ pub fn execute<'a>(
                 }
                 let schema_key = format!("{}{}", SCHEMA_PREFIX, table_name);
                 let mut cols = std::collections::BTreeMap::new();
+                let mut column_order = Vec::with_capacity(columns.len());
+
                 for c in columns {
+                    column_order.push(c.name.clone());
                     let dt = DataType::from_str(&c.data_type)?;
                     let default = if let Some(d) = c.default {
                         Some(super::logical_plan::simple_expr_to_expression(d, &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry)?)
                     } else {
                         None
                     };
-                    cols.insert(c.name, ColumnDefinition { data_type: dt, nullable: c.nullable, unique: c.unique, default });
+                    cols.insert(c.name, ColumnDefinition { data_type: dt, nullable: c.nullable, default });
                 }
 
-                for pk_col_name in &primary_key {
-                    if let Some(c) = cols.get_mut(pk_col_name) {
-                        c.nullable = false;
-                        c.unique = true;
-                    } else {
-                        Err(anyhow!("Column '{}' in PRIMARY KEY not found in table definition", pk_col_name))?;
+                let mut primary_key_cols = Vec::new(); // To be populated from constraints
+                let mut foreign_key_clauses = Vec::new(); // To be populated from constraints
+                let mut check_expression: Option<Expression> = None; // To be populated from constraints
+
+                for constraint in &constraints {
+                    match constraint {
+                        TableConstraint::PrimaryKey { name: _, columns } => {
+                            if !primary_key_cols.is_empty() {
+                                Err(anyhow!("Multiple primary keys defined for table '{}'", table_name))?;
+                            }
+                            primary_key_cols = columns.clone();
+                            for pk_col_name in columns.iter() {
+                                if let Some(c) = cols.get_mut(pk_col_name) {
+                                    c.nullable = false; // Primary key columns are implicitly NOT NULL
+                                } else {
+                                    Err(anyhow!("Column '{}' in PRIMARY KEY not found in table definition", pk_col_name))?;
+                                }
+                            }
+                        }
+                        TableConstraint::ForeignKey(fk) => {
+                            foreign_key_clauses.push(fk.clone());
+                        }
+                        TableConstraint::Check { name: _, expression } => {
+                            if check_expression.is_some() {
+                                Err(anyhow!("Multiple CHECK constraints defined for table '{}'", table_name))?;
+                            }
+                            check_expression = Some(super::logical_plan::simple_expr_to_expression(expression.clone(), &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry)?);
+                        }
+                        TableConstraint::Unique { name: constraint_name_option, columns } => {
+                            // Create unique indexes for unique constraints
+                            if columns.len() != 1 {
+                                Err(anyhow!("Composite UNIQUE constraints are not yet supported for direct column flags. Use CREATE UNIQUE INDEX instead."))?;
+                            }
+                            let col_name = &columns[0];
+                            if !cols.contains_key(col_name) {
+                                                        Err(anyhow!("Column '{}' in UNIQUE constraint not found in table definition", col_name))?
+                            }
+                            let index_name = constraint_name_option.clone().unwrap_or_else(|| format!("unique_{}_{}", table_name, col_name));
+                            let key_prefix = format!("{}:*", table_name);
+                            let json_path = col_name.clone();
+                            let create_index_command = Command {
+                                name: "IDX.CREATE".to_string(),
+                                args: vec![
+                                    b"IDX.CREATE".to_vec(),
+                                    index_name.into_bytes(),
+                                    key_prefix.into_bytes(),
+                                    json_path.into_bytes(),
+                                ],
+                            };
+                            if let Response::Error(e) = super::super::commands::handle_idx_create(create_index_command, &ctx).await {
+                                Err(anyhow!("Failed to create unique index: {}", e))?;
+                            }
+                        }
                     }
                 }
-
-                let fks: Vec<crate::schema::ForeignKeyClause> = foreign_keys
-                    .into_iter()
-                    .map(|fk| crate::schema::ForeignKeyClause {
-                        name: fk.name,
-                        columns: fk.columns,
-                        references_table: fk.references_table,
-                        references_columns: fk.references_columns,
-                        on_delete: fk.on_delete,
-                        on_update: fk.on_update,
-                    })
-                    .collect();
 
                 let schema = VirtualSchema {
                     table_name: table_name.clone(),
                     columns: cols,
-                    primary_key,
-                    check,
-                    foreign_keys: fks,
+                    column_order,
+                    constraints, // Store all constraints
                 };
 
-                // Validate foreign keys
-                for fk in &schema.foreign_keys {
+                // Validate foreign keys (using the populated foreign_key_clauses)
+                for fk in &foreign_key_clauses {
                     let referenced_table_name = &fk.references_table;
                     let referenced_schema = ctx.schema_cache.get(referenced_table_name)
                         .ok_or_else(|| anyhow!("Referenced table '{}' for foreign key does not exist", referenced_table_name))?;
@@ -505,42 +542,27 @@ pub fn execute<'a>(
 
                     // Check that referenced columns are unique or a primary key
                     let referenced_cols_set: std::collections::HashSet<_> = fk.references_columns.iter().cloned().collect();
-                    let pk_cols_set: std::collections::HashSet<_> = referenced_schema.primary_key.iter().cloned().collect();
 
-                    let is_pk = !pk_cols_set.is_empty() && pk_cols_set == referenced_cols_set;
+                    let is_pk = referenced_schema.constraints.iter().any(|c| {
+                        if let TableConstraint::PrimaryKey { name: _, columns } = c {
+                            let pk_cols_set: std::collections::HashSet<_> = columns.iter().cloned().collect();
+                            !pk_cols_set.is_empty() && pk_cols_set == referenced_cols_set
+                        } else {
+                            false
+                        }
+                    });
 
-                    // This only checks for single-column unique constraints.
-                    let is_unique_constraint = if referenced_cols_set.len() == 1 {
-                        let col_name = referenced_cols_set.iter().next().unwrap();
-                        referenced_schema.columns.get(col_name).map_or(false, |c| c.unique)
-                    } else {
-                        // Cannot validate composite unique constraints with current schema structure.
-                        false
-                    };
+                    let is_unique_constraint = referenced_schema.constraints.iter().any(|c| {
+                        if let TableConstraint::Unique { name: _, columns } = c {
+                            let unique_cols_set: std::collections::HashSet<_> = columns.iter().cloned().collect();
+                            !unique_cols_set.is_empty() && unique_cols_set == referenced_cols_set
+                        } else {
+                            false
+                        }
+                    });
 
                     if !is_pk && !is_unique_constraint {
                         Err(anyhow!("There is no unique constraint matching the referenced columns for foreign key in table '{}'", referenced_table_name))?;
-                    }
-                }
-
-                // Create unique indexes
-                for (col_name, col_def) in &schema.columns {
-                    if col_def.unique {
-                        let index_name = format!("unique_{}_{}", table_name, col_name);
-                        let key_prefix = format!("{}:*", table_name);
-                        let json_path = col_name.clone();
-                        let create_index_command = Command {
-                            name: "IDX.CREATE".to_string(),
-                            args: vec![
-                                b"IDX.CREATE".to_vec(),
-                                index_name.into_bytes(),
-                                key_prefix.into_bytes(),
-                                json_path.into_bytes(),
-                            ],
-                        };
-                        if let Response::Error(e) = super::super::commands::handle_idx_create(create_index_command, &ctx).await {
-                            Err(anyhow!("Failed to create unique index: {}", e))?;
-                        }
                     }
                 }
 
@@ -585,96 +607,152 @@ pub fn execute<'a>(
             }
             PhysicalPlan::Insert { table_name, columns, values } => {
                 let schema = ctx.schema_cache.get(&table_name);
-                let mut row_data = json!({});
 
-                // First, apply provided values
-                for (i, col_name) in columns.iter().enumerate() {
-                    let val_expr = &values[i];
-                    let mut val = val_expr.evaluate_with_context(&json!({}), None, ctx.clone()).await?;
-
-                    if let Some(schema) = &schema {
-                        if let Some(col_def) = schema.columns.get(col_name) {
-                            val = cast_value_to_type(val, &col_def.data_type)?;
+                let insert_columns = if columns.is_empty() {
+                    if let Some(s) = &schema {
+                        if !s.column_order.is_empty() {
+                            s.column_order.clone()
+                        } else {
+                            s.columns.keys().cloned().collect::<Vec<String>>()
                         }
+                    } else {
+                        Err(anyhow!("Cannot INSERT without column list into a table with no schema"))?
+                    }
+                } else {
+                    columns.clone()
+                };
+
+                let mut total_rows_affected = 0;
+
+                for row_values in values {
+                    if insert_columns.len() != row_values.len() {
+                        Err(anyhow!("INSERT has mismatch between number of columns ({}) and values ({})", insert_columns.len(), row_values.len()))?;
                     }
 
-                    row_data[col_name] = val;
-                }
+                    let mut row_data = json!({});
 
-                // Second, apply default values for missing columns
-                if let Some(schema) = &schema {
-                    for (col_name, col_def) in &schema.columns {
-                        if !row_data.get(col_name).is_some() { // More reliable check
-                            if let Some(default_expr) = &col_def.default {
-                                let mut val = default_expr.evaluate_with_context(&json!({}), None, ctx.clone()).await?;
+                    for (i, col_name) in insert_columns.iter().enumerate() {
+                        let val_expr = &row_values[i];
+                        let mut val = val_expr.evaluate_with_context(&json!({}), None, ctx.clone()).await?;
+
+                        if let Some(s) = &schema {
+                            if let Some(col_def) = s.columns.get(col_name) {
                                 val = cast_value_to_type(val, &col_def.data_type)?;
-                                row_data[col_name] = val;
                             }
                         }
-                    }
-                }
-
-                // Third, check all constraints
-                if let Some(schema) = &schema {
-                    // NOT NULL
-                    for (col_name, col_def) in &schema.columns {
-                        if !col_def.nullable && row_data.get(col_name).map_or(true, |v| v.is_null()) {
-                            Err(anyhow!("NULL value in column '{}' violates not-null constraint", col_name))?;
-                        }
+                        row_data[col_name] = val;
                     }
 
-                    // UNIQUE
-                    for (col_name, col_def) in &schema.columns {
-                        if col_def.unique {
-                            if let Some(val) = row_data.get(col_name) {
-                                let key_prefix = format!("{}:*", table_name);
-                                let full_index_name = format!("{}|{}", key_prefix, col_name);
-                                if let Some(index) = ctx.index_manager.indexes.get(&full_index_name) {
-                                    let index_key = serde_json::to_string(val)?;
-                                    let index_data = index.read().await;
-                                    if index_data.contains_key(&index_key) {
-                                        Err(anyhow!("UNIQUE constraint failed for column '{}'", col_name))?;
-                                    }
+                    if let Some(s) = &schema {
+                        for (col_name, col_def) in &s.columns {
+                            if !row_data.get(col_name).is_some() {
+                                if let Some(default_expr) = &col_def.default {
+                                    let mut val = default_expr.evaluate_with_context(&json!({}), None, ctx.clone()).await?;
+                                    val = cast_value_to_type(val, &col_def.data_type)?;
+                                    row_data[col_name.clone()] = val;
                                 }
                             }
                         }
                     }
 
-                    // CHECK
-                    if let Some(check_expr) = &schema.check {
-                        let check_row = json!({ table_name.clone(): row_data.clone() });
-                        if !check_expr.evaluate_with_context(&check_row, None, ctx.clone()).await?.as_bool().unwrap_or(false) {
-                            Err(anyhow!("CHECK constraint failed for table '{}'", table_name))?;
+                    if let Some(s) = &schema {
+                        for (col_name, col_def) in &s.columns {
+                            if !col_def.nullable && row_data.get(col_name).map_or(true, |v| v.is_null()) {
+                                Err(anyhow!("NULL value in column '{}' violates not-null constraint", col_name))?;
+                            }
+                        }
+
+                        // Check UNIQUE constraints
+                        for constraint in &s.constraints {
+                            if let TableConstraint::Unique { name: _, columns } = constraint {
+                                if columns.len() == 1 { // Only single-column unique constraints are handled here
+                                    let col_name = &columns[0];
+                                    if let Some(val) = row_data.get(col_name) {
+                                        let key_prefix = format!("{}:*", table_name);
+                                        let full_index_name = format!("{}|{}", key_prefix, col_name);
+                                        if let Some(index) = ctx.index_manager.indexes.get(&full_index_name) {
+                                            let index_key = serde_json::to_string(val)?;
+                                            let index_data = index.read().await;
+                                            if index_data.contains_key(&index_key) {
+                                                Err(anyhow!("UNIQUE constraint failed for column '{}'", col_name))?;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Check CHECK constraints
+                        for constraint in &s.constraints {
+                            if let TableConstraint::Check { name: _, expression } = constraint {
+                                let check_row = json!({ table_name.clone(): row_data.clone() });
+                                if !super::logical_plan::simple_expr_to_expression(expression.clone(), &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry)?.evaluate_with_context(&check_row, None, ctx.clone()).await?.as_bool().unwrap_or(false) {
+                                    Err(anyhow!("CHECK constraint failed for table '{}'", table_name))?;
+                                }
+                            }
+                        }
+
+                        // Check PRIMARY KEY constraint (uniqueness)
+                        let pk_cols: Vec<String> = s.constraints.iter().filter_map(|c| {
+                            if let TableConstraint::PrimaryKey { name: _, columns } = c {
+                                Some(columns.clone())
+                            } else {
+                                None
+                            }
+                        }).flatten().collect();
+
+                        if !pk_cols.is_empty() {
+                            let pk_col = pk_cols.first().cloned().unwrap_or_else(|| "id".to_string());
+                            let pk = match row_data.get(&pk_col) {
+                                Some(Value::String(s)) => s.clone(),
+                                Some(Value::Number(n)) => n.to_string(),
+                                _ => Uuid::new_v4().to_string(),
+                            };
+                            let key = format!("{}:{}", table_name, pk);
+
+                            if ctx.db.contains_key(&key) {
+                                Err(anyhow!("PRIMARY KEY constraint failed for table '{}'. Key '{}' already exists.", table_name, key))?;
+                            }
                         }
                     }
+
+                    check_foreign_key_constraints(&table_name, &row_data, &ctx).await?;
+
+                    let pk_col = if let Some(s) = &schema {
+                        s.constraints.iter().filter_map(|c| {
+                            if let TableConstraint::PrimaryKey { name: _, columns } = c {
+                                columns.first().cloned()
+                            } else {
+                                None
+                            }
+                        }).next().unwrap_or_else(|| "id".to_string())
+                    } else {
+                        "id".to_string()
+                    };
+
+                    let pk = match row_data.get(&pk_col) {
+                        Some(Value::String(s)) => s.clone(),
+                        Some(Value::Number(n)) => n.to_string(),
+                        _ => Uuid::new_v4().to_string(),
+                    };
+                    let key = format!("{}:{}", table_name, pk);
+
+                    if ctx.db.contains_key(&key) {
+                        Err(anyhow!("PRIMARY KEY constraint failed for table '{}'. Key '{}' already exists.", table_name, key))?;
+                    }
+
+                    let value_bytes = serde_json::to_vec(&row_data)?;
+                    let log_entry = LogEntry::SetJsonB { key: key.clone(), value: value_bytes.clone() };
+                    log_and_wait_qe!(ctx.logger, log_entry).await?;
+
+                    ctx.index_manager
+                        .add_key_to_indexes(&key, &row_data)
+                        .await;
+
+                    ctx.db.insert(key, DbValue::JsonB(value_bytes));
+                    total_rows_affected += 1;
                 }
-
-                // Fourth, check foreign key constraints
-                check_foreign_key_constraints(&table_name, &row_data, &ctx).await?;
-
-                let pk_col = schema.as_ref().and_then(|s| s.primary_key.first().cloned()).unwrap_or_else(|| "id".to_string());
-                let pk = row_data.get(&pk_col)
-                    .and_then(|v| v.as_str().map(|s| s.to_string())
-                    .or_else(|| v.as_i64().map(|i| i.to_string()))
-                    .or_else(|| v.as_f64().map(|f| f.to_string())))
-                    .unwrap_or_else(|| Uuid::new_v4().to_string());
-                let key = format!("{}:{}", table_name, pk);
-
-                // Final check for Primary Key uniqueness (in case it's not covered by a UNIQUE index for some reason)
-                if ctx.db.contains_key(&key) {
-                    Err(anyhow!("PRIMARY KEY constraint failed for table '{}'. Key '{}' already exists.", table_name, key))?;
-                }
-
-                let value_bytes = serde_json::to_vec(&row_data)?;
-                let log_entry = LogEntry::SetJsonB { key: key.clone(), value: value_bytes.clone() };
-                log_and_wait_qe!(ctx.logger, log_entry).await?;
-
-                ctx.index_manager
-                    .add_key_to_indexes(&key, &row_data)
-                    .await;
-
-                ctx.db.insert(key, DbValue::JsonB(value_bytes));
-                yield json!({"rows_affected": 1});
+                yield json!({"rows_affected": total_rows_affected});
             }
             PhysicalPlan::Delete { from } => {
                 let stream = execute(*from, ctx.clone(), outer_row);
@@ -752,19 +830,22 @@ pub fn execute<'a>(
                         // Apply ON UPDATE actions for foreign keys
                         apply_on_update_actions(&table_name, &old_val_for_index, &new_val, &ctx).await?;
 
-                        // Check unique constraints
+                        // Check UNIQUE constraints
                         if let Some(schema) = &schema {
-                            for (col_name, col_def) in &schema.columns {
-                                if col_def.unique {
-                                    if let Some(val) = new_val.get(col_name) {
-                                        let key_prefix = format!("{}:*", table_name);
-                                        let full_index_name = format!("{}|{}", key_prefix, col_name);
-                                        if let Some(index) = ctx.index_manager.indexes.get(&full_index_name) {
-                                            let index_key = serde_json::to_string(val)?;
-                                            let index_data = index.read().await;
-                                            if let Some(keys) = index_data.get(&index_key) {
-                                                if !keys.contains(&key) { // Ensure it's not the same key
-                                                    Err(anyhow!("UNIQUE constraint failed for column '{}'", col_name))?;
+                            for constraint in &schema.constraints {
+                                if let TableConstraint::Unique { name: _, columns } = constraint {
+                                    if columns.len() == 1 { // Only single-column unique constraints are handled here
+                                        let col_name = &columns[0];
+                                        if let Some(val) = new_val.get(col_name) {
+                                            let key_prefix = format!("{}:*", table_name);
+                                            let full_index_name = format!("{}|{}", key_prefix, col_name);
+                                            if let Some(index) = ctx.index_manager.indexes.get(&full_index_name) {
+                                                let index_key = serde_json::to_string(val)?;
+                                                let index_data = index.read().await;
+                                                if let Some(keys) = index_data.get(&index_key) {
+                                                    if !keys.contains(&key) { // Ensure it's not the same key
+                                                        Err(anyhow!("UNIQUE constraint failed for column '{}'", col_name))?;
+                                                    }
                                                 }
                                             }
                                         }
@@ -775,16 +856,14 @@ pub fn execute<'a>(
 
                         // Check table-level CHECK constraint
                         if let Some(schema) = &schema {
-                            if let Some(check_expr) = &schema.check {
-                                // Wrap the new row value in a table-namespaced object
-                                let check_row = json!({ table_name.clone(): new_val.clone() });
-                                if !check_expr
-                                    .evaluate_with_context(&check_row, None, ctx.clone())
-                                    .await?
-                                    .as_bool()
-                                    .unwrap_or(false)
-                                {
-                                    Err(anyhow!("CHECK constraint failed for table '{}'", table_name))?;
+                            for constraint in &schema.constraints {
+                                if let TableConstraint::Check { name: _, expression } = constraint {
+                                    // Wrap the new row value in a table-namespaced object
+                                    let check_row = json!({ table_name.clone(): new_val.clone() });
+                                    if !super::logical_plan::simple_expr_to_expression(expression.clone(), &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry)?.evaluate_with_context(&check_row, None, ctx.clone()).await?.as_bool().unwrap_or(false)
+                                    {
+                                        Err(anyhow!("CHECK constraint failed for table '{}'", table_name))?;
+                                    }
                                 }
                             }
                         }
@@ -822,20 +901,222 @@ pub fn execute<'a>(
                         if schema.columns.contains_key(&col_def.name) {
                             Err(anyhow!("Column '{}' already exists in table '{}'", col_def.name, table_name))?;
                         }
-                        let dt = match col_def.data_type.to_uppercase().as_str() {
-                            "INTEGER" => DataType::Integer,
-                            "TEXT" => DataType::Text,
-                            "BOOLEAN" => DataType::Boolean,
-                            "TIMESTAMP" => DataType::Timestamp,
-                            _ => Err(anyhow!("Unsupported data type: {}", col_def.data_type))?,
+                        let dt = DataType::from_str(&col_def.data_type)?;
+                        let default_expr = if let Some(d) = col_def.default {
+                            Some(super::logical_plan::simple_expr_to_expression(d, &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry)?)
+                        } else {
+                            None
                         };
-                        let new_col = ColumnDefinition { data_type: dt, nullable: true, unique: false, default: None };
-                        schema.columns.insert(col_def.name, new_col);
+
+                        let new_col = ColumnDefinition { data_type: dt, nullable: col_def.nullable, default: default_expr };
+                        schema.columns.insert(col_def.name.clone(), new_col);
+                        schema.column_order.push(col_def.name);
                     }
                     AlterTableAction::DropColumn { column_name } => {
                         if schema.columns.remove(&column_name).is_none() {
                              Err(anyhow!("Column '{}' does not exist in table '{}'", column_name, table_name))?;
                         }
+                        schema.column_order.retain(|c| c != &column_name);
+                        // Note: This doesn't remove the data from existing rows. A background job or a more complex
+                        // operation would be needed for that.
+                    }
+                    AlterTableAction::AlterColumnSetDefault { column_name, default_expr } => {
+                        let col = schema.columns.get_mut(&column_name).ok_or_else(|| anyhow!("Column '{}' does not exist", column_name))?;
+                        col.default = Some(super::logical_plan::simple_expr_to_expression(default_expr, &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry)?);
+                    }
+                    AlterTableAction::AlterColumnDropDefault { column_name } => {
+                        let col = schema.columns.get_mut(&column_name).ok_or_else(|| anyhow!("Column '{}' does not exist", column_name))?;
+                        col.default = None;
+                    }
+                    AlterTableAction::AlterColumnSetNotNull { column_name } => {
+                        // First, check if any existing data violates the new constraint
+                                                let table_prefix = format!("{}:", table_name);
+                        for entry in ctx.db.iter() {
+                            if entry.key().starts_with(&table_prefix) {
+                                let val: Value = match entry.value() {
+                                    DbValue::Json(v) => v.clone(),
+                                    DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
+                                    _ => continue,
+                                };
+                                if val.get(&column_name).map_or(true, |v| v.is_null()) {
+                                    Err(anyhow!("Cannot add NOT NULL constraint: column '{}' contains null values", column_name))?;
+                                }
+                            }
+                        }
+                        let col = schema.columns.get_mut(&column_name).ok_or_else(|| anyhow!("Column '{}' does not exist", column_name))?;
+                        col.nullable = false;
+                    }
+                    AlterTableAction::AlterColumnDropNotNull { column_name } => {
+                        let col = schema.columns.get_mut(&column_name).ok_or_else(|| anyhow!("Column '{}' does not exist", column_name))?;
+                        col.nullable = true;
+                    }
+                    AlterTableAction::RenameTable { new_table_name } => {
+                        // 1. Check for conflicts
+                        if ctx.schema_cache.contains_key(&new_table_name) {
+                            Err(anyhow!("Table or view with name '{}' already exists", new_table_name))?;
+                        }
+
+                        // 2. Rename schema key and update schema object
+                        let new_schema_key = format!("{}{}", SCHEMA_PREFIX, new_table_name);
+                        let mut new_schema = schema.clone();
+                        new_schema.table_name = new_table_name.clone();
+                        let new_schema_bytes = serde_json::to_vec(&new_schema)?;
+
+                        // 3. Log the changes for WAL
+                        log_and_wait_qe!(ctx.logger, LogEntry::Delete { key: schema_key.clone() }).await?;
+                        log_and_wait_qe!(ctx.logger, LogEntry::SetBytes { key: new_schema_key.clone(), value: new_schema_bytes.clone() }).await?;
+
+                        // 4. Atomically update in-memory schema
+                        ctx.db.remove(&schema_key);
+                        ctx.db.insert(new_schema_key, DbValue::Bytes(new_schema_bytes));
+                        ctx.schema_cache.remove(&table_name);
+                        ctx.schema_cache.insert(new_table_name.clone(), Arc::new(new_schema));
+
+                        // 5. Rewrite all data keys (this is a heavy operation)
+                        let old_prefix = format!("{}:", table_name);
+                        let new_prefix = format!("{}:", new_table_name);
+                        let keys_to_rename: Vec<_> = ctx.db.iter().filter(|e| e.key().starts_with(&old_prefix)).map(|e| e.key().clone()).collect();
+
+                        for old_key in keys_to_rename {
+                            if let Some(entry) = ctx.db.remove(&old_key) {
+                                let new_key = old_key.replacen(&old_prefix, &new_prefix, 1);
+                                // TODO: This is not transactional. A failure here leaves the DB in an inconsistent state.
+                                // A proper implementation would use a two-phase commit or similar mechanism.
+                                log_and_wait_qe!(ctx.logger, LogEntry::Delete { key: old_key.clone() }).await?;
+                                let log_entry = match entry.1 {
+                                    DbValue::JsonB(ref bytes) => LogEntry::SetJsonB { key: new_key.clone(), value: bytes.clone() },
+                                    DbValue::Bytes(ref bytes) => LogEntry::SetBytes { key: new_key.clone(), value: bytes.clone() },
+                                    _ => Err(anyhow!("Unsupported value type during table rename for key {}", old_key))?,
+                                };
+                                log_and_wait_qe!(ctx.logger, log_entry).await?;
+                                ctx.db.insert(new_key, entry.1);
+                            }
+                        }
+                        // TODO: Update all foreign key references in other tables that point to this table.
+                    }
+                    AlterTableAction::RenameColumn { old_column_name, new_column_name } => {
+                        if !schema.columns.contains_key(&old_column_name) {
+                            Err(anyhow!("Column '{}' does not exist", old_column_name))?;
+                        }
+                        if schema.columns.contains_key(&new_column_name) {
+                            Err(anyhow!("Column '{}' already exists", new_column_name))?;
+                        }
+
+                        // 1. Update schema
+                        if let Some(col_def) = schema.columns.remove(&old_column_name) {
+                            schema.columns.insert(new_column_name.clone(), col_def);
+                        }
+                        if let Some(pos) = schema.column_order.iter().position(|c| c == &old_column_name) {
+                            schema.column_order[pos] = new_column_name.clone();
+                        }
+                        // TODO: Update CHECK constraints and FOREIGN KEY definitions that reference this column.
+
+                        // 2. Rewrite data
+                        let table_prefix = format!("{}:", table_name);
+                        let keys_to_update: Vec<_> = ctx.db.iter().filter(|e| e.key().starts_with(&table_prefix)).map(|e| e.key().clone()).collect();
+                        for key in keys_to_update {
+                             if let Some(mut entry) = ctx.db.get_mut(&key) {
+                                let mut val: serde_json::Value = match entry.value() {
+                                    DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
+                                    _ => continue,
+                                };
+                                if let Some(obj) = val.as_object_mut() {
+                                    if let Some(v) = obj.remove(&old_column_name) {
+                                        obj.insert(new_column_name.clone(), v);
+                                    }
+                                }
+                                let new_bytes = serde_json::to_vec(&val)?;
+                                log_and_wait_qe!(ctx.logger, LogEntry::SetJsonB { key: key.clone(), value: new_bytes.clone() }).await?;
+                                *entry.value_mut() = DbValue::JsonB(new_bytes);
+                             }
+                        }
+                    }
+                    AlterTableAction::AddConstraint(constraint) => {
+                        // TODO: Implement validation to ensure existing data meets the constraint.
+                        // For now, just add the constraint. Validation should happen at a higher level.
+                        schema.constraints.push(constraint);
+                    }
+                    AlterTableAction::DropConstraint { constraint_name } => {
+                        let mut constraint_to_remove = None;
+                        let mut found = false;
+
+                        if let Some(index) = schema.constraints.iter().position(|c| {
+                            let name = match c {
+                                TableConstraint::Unique { name, .. } => name.as_deref(),
+                                TableConstraint::PrimaryKey { name, .. } => name.as_deref(),
+                                TableConstraint::ForeignKey(fk) => fk.name.as_deref(),
+                                TableConstraint::Check { name, .. } => name.as_deref(),
+                            };
+                            name == Some(constraint_name.as_str())
+                        }) {
+                            found = true;
+                            constraint_to_remove = Some(schema.constraints.remove(index));
+                        }
+
+                        if !found {
+                            Err(anyhow!("Constraint '{}' does not exist on table '{}'", constraint_name, table_name))?
+                        }
+
+                        if let Some(constraint) = constraint_to_remove {
+                             match constraint {
+                                TableConstraint::Unique { name, columns } => {
+                                    if columns.len() == 1 { // Only single-column unique constraints are handled here
+                                        let col_name = &columns[0];
+                                        let index_name = name.unwrap_or_else(|| format!("unique_{}_{}", table_name, col_name));
+                                        let drop_index_command = Command {
+                                            name: "IDX.DROP".to_string(),
+                                            args: vec![
+                                                b"IDX.DROP".to_vec(),
+                                                index_name.into_bytes(),
+                                            ],
+                                        };
+                                        if let Response::Error(e) = super::super::commands::handle_idx_drop(drop_index_command, &ctx).await {
+                                            eprintln!("Warning: Could not drop index for unique constraint '{}': {}", constraint_name, e);
+                                        }
+                                    }
+                                }
+                                TableConstraint::PrimaryKey { name, .. } => {
+                                    let index_name = name.unwrap_or_else(|| format!("pk_{}", table_name));
+                                     let drop_index_command = Command {
+                                        name: "IDX.DROP".to_string(),
+                                        args: vec![
+                                            b"IDX.DROP".to_vec(),
+                                            index_name.into_bytes(),
+                                        ],
+                                    };
+                                    if let Response::Error(e) = super::super::commands::handle_idx_drop(drop_index_command, &ctx).await {
+                                        eprintln!("Warning: Could not drop index for primary key constraint '{}': {}", constraint_name, e);
+                                    }
+                                }
+                                _ => {} // No side effects for CHECK or FOREIGN KEY for now
+                            }
+                        }
+                    }
+                    AlterTableAction::AlterColumnType { column_name, new_data_type } => {
+                        let new_dt = DataType::from_str(&new_data_type)?;
+                        // 1. Rewrite data by casting
+                        let table_prefix = format!("{}:", table_name);
+                        let keys_to_update: Vec<_> = ctx.db.iter().filter(|e| e.key().starts_with(&table_prefix)).map(|e| e.key().clone()).collect();
+                        for key in keys_to_update {
+                             if let Some(mut entry) = ctx.db.get_mut(&key) {
+                                let mut val: serde_json::Value = match entry.value() {
+                                    DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
+                                    _ => continue,
+                                };
+                                if let Some(obj) = val.as_object_mut() {
+                                    if let Some(old_v) = obj.get_mut(&column_name) {
+                                        let casted_v = cast_value_to_type(old_v.clone(), &new_dt)?;
+                                        *old_v = casted_v;
+                                    }
+                                }
+                                let new_bytes = serde_json::to_vec(&val)?;
+                                log_and_wait_qe!(ctx.logger, LogEntry::SetJsonB { key: key.clone(), value: new_bytes.clone() }).await?;
+                                *entry.value_mut() = DbValue::JsonB(new_bytes);
+                             }
+                        }
+                        // 2. Update schema
+                        let col = schema.columns.get_mut(&column_name).ok_or_else(|| anyhow!("Column '{}' does not exist", column_name))?;
+                        col.data_type = new_dt;
                     }
                 }
 
@@ -937,7 +1218,7 @@ pub fn execute<'a>(
                 for entry in ctx.db.iter() {
                     if entry.key().starts_with(&table_prefix) {
                         let row_key = entry.key().clone();
-                        let val = match entry.value() {
+                        let val: Value = match entry.value() {
                             DbValue::Json(v) => v.clone(),
                             DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
                             _ => continue,
@@ -1035,62 +1316,64 @@ async fn check_foreign_key_constraints(
     ctx: &Arc<AppContext>,
 ) -> Result<()> {
     if let Some(schema) = ctx.schema_cache.get(table_name) {
-        for fk in &schema.foreign_keys {
-            let child_key_values: Vec<Value> = fk
-                .columns
-                .iter()
-                .map(|col_name| row_data.get(col_name).cloned().unwrap_or(Value::Null))
-                .collect();
+        for constraint in &schema.constraints {
+            if let TableConstraint::ForeignKey(fk) = constraint {
+                let child_key_values: Vec<Value> = fk
+                    .columns
+                    .iter()
+                    .map(|col_name| row_data.get(col_name).cloned().unwrap_or(Value::Null))
+                    .collect();
 
-            // If any part of the foreign key is NULL, the constraint is satisfied (MATCH SIMPLE)
-            if child_key_values.iter().any(|v| v.is_null()) {
-                continue;
-            }
-
-            // Build a filter expression to find the parent row
-            let mut filter_expr: Option<Expression> = None;
-            for (i, col_name) in fk.references_columns.iter().enumerate() {
-                let condition = Expression::BinaryOp {
-                    left: Box::new(Expression::Column(col_name.clone())),
-                    op: Operator::Eq,
-                    right: Box::new(Expression::Literal(child_key_values[i].clone())),
-                };
-                if let Some(existing_expr) = filter_expr {
-                    filter_expr = Some(Expression::LogicalOp {
-                        left: Box::new(existing_expr),
-                        op: LogicalOperator::And,
-                        right: Box::new(condition),
-                    });
-                } else {
-                    filter_expr = Some(condition);
+                // If any part of the foreign key is NULL, the constraint is satisfied (MATCH SIMPLE)
+                if child_key_values.iter().any(|v| v.is_null()) {
+                    continue;
                 }
-            }
 
-            if let Some(predicate) = filter_expr {
-                let scan_plan = LogicalPlan::TableScan {
-                    table_name: fk.references_table.clone(),
-                };
-                let filter_plan = LogicalPlan::Filter {
-                    input: Box::new(scan_plan),
-                    predicate,
-                };
-                let limit_plan = LogicalPlan::Limit {
-                    input: Box::new(filter_plan),
-                    limit: Some(1),
-                    offset: None,
-                };
+                // Build a filter expression to find the parent row
+                let mut filter_expr: Option<Expression> = None;
+                for (i, col_name) in fk.references_columns.iter().enumerate() {
+                    let condition = Expression::BinaryOp {
+                        left: Box::new(Expression::Column(col_name.clone())),
+                        op: Operator::Eq,
+                        right: Box::new(Expression::Literal(child_key_values[i].clone())),
+                    };
+                    if let Some(existing_expr) = filter_expr {
+                        filter_expr = Some(Expression::LogicalOp {
+                            left: Box::new(existing_expr),
+                            op: LogicalOperator::And,
+                            right: Box::new(condition),
+                        });
+                    } else {
+                        filter_expr = Some(condition);
+                    }
+                }
 
-                let physical_plan =
-                    super::physical_plan::logical_to_physical_plan(limit_plan, &ctx.index_manager)?;
+                if let Some(predicate) = filter_expr {
+                    let scan_plan = LogicalPlan::TableScan {
+                        table_name: fk.references_table.clone(),
+                    };
+                    let filter_plan = LogicalPlan::Filter {
+                        input: Box::new(scan_plan),
+                        predicate,
+                    };
+                    let limit_plan = LogicalPlan::Limit {
+                        input: Box::new(filter_plan),
+                        limit: Some(1),
+                        offset: None,
+                    };
 
-                let results: Vec<Value> = execute(physical_plan, ctx.clone(), None).try_collect().await?;
+                    let physical_plan =
+                        super::physical_plan::logical_to_physical_plan(limit_plan, &ctx.index_manager)?;
 
-                if results.is_empty() {
-                    return Err(anyhow!(
-                        "Insert or update on table '{}' violates foreign key constraint. A matching key was not found in table '{}'.",
-                        table_name,
-                        fk.references_table,
-                    ));
+                    let results: Vec<Value> = execute(physical_plan, ctx.clone(), None).try_collect().await?;
+
+                    if results.is_empty() {
+                        return Err(anyhow!(
+                            "Insert or update on table '{}' violates foreign key constraint. A matching key was not found in table '{}'.",
+                            table_name,
+                            fk.references_table,
+                        ));
+                    }
                 }
             }
         }
@@ -1107,150 +1390,152 @@ async fn apply_on_delete_actions(
 ) -> Result<()> {
     for schema_entry in ctx.schema_cache.iter() {
         let child_schema = schema_entry.value();
-        for fk in &child_schema.foreign_keys {
-            if fk.references_table == parent_table_name {
-                let parent_key_values: Vec<Value> = fk
-                    .references_columns
-                    .iter()
-                    .map(|col_name| parent_row_data.get(col_name).cloned().unwrap_or(Value::Null))
-                    .collect();
+        for constraint in &child_schema.constraints {
+            if let TableConstraint::ForeignKey(fk) = constraint {
+                if fk.references_table == parent_table_name {
+                    let parent_key_values: Vec<Value> = fk
+                        .references_columns
+                        .iter()
+                        .map(|col_name| parent_row_data.get(col_name).cloned().unwrap_or(Value::Null))
+                        .collect();
 
-                if parent_key_values.iter().any(|v| v.is_null()) {
-                    continue; // Cannot match on NULL
-                }
-
-                let mut filter_expr: Option<Expression> = None;
-                for (i, col_name) in fk.columns.iter().enumerate() {
-                    let condition = Expression::BinaryOp {
-                        left: Box::new(Expression::Column(col_name.clone())),
-                        op: Operator::Eq,
-                        right: Box::new(Expression::Literal(parent_key_values[i].clone())),
-                    };
-                    if let Some(existing_expr) = filter_expr {
-                        filter_expr = Some(Expression::LogicalOp {
-                            left: Box::new(existing_expr),
-                            op: LogicalOperator::And,
-                            right: Box::new(condition),
-                        });
-                    } else {
-                        filter_expr = Some(condition);
+                    if parent_key_values.iter().any(|v| v.is_null()) {
+                        continue; // Cannot match on NULL
                     }
-                }
 
-                if let Some(predicate) = filter_expr {
-                    let scan_plan = LogicalPlan::TableScan {
-                        table_name: child_schema.table_name.clone(),
-                    };
-                    let filter_plan = LogicalPlan::Filter {
-                        input: Box::new(scan_plan),
-                        predicate,
-                    };
-                    let physical_plan =
-                        super::physical_plan::logical_to_physical_plan(filter_plan, &ctx.index_manager)?;
+                    let mut filter_expr: Option<Expression> = None;
+                    for (i, col_name) in fk.columns.iter().enumerate() {
+                        let condition = Expression::BinaryOp {
+                            left: Box::new(Expression::Column(col_name.clone())),
+                            op: Operator::Eq,
+                            right: Box::new(Expression::Literal(parent_key_values[i].clone())),
+                        };
+                        if let Some(existing_expr) = filter_expr {
+                            filter_expr = Some(Expression::LogicalOp {
+                                left: Box::new(existing_expr),
+                                op: LogicalOperator::And,
+                                right: Box::new(condition),
+                            });
+                        } else {
+                            filter_expr = Some(condition);
+                        }
+                    }
 
-                    let results: Vec<Value> = execute(physical_plan, ctx.clone(), None).try_collect().await?;
+                    if let Some(predicate) = filter_expr {
+                        let scan_plan = LogicalPlan::TableScan {
+                            table_name: child_schema.table_name.clone(),
+                        };
+                        let filter_plan = LogicalPlan::Filter {
+                            input: Box::new(scan_plan),
+                            predicate,
+                        };
+                        let physical_plan =
+                            super::physical_plan::logical_to_physical_plan(filter_plan, &ctx.index_manager)?;
 
-                    if !results.is_empty() {
-                        let on_delete_action = fk.on_delete.as_deref().unwrap_or("NO ACTION").to_uppercase();
-                        match on_delete_action.as_str() {
-                            "CASCADE" => {
-                                for child_row in results {
-                                    let child_key = child_row.as_object()
-                                        .and_then(|obj| obj.values().next())
-                                        .and_then(|table_obj| table_obj.get("_key"))
-                                        .and_then(|k| k.as_str())
-                                        .map(|s| s.to_string())
-                                        .ok_or_else(|| anyhow!("Could not get child key for CASCADE delete"))?;
+                        let results: Vec<Value> = execute(physical_plan, ctx.clone(), None).try_collect().await?;
 
-                                    let log_entry = LogEntry::Delete { key: child_key.clone() };
-                                    log_and_wait_qe!(ctx.logger, log_entry).await?;
-                                    if let Some(entry) = ctx.db.remove(&child_key) {
-                                        let size = crate::memory::estimate_db_value_size(&entry.1).await;
-                                        ctx.memory.decrease_memory(size + child_key.len() as u64);
-                                        ctx.memory.forget_key(&child_key).await;
-                                        if let DbValue::JsonB(b) = entry.1 {
-                                            if let Ok(val) = serde_json::from_slice::<Value>(&b) {
-                                                ctx.index_manager.remove_key_from_indexes(&child_key, &val).await;
+                        if !results.is_empty() {
+                            let on_delete_action = fk.on_delete.as_deref().unwrap_or("NO ACTION").to_uppercase();
+                            match on_delete_action.as_str() {
+                                "CASCADE" => {
+                                    for child_row in results {
+                                        let child_key = child_row.as_object()
+                                            .and_then(|obj| obj.values().next())
+                                            .and_then(|table_obj| table_obj.get("_key"))
+                                            .and_then(|k| k.as_str())
+                                            .map(|s| s.to_string())
+                                            .ok_or_else(|| anyhow!("Could not get child key for CASCADE delete"))?;
+
+                                        let log_entry = LogEntry::Delete { key: child_key.clone() };
+                                        log_and_wait_qe!(ctx.logger, log_entry).await?;
+                                        if let Some(entry) = ctx.db.remove(&child_key) {
+                                            let size = crate::memory::estimate_db_value_size(&entry.1).await;
+                                            ctx.memory.decrease_memory(size + child_key.len() as u64);
+                                            ctx.memory.forget_key(&child_key).await;
+                                            if let DbValue::JsonB(b) = entry.1 {
+                                                if let Ok(val) = serde_json::from_slice::<Value>(&b) {
+                                                    ctx.index_manager.remove_key_from_indexes(&child_key, &val).await;
+                                                }
                                             }
                                         }
                                     }
                                 }
-                            }
-                            "SET NULL" => {
-                                for child_row in results {
-                                    let child_key = child_row.as_object()
-                                        .and_then(|obj| obj.values().next())
-                                        .and_then(|table_obj| table_obj.get("_key"))
-                                        .and_then(|k| k.as_str())
-                                        .map(|s| s.to_string())
-                                        .ok_or_else(|| anyhow!("Could not get child key for SET NULL update"))?;
+                                "SET NULL" => {
+                                    for child_row in results {
+                                        let child_key = child_row.as_object()
+                                            .and_then(|obj| obj.values().next())
+                                            .and_then(|table_obj| table_obj.get("_key"))
+                                            .and_then(|k| k.as_str())
+                                            .map(|s| s.to_string())
+                                            .ok_or_else(|| anyhow!("Could not get child key for SET NULL update"))?;
 
-                                    let old_child_val_for_index = ctx.db.get(&child_key).map(|v| match v.value() {
-                                        DbValue::Json(j) => j.clone(),
-                                        DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
-                                        _ => Value::Null,
-                                    }).unwrap_or_default();
+                                        let old_child_val_for_index = ctx.db.get(&child_key).map(|v| match v.value() {
+                                            DbValue::Json(j) => j.clone(),
+                                            DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
+                                            _ => Value::Null,
+                                        }).unwrap_or_default();
 
-                                    let mut new_child_val = old_child_val_for_index.clone();
-                                    for col_name in &fk.columns {
-                                        new_child_val[col_name] = Value::Null;
-                                    }
-
-                                    let new_val_bytes = serde_json::to_vec(&new_child_val)?;
-                                    let log_entry = LogEntry::SetJsonB { key: child_key.clone(), value: new_val_bytes.clone() };
-                                    log_and_wait_qe!(ctx.logger, log_entry).await?;
-
-                                    ctx.index_manager.remove_key_from_indexes(&child_key, &old_child_val_for_index).await;
-                                    ctx.index_manager.add_key_to_indexes(&child_key, &new_child_val).await;
-
-                                    ctx.db.insert(child_key, DbValue::JsonB(new_val_bytes));
-                                }
-                            }
-                            "SET DEFAULT" => {
-                                for child_row in results {
-                                    let child_key = child_row.as_object()
-                                        .and_then(|obj| obj.values().next())
-                                        .and_then(|table_obj| table_obj.get("_key"))
-                                        .and_then(|k| k.as_str())
-                                        .map(|s| s.to_string())
-                                        .ok_or_else(|| anyhow!("Could not get child key for SET DEFAULT update"))?;
-
-                                    let old_child_val_for_index = ctx.db.get(&child_key).map(|v| match v.value() {
-                                        DbValue::Json(j) => j.clone(),
-                                        DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
-                                        _ => Value::Null,
-                                    }).unwrap_or_default();
-
-                                    let mut new_child_val = old_child_val_for_index.clone();
-                                    for col_name in &fk.columns {
-                                        let col_def = child_schema.columns.get(col_name)
-                                            .ok_or_else(|| anyhow!("Column '{}' not found in child table '{}' for SET DEFAULT", col_name, child_schema.table_name))?;
-
-                                        if let Some(default_expr) = &col_def.default {
-                                            let mut default_val = default_expr.evaluate_with_context(&json!({}), None, ctx.clone()).await?;
-                                            default_val = cast_value_to_type(default_val, &col_def.data_type)?;
-                                            new_child_val[col_name] = default_val;
-                                        } else {
-                                            return Err(anyhow!("Cannot SET DEFAULT because column '{}' in table '{}' has no default value", col_name, child_schema.table_name));
+                                        let mut new_child_val = old_child_val_for_index.clone();
+                                        for col_name in &fk.columns {
+                                            new_child_val[col_name] = Value::Null;
                                         }
+
+                                        let new_val_bytes = serde_json::to_vec(&new_child_val)?;
+                                        let log_entry = LogEntry::SetJsonB { key: child_key.clone(), value: new_val_bytes.clone() };
+                                        log_and_wait_qe!(ctx.logger, log_entry).await?;
+
+                                        ctx.index_manager.remove_key_from_indexes(&child_key, &old_child_val_for_index).await;
+                                        ctx.index_manager.add_key_to_indexes(&child_key, &new_child_val).await;
+
+                                        ctx.db.insert(child_key, DbValue::JsonB(new_val_bytes));
                                     }
-
-                                    let new_val_bytes = serde_json::to_vec(&new_child_val)?;
-                                    let log_entry = LogEntry::SetJsonB { key: child_key.clone(), value: new_val_bytes.clone() };
-                                    log_and_wait_qe!(ctx.logger, log_entry).await?;
-
-                                    ctx.index_manager.remove_key_from_indexes(&child_key, &old_child_val_for_index).await;
-                                    ctx.index_manager.add_key_to_indexes(&child_key, &new_child_val).await;
-
-                                    ctx.db.insert(child_key, DbValue::JsonB(new_val_bytes));
                                 }
-                            }
-                            _ => { // RESTRICT or NO ACTION
-                                return Err(anyhow!(
-                                    "Delete on table '{}' violates foreign key constraint on table '{}'",
-                                    parent_table_name,
-                                    child_schema.table_name,
-                                ));
+                                "SET DEFAULT" => {
+                                    for child_row in results {
+                                        let child_key = child_row.as_object()
+                                            .and_then(|obj| obj.values().next())
+                                            .and_then(|table_obj| table_obj.get("_key"))
+                                            .and_then(|k| k.as_str())
+                                            .map(|s| s.to_string())
+                                            .ok_or_else(|| anyhow!("Could not get child key for SET DEFAULT update"))?;
+
+                                        let old_child_val_for_index = ctx.db.get(&child_key).map(|v| match v.value() {
+                                            DbValue::Json(j) => j.clone(),
+                                            DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
+                                            _ => Value::Null,
+                                        }).unwrap_or_default();
+
+                                        let mut new_child_val = old_child_val_for_index.clone();
+                                        for col_name in &fk.columns {
+                                            let col_def = child_schema.columns.get(col_name)
+                                                .ok_or_else(|| anyhow!("Column '{}' not found in child table '{}' for SET DEFAULT", col_name, child_schema.table_name))?;
+
+                                            if let Some(default_expr) = &col_def.default {
+                                                let mut default_val = default_expr.evaluate_with_context(&json!({}), None, ctx.clone()).await?;
+                                                default_val = cast_value_to_type(default_val, &col_def.data_type)?;
+                                                new_child_val[col_name] = default_val;
+                                            } else {
+                                                return Err(anyhow!("Cannot SET DEFAULT because column '{}' in table '{}' has no default value", col_name, child_schema.table_name));
+                                            }
+                                        }
+
+                                        let new_val_bytes = serde_json::to_vec(&new_child_val)?;
+                                        let log_entry = LogEntry::SetJsonB { key: child_key.clone(), value: new_val_bytes.clone() };
+                                        log_and_wait_qe!(ctx.logger, log_entry).await?;
+
+                                        ctx.index_manager.remove_key_from_indexes(&child_key, &old_child_val_for_index).await;
+                                        ctx.index_manager.add_key_to_indexes(&child_key, &new_child_val).await;
+
+                                        ctx.db.insert(child_key, DbValue::JsonB(new_val_bytes));
+                                    }
+                                }
+                                _ => { // RESTRICT or NO ACTION
+                                    return Err(anyhow!(
+                                        "Delete on table '{}' violates foreign key constraint on table '{}'",
+                                        parent_table_name,
+                                        child_schema.table_name,
+                                    ));
+                                }
                             }
                         }
                     }
@@ -1270,164 +1555,166 @@ async fn apply_on_update_actions(
 ) -> Result<()> {
     for schema_entry in ctx.schema_cache.iter() {
         let child_schema = schema_entry.value();
-        for fk in &child_schema.foreign_keys {
-            if fk.references_table == parent_table_name {
-                let old_parent_key_values: Vec<Value> = fk
-                    .references_columns
-                    .iter()
-                    .map(|col_name| old_parent_row_data.get(col_name).cloned().unwrap_or(Value::Null))
-                    .collect();
+        for constraint in &child_schema.constraints {
+            if let TableConstraint::ForeignKey(fk) = constraint {
+                if fk.references_table == parent_table_name {
+                    let old_parent_key_values: Vec<Value> = fk
+                        .references_columns
+                        .iter()
+                        .map(|col_name| old_parent_row_data.get(col_name).cloned().unwrap_or(Value::Null))
+                        .collect();
 
-                if old_parent_key_values.iter().any(|v| v.is_null()) {
-                    continue; // Cannot match on NULL
-                }
-
-                let mut filter_expr: Option<Expression> = None;
-                for (i, col_name) in fk.columns.iter().enumerate() {
-                    let condition = Expression::BinaryOp {
-                        left: Box::new(Expression::Column(col_name.clone())),
-                        op: Operator::Eq,
-                        right: Box::new(Expression::Literal(old_parent_key_values[i].clone())),
-                    };
-                    if let Some(existing_expr) = filter_expr {
-                        filter_expr = Some(Expression::LogicalOp {
-                            left: Box::new(existing_expr),
-                            op: LogicalOperator::And,
-                            right: Box::new(condition),
-                        });
-                    } else {
-                        filter_expr = Some(condition);
+                    if old_parent_key_values.iter().any(|v| v.is_null()) {
+                        continue; // Cannot match on NULL
                     }
-                }
 
-                if let Some(predicate) = filter_expr {
-                    let scan_plan = LogicalPlan::TableScan {
-                        table_name: child_schema.table_name.clone(),
-                    };
-                    let filter_plan = LogicalPlan::Filter {
-                        input: Box::new(scan_plan),
-                        predicate,
-                    };
-                    let physical_plan =
-                        super::physical_plan::logical_to_physical_plan(filter_plan, &ctx.index_manager)?;
+                    let mut filter_expr: Option<Expression> = None;
+                    for (i, col_name) in fk.columns.iter().enumerate() {
+                        let condition = Expression::BinaryOp {
+                            left: Box::new(Expression::Column(col_name.clone())),
+                            op: Operator::Eq,
+                            right: Box::new(Expression::Literal(old_parent_key_values[i].clone())),
+                        };
+                        if let Some(existing_expr) = filter_expr {
+                            filter_expr = Some(Expression::LogicalOp {
+                                left: Box::new(existing_expr),
+                                op: LogicalOperator::And,
+                                right: Box::new(condition),
+                            });
+                        } else {
+                            filter_expr = Some(condition);
+                        }
+                    }
 
-                    let results: Vec<Value> = execute(physical_plan, ctx.clone(), None).try_collect().await?;
+                    if let Some(predicate) = filter_expr {
+                        let scan_plan = LogicalPlan::TableScan {
+                            table_name: child_schema.table_name.clone(),
+                        };
+                        let filter_plan = LogicalPlan::Filter {
+                            input: Box::new(scan_plan),
+                            predicate,
+                        };
+                        let physical_plan =
+                            super::physical_plan::logical_to_physical_plan(filter_plan, &ctx.index_manager)?;
 
-                    if !results.is_empty() {
-                        let on_update_action = fk.on_update.as_deref().unwrap_or("NO ACTION").to_uppercase();
-                        match on_update_action.as_str() {
-                            "CASCADE" => {
-                                let new_parent_pk_values: HashMap<String, Value> = fk.references_columns.iter()
-                                    .zip(fk.columns.iter())
-                                    .filter_map(|(ref_col, fk_col)| {
-                                        new_parent_row_data.get(ref_col).map(|v| (fk_col.clone(), v.clone()))
-                                    })
-                                    .collect();
+                        let results: Vec<Value> = execute(physical_plan, ctx.clone(), None).try_collect().await?;
 
-                                for child_row in results {
-                                    let child_key = child_row.as_object()
-                                        .and_then(|obj| obj.values().next())
-                                        .and_then(|table_obj| table_obj.get("_key"))
-                                        .and_then(|k| k.as_str())
-                                        .map(|s| s.to_string())
-                                        .ok_or_else(|| anyhow!("Could not get child key for CASCADE update"))?;
+                        if !results.is_empty() {
+                            let on_update_action = fk.on_update.as_deref().unwrap_or("NO ACTION").to_uppercase();
+                            match on_update_action.as_str() {
+                                "CASCADE" => {
+                                    let new_parent_pk_values: HashMap<String, Value> = fk.references_columns.iter()
+                                        .zip(fk.columns.iter())
+                                        .filter_map(|(ref_col, fk_col)| {
+                                            new_parent_row_data.get(ref_col).map(|v| (fk_col.clone(), v.clone()))
+                                        })
+                                        .collect();
 
-                                    let old_child_val_for_index = ctx.db.get(&child_key).map(|v| match v.value() {
-                                        DbValue::Json(j) => j.clone(),
-                                        DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
-                                        _ => Value::Null,
-                                    }).unwrap_or_default();
+                                    for child_row in results {
+                                        let child_key = child_row.as_object()
+                                            .and_then(|obj| obj.values().next())
+                                            .and_then(|table_obj| table_obj.get("_key"))
+                                            .and_then(|k| k.as_str())
+                                            .map(|s| s.to_string())
+                                            .ok_or_else(|| anyhow!("Could not get child key for CASCADE update"))?;
 
-                                    let mut new_child_val = old_child_val_for_index.clone();
-                                    for (col_name, new_val) in &new_parent_pk_values {
-                                        new_child_val[col_name] = new_val.clone();
-                                    }
+                                        let old_child_val_for_index = ctx.db.get(&child_key).map(|v| match v.value() {
+                                            DbValue::Json(j) => j.clone(),
+                                            DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
+                                            _ => Value::Null,
+                                        }).unwrap_or_default();
 
-                                    let new_val_bytes = serde_json::to_vec(&new_child_val)?;
-                                    let log_entry = LogEntry::SetJsonB { key: child_key.clone(), value: new_val_bytes.clone() };
-                                    log_and_wait_qe!(ctx.logger, log_entry).await?;
-
-                                    ctx.index_manager.remove_key_from_indexes(&child_key, &old_child_val_for_index).await;
-                                    ctx.index_manager.add_key_to_indexes(&child_key, &new_child_val).await;
-
-                                    ctx.db.insert(child_key, DbValue::JsonB(new_val_bytes));
-                                }
-                            }
-                            "SET NULL" => {
-                                for child_row in results {
-                                    let child_key = child_row.as_object()
-                                        .and_then(|obj| obj.values().next())
-                                        .and_then(|table_obj| table_obj.get("_key"))
-                                        .and_then(|k| k.as_str())
-                                        .map(|s| s.to_string())
-                                        .ok_or_else(|| anyhow!("Could not get child key for SET NULL update"))?;
-
-                                    let old_child_val_for_index = ctx.db.get(&child_key).map(|v| match v.value() {
-                                        DbValue::Json(j) => j.clone(),
-                                        DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
-                                        _ => Value::Null,
-                                    }).unwrap_or_default();
-
-                                    let mut new_child_val = old_child_val_for_index.clone();
-                                    for col_name in &fk.columns {
-                                        new_child_val[col_name] = Value::Null;
-                                    }
-
-                                    let new_val_bytes = serde_json::to_vec(&new_child_val)?;
-                                    let log_entry = LogEntry::SetJsonB { key: child_key.clone(), value: new_val_bytes.clone() };
-                                    log_and_wait_qe!(ctx.logger, log_entry).await?;
-
-                                    ctx.index_manager.remove_key_from_indexes(&child_key, &old_child_val_for_index).await;
-                                    ctx.index_manager.add_key_to_indexes(&child_key, &new_child_val).await;
-
-                                    ctx.db.insert(child_key, DbValue::JsonB(new_val_bytes));
-                                }
-                            }
-                            "SET DEFAULT" => {
-                                for child_row in results {
-                                    let child_key = child_row.as_object()
-                                        .and_then(|obj| obj.values().next())
-                                        .and_then(|table_obj| table_obj.get("_key"))
-                                        .and_then(|k| k.as_str())
-                                        .map(|s| s.to_string())
-                                        .ok_or_else(|| anyhow!("Could not get child key for SET DEFAULT update"))?;
-
-                                    let old_child_val_for_index = ctx.db.get(&child_key).map(|v| match v.value() {
-                                        DbValue::Json(j) => j.clone(),
-                                        DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
-                                        _ => Value::Null,
-                                    }).unwrap_or_default();
-
-                                    let mut new_child_val = old_child_val_for_index.clone();
-                                    for col_name in &fk.columns {
-                                        let col_def = child_schema.columns.get(col_name)
-                                            .ok_or_else(|| anyhow!("Column '{}' not found in child table '{}' for SET DEFAULT", col_name, child_schema.table_name))?;
-
-                                        if let Some(default_expr) = &col_def.default {
-                                            let mut default_val = default_expr.evaluate_with_context(&json!({}), None, ctx.clone()).await?;
-                                            default_val = cast_value_to_type(default_val, &col_def.data_type)?;
-                                            new_child_val[col_name] = default_val;
-                                        } else {
-                                            return Err(anyhow!("Cannot SET DEFAULT because column '{}' in table '{}' has no default value", col_name, child_schema.table_name));
+                                        let mut new_child_val = old_child_val_for_index.clone();
+                                        for (col_name, new_val) in &new_parent_pk_values {
+                                            new_child_val[col_name] = new_val.clone();
                                         }
+
+                                        let new_val_bytes = serde_json::to_vec(&new_child_val)?;
+                                        let log_entry = LogEntry::SetJsonB { key: child_key.clone(), value: new_val_bytes.clone() };
+                                        log_and_wait_qe!(ctx.logger, log_entry).await?;
+
+                                        ctx.index_manager.remove_key_from_indexes(&child_key, &old_child_val_for_index).await;
+                                        ctx.index_manager.add_key_to_indexes(&child_key, &new_child_val).await;
+
+                                        ctx.db.insert(child_key, DbValue::JsonB(new_val_bytes));
                                     }
-
-                                    let new_val_bytes = serde_json::to_vec(&new_child_val)?;
-                                    let log_entry = LogEntry::SetJsonB { key: child_key.clone(), value: new_val_bytes.clone() };
-                                    log_and_wait_qe!(ctx.logger, log_entry).await?;
-
-                                    ctx.index_manager.remove_key_from_indexes(&child_key, &old_child_val_for_index).await;
-                                    ctx.index_manager.add_key_to_indexes(&child_key, &new_child_val).await;
-
-                                    ctx.db.insert(child_key, DbValue::JsonB(new_val_bytes));
                                 }
-                            }
-                            _ => { // RESTRICT or NO ACTION
-                                return Err(anyhow!(
-                                    "Update on table '{}' violates foreign key constraint on table '{}'",
-                                    parent_table_name,
-                                    child_schema.table_name,
-                                ));
+                                "SET NULL" => {
+                                    for child_row in results {
+                                        let child_key = child_row.as_object()
+                                            .and_then(|obj| obj.values().next())
+                                            .and_then(|table_obj| table_obj.get("_key"))
+                                            .and_then(|k| k.as_str())
+                                            .map(|s| s.to_string())
+                                            .ok_or_else(|| anyhow!("Could not get child key for SET NULL update"))?;
+
+                                        let old_child_val_for_index = ctx.db.get(&child_key).map(|v| match v.value() {
+                                            DbValue::Json(j) => j.clone(),
+                                            DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
+                                            _ => Value::Null,
+                                        }).unwrap_or_default();
+
+                                        let mut new_child_val = old_child_val_for_index.clone();
+                                        for col_name in &fk.columns {
+                                            new_child_val[col_name] = Value::Null;
+                                        }
+
+                                        let new_val_bytes = serde_json::to_vec(&new_child_val)?;
+                                        let log_entry = LogEntry::SetJsonB { key: child_key.clone(), value: new_val_bytes.clone() };
+                                        log_and_wait_qe!(ctx.logger, log_entry).await?;
+
+                                        ctx.index_manager.remove_key_from_indexes(&child_key, &old_child_val_for_index).await;
+                                        ctx.index_manager.add_key_to_indexes(&child_key, &new_child_val).await;
+
+                                        ctx.db.insert(child_key, DbValue::JsonB(new_val_bytes));
+                                    }
+                                }
+                                "SET DEFAULT" => {
+                                    for child_row in results {
+                                        let child_key = child_row.as_object()
+                                            .and_then(|obj| obj.values().next())
+                                            .and_then(|table_obj| table_obj.get("_key"))
+                                            .and_then(|k| k.as_str())
+                                            .map(|s| s.to_string())
+                                            .ok_or_else(|| anyhow!("Could not get child key for SET DEFAULT update"))?;
+
+                                        let old_child_val_for_index = ctx.db.get(&child_key).map(|v| match v.value() {
+                                            DbValue::Json(j) => j.clone(),
+                                            DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
+                                            _ => Value::Null,
+                                        }).unwrap_or_default();
+
+                                        let mut new_child_val = old_child_val_for_index.clone();
+                                        for col_name in &fk.columns {
+                                            let col_def = child_schema.columns.get(col_name)
+                                                .ok_or_else(|| anyhow!("Column '{}' not found in child table '{}' for SET DEFAULT", col_name, child_schema.table_name))?;
+
+                                            if let Some(default_expr) = &col_def.default {
+                                                let mut default_val = default_expr.evaluate_with_context(&json!({}), None, ctx.clone()).await?;
+                                                default_val = cast_value_to_type(default_val, &col_def.data_type)?;
+                                                new_child_val[col_name] = default_val;
+                                            } else {
+                                                return Err(anyhow!("Cannot SET DEFAULT because column '{}' in table '{}' has no default value", col_name, child_schema.table_name));
+                                            }
+                                        }
+
+                                        let new_val_bytes = serde_json::to_vec(&new_child_val)?;
+                                        let log_entry = LogEntry::SetJsonB { key: child_key.clone(), value: new_val_bytes.clone() };
+                                        log_and_wait_qe!(ctx.logger, log_entry).await?;
+
+                                        ctx.index_manager.remove_key_from_indexes(&child_key, &old_child_val_for_index).await;
+                                        ctx.index_manager.add_key_to_indexes(&child_key, &new_child_val).await;
+
+                                        ctx.db.insert(child_key, DbValue::JsonB(new_val_bytes));
+                                    }
+                                }
+                                _ => { // RESTRICT or NO ACTION
+                                    return Err(anyhow!(
+                                        "Update on table '{}' violates foreign key constraint on table '{}'",
+                                        parent_table_name,
+                                        child_schema.table_name,
+                                    ));
+                                }
                             }
                         }
                     }

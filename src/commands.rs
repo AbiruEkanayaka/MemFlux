@@ -1089,6 +1089,9 @@ pub async fn handle_idx_create(command: Command, ctx: &AppContext) -> Response {
     let full_index_name = format!("{}|{}", key_prefix, json_path);
 
     if ctx.index_manager.indexes.contains_key(&full_index_name) {
+        return Response::Error(format!("Index on this prefix and path already exists"));
+    }
+    if ctx.index_manager.name_to_internal_name.contains_key(&index_name) {
         return Response::Error(format!("Index '{}' already exists", index_name));
     }
 
@@ -1096,6 +1099,9 @@ pub async fn handle_idx_create(command: Command, ctx: &AppContext) -> Response {
     ctx.index_manager
         .indexes
         .insert(full_index_name.clone(), index.clone());
+    ctx.index_manager
+        .name_to_internal_name
+        .insert(index_name.clone(), full_index_name.clone());
     ctx.index_manager
         .prefix_to_indexes
         .entry(key_prefix.clone())
@@ -1134,7 +1140,7 @@ pub async fn handle_idx_create(command: Command, ctx: &AppContext) -> Response {
     Response::Ok
 }
 
-async fn handle_idx_drop(command: Command, ctx: &AppContext) -> Response {
+pub async fn handle_idx_drop(command: Command, ctx: &AppContext) -> Response {
     if command.args.len() != 2 {
         return Response::Error("IDX.DROP requires an index name".to_string());
     }
@@ -1143,32 +1149,11 @@ async fn handle_idx_drop(command: Command, ctx: &AppContext) -> Response {
         Err(_) => return Response::Error("Invalid index name".to_string()),
     };
 
-    let mut found_key: Option<String> = None;
-    for item in ctx.index_manager.indexes.iter() {
-        let internal_name = item.key();
-        let parts: Vec<&str> = internal_name.splitn(2, '|').collect();
-        if parts.len() == 2 {
-            let key_prefix = parts[0];
-            let json_path = parts[1];
-
-            let fabricated_name = format!(
-                "{}_{}",
-                key_prefix.trim_end_matches('*'),
-                json_path.replace('.', "_")
-            );
-
-            if fabricated_name == index_name_to_drop {
-                found_key = Some(internal_name.clone());
-                break;
-            }
-        }
-    }
-
-    if let Some(key) = found_key {
-        ctx.index_manager.indexes.remove(&key);
-        let prefix = key.split('|').next().unwrap().to_string();
+    if let Some((_, internal_name)) = ctx.index_manager.name_to_internal_name.remove(&index_name_to_drop) {
+        ctx.index_manager.indexes.remove(&internal_name);
+        let prefix = internal_name.split('|').next().unwrap().to_string();
         if let Some(mut prefixes) = ctx.index_manager.prefix_to_indexes.get_mut(&prefix) {
-            prefixes.retain(|name| name != &key);
+            prefixes.retain(|name| name != &internal_name);
         }
         Response::Integer(1)
     } else {

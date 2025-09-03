@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::types::{Db, DbValue, SchemaCache};
 use crate::query_engine::logical_plan::Expression;
+use crate::query_engine::ast::{TableConstraint};
 
 use std::fmt;
 
@@ -166,19 +167,7 @@ pub struct ColumnDefinition {
     pub data_type: DataType,
     pub nullable: bool,
     #[serde(default)]
-    pub unique: bool,
-    #[serde(default)]
     pub default: Option<Expression>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct ForeignKeyClause {
-    pub name: Option<String>,
-    pub columns: Vec<String>,
-    pub references_table: String,
-    pub references_columns: Vec<String>,
-    pub on_delete: Option<String>,
-    pub on_update: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -186,11 +175,9 @@ pub struct VirtualSchema {
     pub table_name: String,
     pub columns: BTreeMap<String, ColumnDefinition>,
     #[serde(default)]
-    pub primary_key: Vec<String>,
+    pub column_order: Vec<String>,
     #[serde(default)]
-    pub check: Option<Expression>,
-    #[serde(default)]
-    pub foreign_keys: Vec<ForeignKeyClause>,
+    pub constraints: Vec<TableConstraint>,
 }
 
 pub async fn load_schemas_from_db(db: &Db, schema_cache: &SchemaCache) -> Result<()> {

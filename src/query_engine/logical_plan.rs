@@ -47,13 +47,41 @@ pub(crate) fn cast_value_to_type(value: Value, target_type: &DataType) -> Result
             _ => Err(anyhow!("Cannot cast {:?} to SMALLINT", value)),
         },
         DataType::Integer => match value {
-            Value::Number(n) => Ok(serde_json::json!(n.as_f64().unwrap_or_default() as i32)),
+            Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    if i > i32::MAX as i64 || i < i32::MIN as i64 {
+                        Err(anyhow!("Value {} out of range for INTEGER", i))
+                    } else {
+                        Ok(serde_json::json!(i as i32))
+                    }
+                } else if let Some(f) = n.as_f64() {
+                    if f.is_nan() || f > i32::MAX as f64 || f < i32::MIN as f64 {
+                        Err(anyhow!("Value {} out of range for INTEGER", f))
+                    } else {
+                        Ok(serde_json::json!(f.trunc() as i32))
+                    }
+                } else {
+                    Err(anyhow!("Invalid numeric value for INTEGER"))
+                }
+            }
             Value::String(s) => Ok(serde_json::json!(s.parse::<i32>()?)),
             Value::Bool(b) => Ok(serde_json::json!(if b { 1 } else { 0 })),
             _ => Err(anyhow!("Cannot cast {:?} to INTEGER", value)),
         },
         DataType::BigInt => match value {
-            Value::Number(n) => Ok(serde_json::json!(n.as_f64().unwrap_or_default() as i64)),
+            Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Ok(serde_json::json!(i))
+                } else if let Some(f) = n.as_f64() {
+                    if f.is_nan() {
+                        Err(anyhow!("NaN value cannot be cast to BIGINT"))
+                    } else {
+                        Ok(serde_json::json!(f.trunc() as i64))
+                    }
+                } else {
+                    Err(anyhow!("Invalid numeric value for BIGINT"))
+                }
+            }
             Value::String(s) => Ok(serde_json::json!(s.parse::<i64>()?)),
             Value::Bool(b) => Ok(serde_json::json!(if b { 1 } else { 0 })),
             _ => Err(anyhow!("Cannot cast {:?} to BIGINT", value)),
@@ -733,10 +761,8 @@ pub enum LogicalPlan {
     CreateTable {
         table_name: String,
         columns: Vec<ColumnDef>,
-        primary_key: Vec<String>,
-        foreign_keys: Vec<ForeignKeyClause>,
-        check: Option<Expression>,
         if_not_exists: bool,
+        constraints: Vec<TableConstraint>,
     },
     CreateSchema {
         schema_name: String,
@@ -748,7 +774,7 @@ pub enum LogicalPlan {
     Insert {
         table_name: String,
         columns: Vec<String>,
-        values: Vec<Expression>,
+        values: Vec<Vec<Expression>>,
     },
     Delete {
         from: Box<LogicalPlan>,
@@ -1069,23 +1095,11 @@ pub fn ast_to_logical_plan(
             query: statement.query,
         }),
         AstStatement::CreateTable(statement) => {
-            let check = if let Some(c) = statement.check {
-                Some(simple_expr_to_expression(
-                    c,
-                    schema_cache,
-                    view_cache,
-                    function_registry,
-                )?)
-            } else {
-                None
-            };
             Ok(LogicalPlan::CreateTable {
                 table_name: statement.table_name,
                 columns: statement.columns,
-                primary_key: statement.primary_key,
-                foreign_keys: statement.foreign_keys,
-                check,
                 if_not_exists: statement.if_not_exists,
+                constraints: statement.constraints,
             })
         }
         AstStatement::DropTable(statement) => Ok(LogicalPlan::DropTable {
@@ -1280,19 +1294,33 @@ pub fn ast_to_logical_plan(
             Ok(plan)
         }
         AstStatement::Insert(statement) => {
-            if let Some(schema) = schema_cache.get(&statement.table) {
-                for col in &statement.columns {
-                    if !schema.columns.contains_key(col) {
-                        return Err(anyhow!("Column '{}' does not exist in table '{}'", col, statement.table));
+            if !statement.columns.is_empty() {
+                if let Some(schema) = schema_cache.get(&statement.table) {
+                    for col in &statement.columns {
+                        if !schema.columns.contains_key(col) {
+                            return Err(anyhow!(
+                                "Column '{}' does not exist in table '{}'",
+                                col,
+                                statement.table
+                            ));
+                        }
                     }
                 }
             }
 
-                        let values = statement
+            let values = statement
                 .values
                 .into_iter()
-                .map(|e| simple_expr_to_expression(e, schema_cache, view_cache, function_registry))
-                .collect::<Result<Vec<_>>>()?;
+                .map(|row_values| {
+                    row_values
+                        .into_iter()
+                        .map(|e| {
+                            simple_expr_to_expression(e, schema_cache, view_cache, function_registry)
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<Vec<Vec<_>>>>()?;
+
             Ok(LogicalPlan::Insert {
                 table_name: statement.table,
                 columns: statement.columns,

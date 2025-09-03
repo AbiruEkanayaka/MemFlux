@@ -87,7 +87,7 @@ pub struct SelectStatement {
 pub struct InsertStatement {
     pub table: String,
     pub columns: Vec<String>,
-    pub values: Vec<SimpleExpression>,
+    pub values: Vec<Vec<SimpleExpression>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,7 +101,6 @@ pub struct ColumnDef {
     pub name: String,
     pub data_type: String,
     pub nullable: bool,
-    pub unique: bool,
     pub default: Option<SimpleExpression>,
 }
 
@@ -119,10 +118,8 @@ pub struct ForeignKeyClause {
 pub struct CreateTableStatement {
     pub table_name: String,
     pub columns: Vec<ColumnDef>,
-    pub primary_key: Vec<String>,
-    pub foreign_keys: Vec<ForeignKeyClause>,
-    pub check: Option<SimpleExpression>,
     pub if_not_exists: bool,
+    pub constraints: Vec<TableConstraint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -137,8 +134,46 @@ pub struct DropViewStatement {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AlterTableAction {
+    RenameTable {
+        new_table_name: String,
+    },
+    RenameColumn {
+        old_column_name: String,
+        new_column_name: String,
+    },
     AddColumn(ColumnDef),
-    DropColumn { column_name: String },
+    DropColumn {
+        column_name: String,
+    },
+    AddConstraint(TableConstraint),
+    DropConstraint {
+        constraint_name: String,
+    },
+    AlterColumnSetDefault {
+        column_name: String,
+        default_expr: SimpleExpression,
+    },
+    AlterColumnDropDefault {
+        column_name: String,
+    },
+    AlterColumnSetNotNull {
+        column_name: String,
+    },
+    AlterColumnDropNotNull {
+        column_name: String,
+    },
+    AlterColumnType {
+        column_name: String,
+        new_data_type: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TableConstraint {
+    Unique { name: Option<String>, columns: Vec<String> },
+    PrimaryKey { name: Option<String>, columns: Vec<String> },
+    ForeignKey(ForeignKeyClause),
+    Check { name: Option<String>, expression: SimpleExpression },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -10,10 +10,12 @@ pub type Index = RwLock<BTreeMap<String, HashSet<String>>>;
 
 #[derive(Default, Debug)]
 pub struct IndexManager {
-    /// Maps an index name (e.g., "user:*|profile.age") to the index data.
+    /// Maps an internal index name (e.g., "user:*|profile.age") to the index data.
     pub indexes: DashMap<String, Arc<Index>>,
-    /// Maps a key prefix (e.g., "user:*") to a list of index names that apply to it.
+    /// Maps a key prefix (e.g., "user:*") to a list of internal index names that apply to it.
     pub prefix_to_indexes: DashMap<String, Vec<String>>,
+    /// Maps a user-facing index name to the internal name (prefix|path).
+    pub name_to_internal_name: DashMap<String, String>,
 }
 
 impl IndexManager {
