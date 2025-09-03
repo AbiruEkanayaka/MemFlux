@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use super::ast::{AlterTableAction, ColumnDef, ForeignKeyClause};
+use super::ast::{AlterTableAction, ColumnDef, ForeignKeyClause, CreateIndexStatement, SelectStatement};
 use super::logical_plan::*;
 use crate::indexing::IndexManager;
 
@@ -48,9 +48,20 @@ pub enum PhysicalPlan {
         primary_key: Vec<String>,
         foreign_keys: Vec<ForeignKeyClause>,
         check: Option<Expression>,
+        if_not_exists: bool,
+    },
+    CreateView {
+        view_name: String,
+        query: SelectStatement,
+    },
+    CreateSchema {
+        schema_name: String,
     },
     DropTable {
         table_name: String,
+    },
+    DropView {
+        view_name: String,
     },
     AlterTable {
         table_name: String,
@@ -73,6 +84,9 @@ pub enum PhysicalPlan {
         left: Box<PhysicalPlan>,
         right: Box<PhysicalPlan>,
         all: bool,
+    },
+    CreateIndex {
+        statement: CreateIndexStatement,
     },
 }
 
@@ -151,17 +165,36 @@ pub fn logical_to_physical_plan(
             primary_key,
             foreign_keys,
             check,
+            if_not_exists,
         } => Ok(PhysicalPlan::CreateTable {
             table_name,
             columns,
             primary_key,
             foreign_keys,
             check,
+            if_not_exists,
+        }),
+        LogicalPlan::CreateView {
+            view_name,
+            query,
+        } => Ok(PhysicalPlan::CreateView {
+            view_name,
+            query,
+        }),
+        LogicalPlan::CreateSchema {
+            schema_name,
+        } => Ok(PhysicalPlan::CreateSchema {
+            schema_name,
         }),
         LogicalPlan::DropTable {
             table_name,
         } => Ok(PhysicalPlan::DropTable {
             table_name,
+        }),
+        LogicalPlan::DropView {
+            view_name,
+        } => Ok(PhysicalPlan::DropView {
+            view_name,
         }),
         LogicalPlan::Insert {
             table_name,
@@ -192,6 +225,7 @@ pub fn logical_to_physical_plan(
             right: Box::new(logical_to_physical_plan(*right, index_manager)?),
             all,
         }),
+        LogicalPlan::CreateIndex { statement } => Ok(PhysicalPlan::CreateIndex { statement }),
     }
 }
 

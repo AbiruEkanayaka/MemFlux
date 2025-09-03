@@ -12,7 +12,7 @@ use hex;
 
 use super::ast::*;
 use crate::schema::{DataType, VirtualSchema};
-use crate::types::{AppContext, FunctionRegistry, SchemaCache};
+use crate::types::{AppContext, FunctionRegistry, SchemaCache, ViewCache};
 
 pub(crate) fn cast_value_to_type(value: Value, target_type: &DataType) -> Result<Value> {
     // Allow nulls to pass through without casting. Nullability is a separate check.
@@ -736,6 +736,14 @@ pub enum LogicalPlan {
         primary_key: Vec<String>,
         foreign_keys: Vec<ForeignKeyClause>,
         check: Option<Expression>,
+        if_not_exists: bool,
+    },
+    CreateSchema {
+        schema_name: String,
+    },
+    CreateView {
+        view_name: String,
+        query: SelectStatement,
     },
     Insert {
         table_name: String,
@@ -753,6 +761,9 @@ pub enum LogicalPlan {
     DropTable {
         table_name: String,
     },
+    DropView {
+        view_name: String,
+    },
     AlterTable {
         table_name: String,
         action: AlterTableAction,
@@ -761,6 +772,9 @@ pub enum LogicalPlan {
         left: Box<LogicalPlan>,
         right: Box<LogicalPlan>,
         all: bool,
+    },
+    CreateIndex {
+        statement: CreateIndexStatement,
     },
 }
 
@@ -776,6 +790,7 @@ pub enum JoinType {
 pub(crate) fn simple_expr_to_expression(
     expr: SimpleExpression,
     schema_cache: &SchemaCache,
+    view_cache: &ViewCache,
     function_registry: &FunctionRegistry,
 ) -> Result<Expression> {
     match expr {
@@ -808,12 +823,14 @@ pub(crate) fn simple_expr_to_expression(
                 left: Box::new(simple_expr_to_expression(
                     *left,
                     schema_cache,
+                    view_cache,
                     function_registry,
                 )?),
                 op,
                 right: Box::new(simple_expr_to_expression(
                     *right,
                     schema_cache,
+                    view_cache,
                     function_registry,
                 )?),
             })
@@ -828,12 +845,14 @@ pub(crate) fn simple_expr_to_expression(
                 left: Box::new(simple_expr_to_expression(
                     *left,
                     schema_cache,
+                    view_cache,
                     function_registry,
                 )?),
                 op,
                 right: Box::new(simple_expr_to_expression(
                     *right,
                     schema_cache,
+                    view_cache,
                     function_registry,
                 )?),
             })
@@ -852,7 +871,7 @@ pub(crate) fn simple_expr_to_expression(
         SimpleExpression::FunctionCall { func, args } => {
             let args_expr = args
                 .into_iter()
-                .map(|e| simple_expr_to_expression(e, schema_cache, function_registry))
+                .map(|e| simple_expr_to_expression(e, schema_cache, view_cache, function_registry))
                 .collect::<Result<_>>()?;
             Ok(Expression::FunctionCall {
                 func,
@@ -868,11 +887,13 @@ pub(crate) fn simple_expr_to_expression(
                         Box::new(simple_expr_to_expression(
                             w,
                             schema_cache,
+                            view_cache,
                             function_registry,
                         )?),
                         Box::new(simple_expr_to_expression(
                             t,
                             schema_cache,
+                            view_cache,
                             function_registry,
                         )?),
                     ))
@@ -883,6 +904,7 @@ pub(crate) fn simple_expr_to_expression(
                 Some(Box::new(simple_expr_to_expression(
                     *else_expr,
                     schema_cache,
+                    view_cache,
                     function_registry,
                 )?))
             } else {
@@ -900,6 +922,7 @@ pub(crate) fn simple_expr_to_expression(
                 expr: Box::new(simple_expr_to_expression(
                     *expr,
                     schema_cache,
+                    view_cache,
                     function_registry,
                 )?),
                 data_type: dt,
@@ -907,7 +930,7 @@ pub(crate) fn simple_expr_to_expression(
         }
         SimpleExpression::Subquery(select_statement) => {
             let logical_plan =
-                ast_to_logical_plan(AstStatement::Select(*select_statement), schema_cache, function_registry)?;
+                ast_to_logical_plan(AstStatement::Select(*select_statement), schema_cache, view_cache, function_registry)?;
             Ok(Expression::Subquery(Box::new(logical_plan)))
         }
     }
@@ -917,6 +940,7 @@ pub(crate) fn simple_expr_to_expression(
 fn validate_expression(
     expr: &SimpleExpression,
     schemas: &HashMap<String, Arc<VirtualSchema>>,
+    view_cache: &ViewCache,
     function_registry: &FunctionRegistry,
 ) -> Result<()> {
     if schemas.is_empty() {
@@ -926,7 +950,7 @@ fn validate_expression(
                 return Err(anyhow!("Function '{}' not found", func));
             }
             for arg in args {
-                validate_expression(arg, schemas, function_registry)?;
+                validate_expression(arg, schemas, view_cache, function_registry)?;
             }
         }
         return Ok(());
@@ -970,16 +994,16 @@ fn validate_expression(
             Ok(())
         }
         SimpleExpression::BinaryOp { left, right, .. } => {
-            validate_expression(left, schemas, function_registry)?;
-            validate_expression(right, schemas, function_registry)
+            validate_expression(left, schemas, view_cache, function_registry)?;
+            validate_expression(right, schemas, view_cache, function_registry)
         }
         SimpleExpression::LogicalOp { left, right, .. } => {
-            validate_expression(left, schemas, function_registry)?;
-            validate_expression(right, schemas, function_registry)
+            validate_expression(left, schemas, view_cache, function_registry)?;
+            validate_expression(right, schemas, view_cache, function_registry)
         }
         SimpleExpression::AggregateFunction { arg, .. } => {
             if arg != "*" {
-                validate_expression(&SimpleExpression::Column(arg.clone()), schemas, function_registry)?;
+                validate_expression(&SimpleExpression::Column(arg.clone()), schemas, view_cache, function_registry)?;
             }
             Ok(())
         }
@@ -988,23 +1012,23 @@ fn validate_expression(
                 return Err(anyhow!("Function '{}' not found", func));
             }
             for arg in args {
-                validate_expression(arg, schemas, function_registry)?;
+                validate_expression(arg, schemas, view_cache, function_registry)?;
             }
             Ok(())
         }
         SimpleExpression::Literal(_) => Ok(()),
         SimpleExpression::Case(case_expr) => {
             for (when_expr, then_expr) in &case_expr.when_then_pairs {
-                validate_expression(when_expr, schemas, function_registry)?;
-                validate_expression(then_expr, schemas, function_registry)?;
+                validate_expression(when_expr, schemas, view_cache, function_registry)?;
+                validate_expression(then_expr, schemas, view_cache, function_registry)?;
             }
             if let Some(else_expr) = &case_expr.else_expression {
-                validate_expression(else_expr, schemas, function_registry)?;
+                validate_expression(else_expr, schemas, view_cache, function_registry)?;
             }
             Ok(())
         }
         SimpleExpression::Cast { expr, .. } => {
-            validate_expression(expr, schemas, function_registry)
+            validate_expression(expr, schemas, view_cache, function_registry)
         }
         SimpleExpression::Subquery(select_statement) => {
             // We need to validate the subquery in its own context.
@@ -1019,10 +1043,10 @@ fn validate_expression(
             }
 
             for col in &select_statement.columns {
-                validate_expression(&col.expr, &sub_schemas, function_registry)?;
+                validate_expression(&col.expr, &sub_schemas, view_cache, function_registry)?;
             }
             if let Some(where_clause) = &select_statement.where_clause {
-                validate_expression(where_clause, &sub_schemas, function_registry)?;
+                validate_expression(where_clause, &sub_schemas, view_cache, function_registry)?;
             }
             // TODO: Validate other parts of the subquery (GROUP BY, ORDER BY etc)
             Ok(())
@@ -1033,14 +1057,23 @@ fn validate_expression(
 pub fn ast_to_logical_plan(
     statement: AstStatement,
     schema_cache: &SchemaCache,
+    view_cache: &ViewCache,
     function_registry: &FunctionRegistry,
 ) -> Result<LogicalPlan> {
     match statement {
+        AstStatement::CreateSchema(statement) => Ok(LogicalPlan::CreateSchema {
+            schema_name: statement.schema_name,
+        }),
+        AstStatement::CreateView(statement) => Ok(LogicalPlan::CreateView {
+            view_name: statement.view_name,
+            query: statement.query,
+        }),
         AstStatement::CreateTable(statement) => {
             let check = if let Some(c) = statement.check {
                 Some(simple_expr_to_expression(
                     c,
                     schema_cache,
+                    view_cache,
                     function_registry,
                 )?)
             } else {
@@ -1052,10 +1085,14 @@ pub fn ast_to_logical_plan(
                 primary_key: statement.primary_key,
                 foreign_keys: statement.foreign_keys,
                 check,
+                if_not_exists: statement.if_not_exists,
             })
         }
         AstStatement::DropTable(statement) => Ok(LogicalPlan::DropTable {
             table_name: statement.table_name,
+        }),
+        AstStatement::DropView(statement) => Ok(LogicalPlan::DropView {
+            view_name: statement.view_name,
         }),
         AstStatement::Select(mut statement) => {
             let union_clause = statement.union.take();
@@ -1073,24 +1110,31 @@ pub fn ast_to_logical_plan(
 
             // We can validate expressions even with no schemas, for function calls
             for col in &statement.columns {
-                validate_expression(&col.expr, &schemas_in_scope, function_registry)?;
+                validate_expression(&col.expr, &schemas_in_scope, view_cache, function_registry)?;
             }
             if let Some(where_clause) = &statement.where_clause {
-                validate_expression(where_clause, &schemas_in_scope, function_registry)?;
+                validate_expression(where_clause, &schemas_in_scope, view_cache, function_registry)?;
             }
             for group_expr in &statement.group_by {
-                validate_expression(group_expr, &schemas_in_scope, function_registry)?;
+                validate_expression(group_expr, &schemas_in_scope, view_cache, function_registry)?;
             }
             for order_expr in &statement.order_by {
-                validate_expression(&order_expr.expression, &schemas_in_scope, function_registry)?;
+                validate_expression(&order_expr.expression, &schemas_in_scope, view_cache, function_registry)?;
             }
             for join in &statement.joins {
-                validate_expression(&join.on_condition, &schemas_in_scope, function_registry)?;
+                validate_expression(&join.on_condition, &schemas_in_scope, view_cache, function_registry)?;
             }
             // --- VALIDATION END ---
 
-            let mut plan = LogicalPlan::TableScan {
-                table_name: statement.from_table,
+            // Check if the FROM table is a view
+            let mut plan = if let Some(view_def) = view_cache.get(&statement.from_table) {
+                // It's a view, so we use its query as the base plan.
+                ast_to_logical_plan(AstStatement::Select(view_def.query.clone()), schema_cache, view_cache, function_registry)?
+            } else {
+                // It's a real table.
+                LogicalPlan::TableScan {
+                    table_name: statement.from_table,
+                }
             };
 
             for join in statement.joins {
@@ -1102,14 +1146,23 @@ pub fn ast_to_logical_plan(
                     "CROSS JOIN" => JoinType::Cross,
                     _ => return Err(anyhow!("Unsupported join type: {}", join.join_type)),
                 };
+
+                // Check if the JOIN table is a view
+                let right_plan = if let Some(view_def) = view_cache.get(&join.table) {
+                    ast_to_logical_plan(AstStatement::Select(view_def.query.clone()), schema_cache, view_cache, function_registry)?
+                } else {
+                    LogicalPlan::TableScan {
+                        table_name: join.table,
+                    }
+                };
+
                 plan = LogicalPlan::Join {
                     left: Box::new(plan),
-                    right: Box::new(LogicalPlan::TableScan {
-                        table_name: join.table,
-                    }),
+                    right: Box::new(right_plan),
                     condition: simple_expr_to_expression(
                         join.on_condition,
                         schema_cache,
+                        view_cache,
                         function_registry,
                     )?,
                     join_type,
@@ -1122,6 +1175,7 @@ pub fn ast_to_logical_plan(
                     predicate: simple_expr_to_expression(
                         selection,
                         schema_cache,
+                        view_cache,
                         function_registry,
                     )?,
                 };
@@ -1131,7 +1185,7 @@ pub fn ast_to_logical_plan(
                 .columns
                 .into_iter()
                 .map(|c| {
-                    simple_expr_to_expression(c.expr, schema_cache, function_registry)
+                    simple_expr_to_expression(c.expr, schema_cache, view_cache, function_registry)
                         .map(|expr| (expr, c.alias))
                 })
                 .collect::<Result<_>>()?;
@@ -1154,7 +1208,7 @@ pub fn ast_to_logical_plan(
                     .group_by
                     .clone()
                     .into_iter()
-                    .map(|e| simple_expr_to_expression(e, schema_cache, function_registry))
+                    .map(|e| simple_expr_to_expression(e, schema_cache, view_cache, function_registry))
                     .collect::<Result<_>>()?;
 
                 for proj_expr in &non_agg_expressions {
@@ -1189,7 +1243,7 @@ pub fn ast_to_logical_plan(
                         .order_by
                         .into_iter()
                         .map(|o| {
-                            simple_expr_to_expression(o.expression, schema_cache, function_registry)
+                            simple_expr_to_expression(o.expression, schema_cache, view_cache, function_registry)
                                 .map(|e| (e, o.asc))
                         })
                         .collect::<Result<_>>()?,
@@ -1213,6 +1267,7 @@ pub fn ast_to_logical_plan(
                 let right_plan = ast_to_logical_plan(
                     AstStatement::Select(*union_clause.select),
                     schema_cache,
+                    view_cache,
                     function_registry,
                 )?;
                 plan = LogicalPlan::Union {
@@ -1233,10 +1288,10 @@ pub fn ast_to_logical_plan(
                 }
             }
 
-            let values = statement
+                        let values = statement
                 .values
                 .into_iter()
-                .map(|e| simple_expr_to_expression(e, schema_cache, function_registry))
+                .map(|e| simple_expr_to_expression(e, schema_cache, view_cache, function_registry))
                 .collect::<Result<Vec<_>>>()?;
             Ok(LogicalPlan::Insert {
                 table_name: statement.table,
@@ -1251,7 +1306,7 @@ pub fn ast_to_logical_plan(
             }
 
             if let Some(where_clause) = &statement.where_clause {
-                validate_expression(where_clause, &schemas_in_scope, function_registry)?;
+                validate_expression(where_clause, &schemas_in_scope, view_cache, function_registry)?;
             }
 
             let mut plan = LogicalPlan::TableScan {
@@ -1260,7 +1315,7 @@ pub fn ast_to_logical_plan(
             if let Some(selection) = statement.where_clause {
                 plan = LogicalPlan::Filter {
                     input: Box::new(plan),
-                    predicate: simple_expr_to_expression(selection, schema_cache, function_registry)?,
+                    predicate: simple_expr_to_expression(selection, schema_cache, view_cache, function_registry)?,
                 };
             }
             Ok(LogicalPlan::Delete {
@@ -1279,10 +1334,10 @@ pub fn ast_to_logical_plan(
                         return Err(anyhow!("Column '{}' does not exist in table '{}'", col, statement.table));
                     }
                 }
-                validate_expression(expr, &schemas_in_scope, function_registry)?;
+                validate_expression(expr, &schemas_in_scope, view_cache, function_registry)?;
             }
             if let Some(where_clause) = &statement.where_clause {
-                validate_expression(where_clause, &schemas_in_scope, function_registry)?;
+                validate_expression(where_clause, &schemas_in_scope, view_cache, function_registry)?;
             }
 
 
@@ -1292,13 +1347,13 @@ pub fn ast_to_logical_plan(
             if let Some(selection) = statement.where_clause {
                 plan = LogicalPlan::Filter {
                     input: Box::new(plan),
-                    predicate: simple_expr_to_expression(selection, schema_cache, function_registry)?,
+                    predicate: simple_expr_to_expression(selection, schema_cache, view_cache, function_registry)?,
                 };
             }
             let set = statement
                 .set
                 .into_iter()
-                .map(|(col, expr)| simple_expr_to_expression(expr, schema_cache, function_registry).map(|e| (col, e)))
+                .map(|(col, expr)| simple_expr_to_expression(expr, schema_cache, view_cache, function_registry).map(|e| (col, e)))
                 .collect::<Result<Vec<_>>>()?;
 
             Ok(LogicalPlan::Update {
@@ -1318,8 +1373,7 @@ pub fn ast_to_logical_plan(
             Ok(LogicalPlan::Delete {
                 from: Box::new(plan),
             })
-        }
+        },
+        AstStatement::CreateIndex(statement) => Ok(LogicalPlan::CreateIndex { statement }),
     }
 }
-
-

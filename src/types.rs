@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use crate::config::Config;
 use crate::indexing::IndexManager;
 use crate::memory::MemoryManager;
+use crate::query_engine::ast::SelectStatement;
 use crate::schema::VirtualSchema;
 
 // --- Core Data Structures ---
@@ -98,6 +99,12 @@ pub struct SnapshotEntry {
     pub value: SerializableDbValue,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ViewDefinition {
+    pub name: String,
+    pub query: SelectStatement,
+}
+
 pub struct LogRequest {
     pub entry: LogEntry,
     pub ack: oneshot::Sender<Result<(), String>>,
@@ -109,6 +116,7 @@ pub type Logger = mpsc::Sender<LogRequest>;
 pub type Db = Arc<DashMap<String, DbValue>>;
 pub type JsonCache = Arc<DashMap<String, Arc<Vec<u8>>>>;
 pub type SchemaCache = Arc<DashMap<String, Arc<VirtualSchema>>>;
+pub type ViewCache = Arc<DashMap<String, Arc<ViewDefinition>>>;
 pub type ScalarFunction = Box<dyn Fn(Vec<Value>) -> Result<Value> + Send + Sync>;
 
 // --- Function Registry ---
@@ -142,6 +150,7 @@ pub struct AppContext {
     pub index_manager: Arc<IndexManager>,
     pub json_cache: JsonCache,
     pub schema_cache: SchemaCache,
+    pub view_cache: ViewCache,
     pub function_registry: Arc<FunctionRegistry>,
     pub config: Arc<Config>,
     pub memory: Arc<MemoryManager>,

@@ -9,6 +9,7 @@ use crate::query_engine::logical_plan::Expression;
 use std::fmt;
 
 pub const SCHEMA_PREFIX: &str = "_internal:schemas:";
+pub const VIEW_PREFIX: &str = "_internal:views:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataType {

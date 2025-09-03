@@ -122,11 +122,17 @@ pub struct CreateTableStatement {
     pub primary_key: Vec<String>,
     pub foreign_keys: Vec<ForeignKeyClause>,
     pub check: Option<SimpleExpression>,
+    pub if_not_exists: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DropTableStatement {
     pub table_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DropViewStatement {
+    pub view_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -147,15 +153,38 @@ pub struct TruncateTableStatement {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateIndexStatement {
+    pub index_name: String,
+    pub table_name: String,
+    pub columns: Vec<SimpleExpression>, // To support expression-based indexes
+    pub unique: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AstStatement {
     Select(SelectStatement),
     Insert(InsertStatement),
     Delete(DeleteStatement),
     Update(UpdateStatement),
     CreateTable(CreateTableStatement),
+    CreateView(CreateViewStatement),
+    CreateSchema(CreateSchemaStatement),
     DropTable(DropTableStatement),
+    DropView(DropViewStatement),
     AlterTable(AlterTableStatement),
     TruncateTable(TruncateTableStatement),
+    CreateIndex(CreateIndexStatement),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateSchemaStatement {
+    pub schema_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateViewStatement {
+    pub view_name: String,
+    pub query: SelectStatement,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
