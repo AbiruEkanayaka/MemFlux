@@ -55,11 +55,20 @@ def test_sql(sock, reader):
 
     # --- 1. Setup: Clean & Load Data ---
     print("\n-- Phase 1: Data Setup --")
+    send(["FLUSHDB"]) # Ensure a clean state for schemas and indexes
+
+    # Create schemas for tables used in SQL tests
+    assert_eq(send(["SQL", "CREATE", "TABLE", "user", "(id INTEGER, name TEXT, age INTEGER, city TEXT, dept_id TEXT)"]), "+OK", "CREATE TABLE user")
+    assert_eq(send(["SQL", "CREATE", "TABLE", "products", "(id INTEGER, name TEXT, price INTEGER)"]), "+OK", "CREATE TABLE products")
+    assert_eq(send(["SQL", "CREATE", "TABLE", "orders", "(id INTEGER, user_id TEXT, product_id TEXT, amount INTEGER)"]), "+OK", "CREATE TABLE orders")
+    assert_eq(send(["SQL", "CREATE", "TABLE", "departments", "(id INTEGER, name TEXT)"]), "+OK", "CREATE TABLE departments") # For advanced join tests
+
     # Clean up all potential keys
     for i in range(1, 11):
         send(["DELETE", f"user:{i}"])
         send(["DELETE", f"orders:{i}"])
         send(["DELETE", f"products:{i}"])
+        send(["DELETE", f"departments:{i}"]) # Clean up departments keys
 
     # Insert users: name, age, city
     assert_eq(send(["JSON.SET", "user:1", '{"name":"Alice","age":30,"city":"SF"}']), "+OK", "Insert user:1")

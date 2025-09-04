@@ -813,11 +813,21 @@ impl Parser {
                 match self.current().map(|s| s.to_uppercase()).as_deref() {
                     Some("SET") => {
                         self.advance(); // consume SET
-                        self.expect("DEFAULT")?;
-                        let default_expr = self.parse_expression()?;
-                        AlterTableAction::AlterColumnSetDefault {
-                            column_name,
-                            default_expr,
+                        if self.current().map_or(false, |t| t.eq_ignore_ascii_case("DEFAULT")) {
+                            self.advance(); // consume DEFAULT
+                            let default_expr = self.parse_expression()?;
+                            AlterTableAction::AlterColumnSetDefault {
+                                column_name,
+                                default_expr,
+                            }
+                        } else if self.current().map_or(false, |t| t.eq_ignore_ascii_case("NOT")) {
+                            self.advance(); // consume NOT
+                            self.expect("NULL")?;
+                            AlterTableAction::AlterColumnSetNotNull {
+                                column_name,
+                            }
+                        } else {
+                            return Err(anyhow!("Expected DEFAULT or NOT NULL after SET"));
                         }
                     }
                     Some("DROP") => {

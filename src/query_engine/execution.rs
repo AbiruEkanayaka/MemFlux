@@ -989,7 +989,9 @@ pub fn execute<'a>(
                                     _ => Err(anyhow!("Unsupported value type during table rename for key {}", old_key))?,
                                 };
                                 log_and_wait_qe!(ctx.logger, log_entry).await?;
-                                ctx.db.insert(new_key, entry.1);
+                                ctx.memory.forget_key(&old_key).await; // Forget the old key from memory tracking
+                                ctx.db.insert(new_key.clone(), entry.1);
+                                ctx.memory.track_access(&new_key).await; // Track the new key in memory
                             }
                         }
                         // TODO: Update all foreign key references in other tables that point to this table.
@@ -1032,8 +1034,33 @@ pub fn execute<'a>(
                         }
                     }
                     AlterTableAction::AddConstraint(constraint) => {
-                        // TODO: Implement validation to ensure existing data meets the constraint.
+                        // Implement validation to ensure existing data meets the constraint.
                         // For now, just add the constraint. Validation should happen at a higher level.
+                        if let TableConstraint::Unique { name: constraint_name_option, columns } = &constraint {
+                            if columns.len() != 1 {
+                                Err(anyhow!("Composite UNIQUE constraints are not yet supported for direct column flags. Use CREATE UNIQUE INDEX instead."))?;
+                            }
+                            let col_name = &columns[0];
+                            // Check if column exists in schema
+                            if !schema.columns.contains_key(col_name) {
+                                Err(anyhow!("Column '{}' in UNIQUE constraint not found in table definition", col_name))?;
+                            }
+                            let index_name = constraint_name_option.clone().unwrap_or_else(|| format!("unique_{}_{}", table_name, col_name));
+                            let key_prefix = format!("{}:*", table_name);
+                            let json_path = col_name.clone();
+                            let create_index_command = Command {
+                                name: "IDX.CREATE".to_string(),
+                                args: vec![
+                                    b"IDX.CREATE".to_vec(),
+                                    index_name.into_bytes(),
+                                    key_prefix.into_bytes(),
+                                    json_path.into_bytes(),
+                                ],
+                            };
+                            if let Response::Error(e) = super::super::commands::handle_idx_create(create_index_command, &ctx).await {
+                                Err(anyhow!("Failed to create unique index: {}", e))?;
+                            }
+                        }
                         schema.constraints.push(constraint);
                     }
                     AlterTableAction::DropConstraint { constraint_name } => {
