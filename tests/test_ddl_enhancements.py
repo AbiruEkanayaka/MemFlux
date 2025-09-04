@@ -20,7 +20,11 @@ def test_ddl_enhancements(sock, reader):
         while i < len(lines):
             if lines[i].startswith(b'$'):
                 try:
-                    bulk_string = lines[i] + b'\r\n' + lines[i+1] + b'\r\n'
+                    if i + 1 < len(lines):
+                        bulk_string = lines[i] + b'\r\n' + lines[i+1] + b'\r\n'
+                    else:
+                        print(f"[WARN] Incomplete bulk string at line {i}")
+                        break
                     row_json = extract_json_from_bulk(bulk_string)
                     if row_json:
                         results.append(row_json)
@@ -86,9 +90,8 @@ def test_ddl_enhancements(sock, reader):
     
     results = send_and_parse(["SQL", "SELECT", "id, value", "FROM", "my_view"], "Query my_view")
     assert_eq(len(results), 1, "View should return 1 row")
-    if results:
-        assert_eq(results[0].get('id'), 1, "View row ID")
-        assert_eq(results[0].get('value'), "test_value", "View row value")
+    assert_eq(results[0].get('id'), 1, "View row ID")
+    assert_eq(results[0].get('value'), "test_value", "View row value")
     
     assert_eq(send(["SQL", "CREATE", "VIEW", "my_view", "AS", "SELECT", "id", "FROM", "view_base_table"]).startswith("-ERR"), True, "CREATE VIEW existing (should fail)")
     assert_eq(send(["SQL", "DROP", "VIEW", "my_view"]), "+OK", "DROP VIEW my_view")
@@ -152,7 +155,7 @@ def test_ddl_enhancements(sock, reader):
     assert_eq(send(["SQL", "INSERT", "INTO", "drop_constraint_test", "(id, value)", "VALUES", "(3, 10)"]).startswith("-ERR"), True, "INSERT violating UNIQUE (should fail)")
 
     # Drop UNIQUE constraint
-    assert_eq(send(["SQL", "ALTER", "TABLE", "drop_constraint_test", "DROP", "CONSTRAINT", "my_unique_value"]), "+OK", "ALTER TABLE DROP UNIQUE CONSTRAINT") # Constraint name is auto-generated as <column_name>_unique
+    assert_eq(send(["SQL", "ALTER", "TABLE", "drop_constraint_test", "DROP", "CONSTRAINT", "my_unique_value"]), "+OK", "ALTER TABLE DROP UNIQUE CONSTRAINT") # Using the explicitly named constraint from line 149
     assert_eq(send(["SQL", "INSERT", "INTO", "drop_constraint_test", "(id, value)", "VALUES", "(3, 10)"]), ":1", "INSERT previously violating UNIQUE (should succeed)")
     
     send(["SQL", "DROP", "TABLE", "drop_constraint_test"])

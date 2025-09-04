@@ -270,6 +270,11 @@ async fn load_views_from_db(db: &types::Db, view_cache: &ViewCache) -> Result<()
 
             match view_def_result {
                 Ok(view_def) => {
+                    // Validate view definition has required fields
+                    if view_def.name.is_empty() {
+                        eprintln!("Warning: View with empty name in key '{}'. Skipping.", key);
+                        continue;
+                    }
                     let view_name = view_def.name.clone();
                     view_cache.insert(view_name, Arc::new(view_def));
                 }

@@ -283,13 +283,37 @@ impl Parser {
                         let func_name = identifier.to_uppercase();
 
                         if ["COUNT", "SUM", "AVG", "MIN", "MAX"].contains(&func_name.as_str()) {
-                            let arg = if self.current() == Some("*") {
+                            // Handle DISTINCT modifier for COUNT
+                            let distinct = if func_name == "COUNT"
+                                && self.current().map_or(false, |t| t.eq_ignore_ascii_case("DISTINCT"))
+                            {
                                 self.advance();
-                                "*".to_string()
+                                true
                             } else {
-                                self.parse_identifier()?
+                                false
+                            };
+
+                            let arg_expr = if self.current() == Some("*") {
+                                self.advance();
+                                SimpleExpression::Column("*".to_string())
+                            } else {
+                                self.parse_expression()?
                             };
                             self.expect(")")?;
+
+                            // For now, convert back to string for backward compatibility
+                            // Consider updating AggregateFunction to accept SimpleExpression
+                            let arg = match arg_expr {
+                                SimpleExpression::Column(col) => {
+                                    if distinct {
+                                        format!("DISTINCT {}", col)
+                                    } else {
+                                        col
+                                    }
+                                },
+                                _ => return Err(anyhow!("Complex expressions in aggregate functions not yet supported")),
+                            };
+
                             return Ok(SimpleExpression::AggregateFunction { func: func_name, arg });
                         }
 

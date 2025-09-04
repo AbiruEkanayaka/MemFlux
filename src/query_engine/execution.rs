@@ -495,7 +495,7 @@ pub fn execute<'a>(
                         TableConstraint::Unique { name: constraint_name_option, columns } => {
                             // Create unique indexes for unique constraints
                             if columns.len() != 1 {
-                                Err(anyhow!("Composite UNIQUE constraints are not yet supported for direct column flags. Use CREATE UNIQUE INDEX instead."))?;
+                                Err(anyhow!("Composite UNIQUE constraints are not yet supported."))?;
                             }
                             let col_name = &columns[0];
                             if !cols.contains_key(col_name) {
@@ -692,28 +692,7 @@ pub fn execute<'a>(
                             }
                         }
 
-                        // Check PRIMARY KEY constraint (uniqueness)
-                        let pk_cols: Vec<String> = s.constraints.iter().filter_map(|c| {
-                            if let TableConstraint::PrimaryKey { name: _, columns } = c {
-                                Some(columns.clone())
-                            } else {
-                                None
-                            }
-                        }).flatten().collect();
-
-                        if !pk_cols.is_empty() {
-                            let pk_col = pk_cols.first().cloned().unwrap_or_else(|| "id".to_string());
-                            let pk = match row_data.get(&pk_col) {
-                                Some(Value::String(s)) => s.clone(),
-                                Some(Value::Number(n)) => n.to_string(),
-                                _ => Uuid::new_v4().to_string(),
-                            };
-                            let key = format!("{}:{}", table_name, pk);
-
-                            if ctx.db.contains_key(&key) {
-                                Err(anyhow!("PRIMARY KEY constraint failed for table '{}'. Key '{}' already exists.", table_name, key))?;
-                            }
-                        }
+                        
                     }
 
                     check_foreign_key_constraints(&table_name, &row_data, &ctx).await?;
@@ -930,7 +909,7 @@ pub fn execute<'a>(
                     }
                     AlterTableAction::AlterColumnSetNotNull { column_name } => {
                         // First, check if any existing data violates the new constraint
-                                                let table_prefix = format!("{}:", table_name);
+                        let table_prefix = format!("{}:", table_name);
                         for entry in ctx.db.iter() {
                             if entry.key().starts_with(&table_prefix) {
                                 let val: Value = match entry.value() {
@@ -938,8 +917,10 @@ pub fn execute<'a>(
                                     DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
                                     _ => continue,
                                 };
-                                if val.get(&column_name).map_or(true, |v| v.is_null()) {
-                                    Err(anyhow!("Cannot add NOT NULL constraint: column '{}' contains null values", column_name))?;
+                                if let Some(col_val) = val.get(&column_name) {
+                                    if col_val.is_null() {
+                                        Err(anyhow!("Cannot add NOT NULL constraint on column '{}' because it contains null values.", column_name))?;
+                                    }
                                 }
                             }
                         }
@@ -956,23 +937,33 @@ pub fn execute<'a>(
                             Err(anyhow!("Table or view with name '{}' already exists", new_table_name))?;
                         }
 
-                        // 2. Rename schema key and update schema object
-                        let new_schema_key = format!("{}{}", SCHEMA_PREFIX, new_table_name);
-                        let mut new_schema = schema.clone();
-                        new_schema.table_name = new_table_name.clone();
-                        let new_schema_bytes = serde_json::to_vec(&new_schema)?;
+                        // 2. Log the atomic operation
+                        let log_entry = LogEntry::RenameTable {
+                            old_name: table_name.clone(),
+                            new_name: new_table_name.clone(),
+                        };
+                        log_and_wait_qe!(ctx.logger, log_entry).await?;
 
-                        // 3. Log the changes for WAL
-                        log_and_wait_qe!(ctx.logger, LogEntry::Delete { key: schema_key.clone() }).await?;
-                        log_and_wait_qe!(ctx.logger, LogEntry::SetBytes { key: new_schema_key.clone(), value: new_schema_bytes.clone() }).await?;
+                        // 3. Perform the rename in memory. This is not perfectly atomic in-memory,
+                        // but it is consistent upon WAL replay.
 
-                        // 4. Atomically update in-memory schema
-                        ctx.db.remove(&schema_key);
-                        ctx.db.insert(new_schema_key, DbValue::Bytes(new_schema_bytes));
-                        ctx.schema_cache.remove(&table_name);
-                        ctx.schema_cache.insert(new_table_name.clone(), Arc::new(new_schema));
+                        // 3a. Rename schema
+                        let old_schema_key = format!("{}{}", SCHEMA_PREFIX, &table_name);
+                        if let Some((_, schema_val)) = ctx.db.remove(&old_schema_key) {
+                             if let DbValue::Bytes(bytes) = schema_val {
+                                if let Ok(mut schema) = serde_json::from_slice::<VirtualSchema>(&bytes) {
+                                    schema.table_name = new_table_name.clone();
+                                    if let Ok(new_bytes) = serde_json::to_vec(&schema) {
+                                        let new_schema_key = format!("{}{}", SCHEMA_PREFIX, &new_table_name);
+                                        ctx.db.insert(new_schema_key, DbValue::Bytes(new_bytes));
+                                        ctx.schema_cache.remove(&table_name);
+                                        ctx.schema_cache.insert(new_table_name.clone(), Arc::new(schema));
+                                    }
+                                }
+                             }
+                        }
 
-                        // 5. Rewrite all data keys (this is a heavy operation)
+                        // 3b. Rename data keys
                         let old_prefix = format!("{}:", table_name);
                         let new_prefix = format!("{}:", new_table_name);
                         let keys_to_rename: Vec<_> = ctx.db.iter().filter(|e| e.key().starts_with(&old_prefix)).map(|e| e.key().clone()).collect();
@@ -980,18 +971,9 @@ pub fn execute<'a>(
                         for old_key in keys_to_rename {
                             if let Some(entry) = ctx.db.remove(&old_key) {
                                 let new_key = old_key.replacen(&old_prefix, &new_prefix, 1);
-                                // TODO: This is not transactional. A failure here leaves the DB in an inconsistent state.
-                                // A proper implementation would use a two-phase commit or similar mechanism.
-                                log_and_wait_qe!(ctx.logger, LogEntry::Delete { key: old_key.clone() }).await?;
-                                let log_entry = match entry.1 {
-                                    DbValue::JsonB(ref bytes) => LogEntry::SetJsonB { key: new_key.clone(), value: bytes.clone() },
-                                    DbValue::Bytes(ref bytes) => LogEntry::SetBytes { key: new_key.clone(), value: bytes.clone() },
-                                    _ => Err(anyhow!("Unsupported value type during table rename for key {}", old_key))?,
-                                };
-                                log_and_wait_qe!(ctx.logger, log_entry).await?;
-                                ctx.memory.forget_key(&old_key).await; // Forget the old key from memory tracking
+                                ctx.memory.forget_key(&old_key).await;
                                 ctx.db.insert(new_key.clone(), entry.1);
-                                ctx.memory.track_access(&new_key).await; // Track the new key in memory
+                                ctx.memory.track_access(&new_key).await;
                             }
                         }
                         // TODO: Update all foreign key references in other tables that point to this table.

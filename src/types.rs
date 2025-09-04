@@ -91,6 +91,7 @@ pub enum LogEntry {
     RPop { key: String, count: usize },
     SAdd { key: String, members: Vec<Vec<u8>> },
     SRem { key: String, members: Vec<Vec<u8>> },
+    RenameTable { old_name: String, new_name: String },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
