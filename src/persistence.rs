@@ -397,6 +397,9 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
             LogEntry::SetBytes { key, value } => {
                 db.insert(key, DbValue::Bytes(value));
             }
+            LogEntry::SetJsonB { key, value } => {
+                db.insert(key, DbValue::JsonB(value));
+            }
             LogEntry::Delete { key } => {
                 db.remove(&key);
             }
@@ -470,6 +473,36 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                         let mut set = set_lock.write().await;
                         for m in members {
                             set.remove(&m);
+                        }
+                    }
+                }
+            }
+            LogEntry::RenameTable { old_name, new_name } => {
+                // 1. Rename data keys
+                let old_prefix = format!("{}:", old_name);
+                let new_prefix = format!("{}:", new_name);
+                let keys_to_rename: Vec<String> = db.iter()
+                    .filter(|entry| entry.key().starts_with(&old_prefix))
+                    .map(|entry| entry.key().clone())
+                    .collect();
+
+                for old_key in keys_to_rename {
+                    if let Some((k, v)) = db.remove(&old_key) {
+                        let new_key = k.replacen(&old_prefix, &new_prefix, 1);
+                        db.insert(new_key, v);
+                    }
+                }
+
+                // 2. Rename schema key and update its content
+                let old_schema_key = format!("{}{}", crate::schema::SCHEMA_PREFIX, old_name);
+                if let Some((_, schema_val)) = db.remove(&old_schema_key) {
+                    if let DbValue::Bytes(bytes) = schema_val {
+                        if let Ok(mut schema) = serde_json::from_slice::<crate::schema::VirtualSchema>(&bytes) {
+                            schema.table_name = new_name.clone();
+                            if let Ok(new_bytes) = serde_json::to_vec(&schema) {
+                                let new_schema_key = format!("{}{}", crate::schema::SCHEMA_PREFIX, new_name);
+                                db.insert(new_schema_key, DbValue::Bytes(new_bytes));
+                            }
                         }
                     }
                 }

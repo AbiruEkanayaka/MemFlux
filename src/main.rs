@@ -25,8 +25,8 @@ use memory::MemoryManager;
 use persistence::{load_db_from_disk, PersistenceEngine};
 use protocol::parse_command_from_stream;
 use query_engine::functions;
-use schema::load_schemas_from_db;
-use types::{AppContext, FunctionRegistry, Response};
+use schema::{load_schemas_from_db, VIEW_PREFIX};
+use types::{AppContext, FunctionRegistry, Response, ViewCache, ViewDefinition};
 
 fn generate_self_signed_cert(cert_path: &str, key_path: &str) -> Result<()> {
     println!("Generating self-signed certificate...");
@@ -110,6 +110,19 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Load views
+    let view_cache = Arc::new(DashMap::new());
+    if let Err(e) = load_views_from_db(&db, &view_cache).await {
+        eprintln!(
+            "Warning: Could not load views: {}. Continuing without them.",
+            e
+        );
+    } else {
+        if !view_cache.is_empty() {
+            println!("Loaded {} views.", view_cache.len());
+        }
+    }
+
     // 5. Set up Memory Manager and calculate initial usage
     let memory_manager = Arc::new(MemoryManager::new(
         config.maxmemory_mb,
@@ -156,7 +169,8 @@ async fn main() -> Result<()> {
             logger: logger.clone(),
             index_manager: index_manager.clone(),
             json_cache: Arc::new(DashMap::new()), // Not needed for eviction
-            schema_cache: schema_cache.clone(), // Not needed for eviction
+            schema_cache: schema_cache.clone(),   // Not needed for eviction
+            view_cache: view_cache.clone(),       // Not needed for eviction
             function_registry: Arc::new(FunctionRegistry::new()), // Not needed for eviction
             config: config.clone(),
             memory: memory_manager.clone(),
@@ -185,6 +199,7 @@ async fn main() -> Result<()> {
         index_manager,
         json_cache,
         schema_cache,
+        view_cache,
         function_registry,
         config: config.clone(),
         memory: memory_manager,
@@ -236,6 +251,40 @@ async fn main() -> Result<()> {
             });
         }
     }
+}
+
+async fn load_views_from_db(db: &types::Db, view_cache: &ViewCache) -> Result<()> {
+    for item in db.iter() {
+        let key = item.key();
+        if key.starts_with(VIEW_PREFIX) {
+            let view_def_result: Result<ViewDefinition, _> = match item.value() {
+                types::DbValue::Bytes(bytes) => serde_json::from_slice(bytes),
+                _ => {
+                    eprintln!(
+                        "Warning: View key '{}' has non-Bytes value type. Skipping.",
+                        key
+                    );
+                    continue;
+                }
+            };
+
+            match view_def_result {
+                Ok(view_def) => {
+                    // Validate view definition has required fields
+                    if view_def.name.is_empty() {
+                        eprintln!("Warning: View with empty name in key '{}'. Skipping.", key);
+                        continue;
+                    }
+                    let view_name = view_def.name.clone();
+                    view_cache.insert(view_name, Arc::new(view_def));
+                }
+                Err(e) => {
+                    eprintln!("Failed to parse view for key '{}': {}", key, e);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Handles a single client connection.
@@ -308,6 +357,7 @@ where
                     let logical_plan = match query_engine::ast_to_logical_plan(
                         ast,
                         &ctx.schema_cache,
+                        &ctx.view_cache,
                         &ctx.function_registry,
                     ) {
                         Ok(plan) => plan,

@@ -11,24 +11,29 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use crate::config::Config;
 use crate::indexing::IndexManager;
 use crate::memory::MemoryManager;
+use crate::query_engine::ast::SelectStatement;
 use crate::schema::VirtualSchema;
 
 // --- Core Data Structures ---
 
 pub enum DbValue {
     Json(Value),
+    JsonB(Vec<u8>),
     List(RwLock<VecDeque<Vec<u8>>>),
     Set(RwLock<HashSet<Vec<u8>>>),
     Bytes(Vec<u8>),
+    Array(Vec<Value>),
 }
 
 impl fmt::Debug for DbValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DbValue::Json(v) => write!(f, "Json({:?})", v),
+            DbValue::JsonB(b) => write!(f, "JsonB({:?})", b),
             DbValue::List(_) => write!(f, "List(<RwLock>)"),
             DbValue::Set(_) => write!(f, "Set(<RwLock>)"),
             DbValue::Bytes(b) => write!(f, "Bytes({:?})", String::from_utf8_lossy(b)),
+            DbValue::Array(a) => write!(f, "Array({:?})", a),
         }
     }
 }
@@ -36,15 +41,18 @@ impl fmt::Debug for DbValue {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum SerializableDbValue {
     Json(Value),
+    JsonB(Vec<u8>),
     List(VecDeque<Vec<u8>>),
     Set(Vec<Vec<u8>>),
     Bytes(Vec<u8>),
+    Array(Vec<Value>),
 }
 
 impl SerializableDbValue {
     pub async fn from_db_value(db_value: &DbValue) -> Self {
         match db_value {
             DbValue::Json(v) => SerializableDbValue::Json(v.clone()),
+            DbValue::JsonB(b) => SerializableDbValue::JsonB(b.clone()),
             DbValue::Bytes(b) => SerializableDbValue::Bytes(b.clone()),
             DbValue::List(lock) => {
                 let list = lock.read().await;
@@ -54,15 +62,18 @@ impl SerializableDbValue {
                 let set = lock.read().await;
                 SerializableDbValue::Set(set.iter().cloned().collect())
             }
+            DbValue::Array(a) => SerializableDbValue::Array(a.clone()),
         }
     }
 
     pub fn into_db_value(self) -> DbValue {
         match self {
             SerializableDbValue::Json(v) => DbValue::Json(v),
+            SerializableDbValue::JsonB(b) => DbValue::JsonB(b),
             SerializableDbValue::Bytes(b) => DbValue::Bytes(b),
             SerializableDbValue::List(v) => DbValue::List(RwLock::new(v)),
             SerializableDbValue::Set(v) => DbValue::Set(RwLock::new(v.into_iter().collect())),
+            SerializableDbValue::Array(a) => DbValue::Array(a),
         }
     }
 }
@@ -70,6 +81,7 @@ impl SerializableDbValue {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum LogEntry {
     SetBytes { key: String, value: Vec<u8> },
+    SetJsonB { key: String, value: Vec<u8> },
     Delete { key: String },
     JsonSet { path: String, value: String },
     JsonDelete { path: String },
@@ -79,12 +91,19 @@ pub enum LogEntry {
     RPop { key: String, count: usize },
     SAdd { key: String, members: Vec<Vec<u8>> },
     SRem { key: String, members: Vec<Vec<u8>> },
+    RenameTable { old_name: String, new_name: String },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct SnapshotEntry {
     pub key: String,
     pub value: SerializableDbValue,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ViewDefinition {
+    pub name: String,
+    pub query: SelectStatement,
 }
 
 pub struct LogRequest {
@@ -98,6 +117,7 @@ pub type Logger = mpsc::Sender<LogRequest>;
 pub type Db = Arc<DashMap<String, DbValue>>;
 pub type JsonCache = Arc<DashMap<String, Arc<Vec<u8>>>>;
 pub type SchemaCache = Arc<DashMap<String, Arc<VirtualSchema>>>;
+pub type ViewCache = Arc<DashMap<String, Arc<ViewDefinition>>>;
 pub type ScalarFunction = Box<dyn Fn(Vec<Value>) -> Result<Value> + Send + Sync>;
 
 // --- Function Registry ---
@@ -131,6 +151,7 @@ pub struct AppContext {
     pub index_manager: Arc<IndexManager>,
     pub json_cache: JsonCache,
     pub schema_cache: SchemaCache,
+    pub view_cache: ViewCache,
     pub function_registry: Arc<FunctionRegistry>,
     pub config: Arc<Config>,
     pub memory: Arc<MemoryManager>,

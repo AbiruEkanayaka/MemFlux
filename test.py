@@ -1,7 +1,7 @@
 import sys
 import shlex
 
-from tests.common import send_resp_command, create_connection
+from tests.common import send_resp_command, create_connection, test_result
 from tests.test_commands import test_byte, test_json, test_lists, test_sets
 from tests.test_sql import test_sql
 from tests.test_aliases import test_sql_aliases
@@ -19,6 +19,8 @@ from tests.test_sql_operators import test_sql_comparison_operators
 from tests.test_indexing import test_index_maintenance
 from tests.test_recovery import test_recovery
 from tests.test_wrongtype_errors import test_wrongtype_errors
+from tests.test_data_types_and_constraints import test_data_types_and_constraints # Import new test
+from tests.test_ddl_enhancements import test_ddl_enhancements
 
 
 # Add prompt_toolkit for better interactive input
@@ -73,6 +75,10 @@ def unit_test(sock, reader, mode):
         return test_recovery(sock, reader)
     if mode in ("wrongtype", "all"):
         test_wrongtype_errors(sock, reader)
+    if mode in ("constraints", "all"): # Add new test to runner
+        test_data_types_and_constraints(sock, reader)
+    if mode in ("ddl_enhancements", "all"): # Add new DDL enhancements test
+        test_ddl_enhancements(sock, reader)
     
     return sock, reader
 
@@ -121,11 +127,40 @@ if __name__ == "__main__":
                     print("Error: MBs must be an integer.")
                     sys.exit(1)
                 fill_db(sock, reader, mbs)
+            elif sys.argv[1] == "sql":
+                print("Entering SQL mode. Type your SQL commands.")
+                if PromptSession is not None:
+                    session = PromptSession()
+                    while True:
+                        try:
+                            line = session.prompt("sql> ")
+                        except (EOFError, KeyboardInterrupt):
+                            print()
+                            break
+                        line = line.strip()
+                        if not line:
+                            continue
+                        else:
+                            parts = ['SQL', line]
+                        resp, send, lat, tot = send_resp_command(sock, reader, parts)
+                        print(resp, end='')
+                        print(f"Send: {send:.2f}ms, Latency: {lat:.2f}ms, Total: {tot:.2f}ms")
+                else:
+                    for line in sys.stdin:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        else:
+                            parts = ['SQL', line]
+                        resp, send, lat, tot = send_resp_command(sock, reader, parts)
+                        print(resp, end='')
+                        print(f"Send: {send:.2f}ms, Latency: {lat:.2f}ms, Total: {tot:.2f}ms")
             elif sys.argv[1] == "unit":
                 if len(sys.argv) < 3:
-                    print("Usage: python test.py unit {json,byte,lists,sets,sql,snapshot,types,schema,aliases,case,like,functions,union,advanced,operators,indexing,recovery,wrongtype,all}")
+                    print("Usage: python test.py unit {json,byte,lists,sets,sql,snapshot,types,schema,aliases,case,like,functions,union,advanced,operators,indexing,recovery,wrongtype,constraints,ddl_enhancements,all}")
                     sys.exit(1)
                 sock, reader = unit_test(sock, reader, sys.argv[2].lower())
+                test_result.summary()
 
         else:
             print("Enter commands (e.g. SET user:123 '{\"profile\":{\"name\":\"Jane Doe\"}}'):")

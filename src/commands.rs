@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
 use std::str;
@@ -84,6 +84,8 @@ async fn handle_get(command: Command, ctx: &AppContext) -> Response {
                 DbValue::Json(v) => Response::Bytes(v.to_string().into_bytes()),
                 DbValue::List(_) => Response::Error("WRONGTYPE Operation against a list".to_string()),
                 DbValue::Set(_) => Response::Error("WRONGTYPE Operation against a set".to_string()),
+                DbValue::JsonB(b) => Response::Bytes(b.clone()),
+                DbValue::Array(_) => Response::Error("WRONGTYPE Operation against an array value".to_string()),
             }
         }
         None => Response::Nil,
@@ -194,77 +196,6 @@ pub fn json_path_to_pointer(path: &str) -> String {
     format!("/{}", p.replace('.', "/"))
 }
 
-pub fn apply_json_set_to_db(db: &Db, path: &str, value: Value) -> Result<()> {
-    let mut parts = path.splitn(2, '.');
-    let key = parts.next().ok_or_else(|| anyhow!("Invalid path"))?.to_string();
-    let inner_path = parts.next().unwrap_or("");
-
-    let mut entry = db.entry(key.clone()).or_insert_with(|| DbValue::Json(json!({})));
-
-    match entry.value_mut() {
-        DbValue::Json(v) => {
-            let pointer = json_path_to_pointer(inner_path);
-            if pointer.is_empty() {
-                *v = value;
-                return Ok(());
-            }
-            if let Some(target) = v.pointer_mut(&pointer) {
-                *target = value;
-            } else {
-                // Create path if it doesn't exist
-                let mut current = v;
-                for part in inner_path.split('.') {
-                    if part.is_empty() {
-                        continue;
-                    }
-                    if current.is_object() {
-                        current = current
-                            .as_object_mut()
-                            .unwrap()
-                            .entry(part)
-                            .or_insert(json!({}));
-                    } else {
-                        bail!("Path creation failed: part is not an object");
-                    }
-                }
-                *current = value;
-            }
-            Ok(())
-        }
-        _ => bail!("WRONGTYPE Operation against a non-JSON value"),
-    }
-}
-
-pub fn apply_json_delete_to_db(db: &Db, path: &str) -> Result<bool> {
-    let mut parts = path.splitn(2, '.');
-    let key = parts.next().ok_or_else(|| anyhow!("Invalid path"))?.to_string();
-    let inner_path = parts.next().unwrap_or("");
-
-    if let Some(mut entry) = db.get_mut(&key) {
-        match entry.value_mut() {
-            DbValue::Json(v) => {
-                if inner_path.is_empty() || inner_path == "." {
-                    db.remove(&key);
-                    return Ok(true);
-                }
-                let mut pointer_parts: Vec<&str> = inner_path.split('.').collect();
-                let final_key = pointer_parts.pop().unwrap();
-                let parent_pointer = json_path_to_pointer(&pointer_parts.join("."));
-
-                if let Some(target) = v.pointer_mut(&parent_pointer) {
-                    if let Some(obj) = target.as_object_mut() {
-                        return Ok(obj.remove(final_key).is_some());
-                    }
-                }
-                Ok(false)
-            }
-            _ => bail!("WRONGTYPE Operation against a non-JSON value"),
-        }
-    } else {
-        Ok(false)
-    }
-}
-
 async fn handle_json_set(command: Command, ctx: &AppContext) -> Response {
     if command.args.len() != 3 {
         return Response::Error("JSON.SET requires a key/path and a value".to_string());
@@ -282,61 +213,83 @@ async fn handle_json_set(command: Command, ctx: &AppContext) -> Response {
         Err(_) => return Response::Error("Value is not valid JSON".to_string()),
     };
 
-    let key = path.split('.').next().unwrap_or("").to_string();
-    if key.is_empty() {
-        return Response::Error("Invalid path: missing key".to_string());
+    let mut parts = path.splitn(2, '.');
+    let key = match parts.next() {
+        Some(k) if !k.is_empty() => k.to_string(),
+        _ => return Response::Error("Invalid path: missing key".to_string()),
+    };
+    let inner_path = parts.next().unwrap_or("");
+
+    let (old_size, mut current_val, old_val_for_index) = {
+        let old_db_value = ctx.db.get(&key);
+        let old_size = if let Some(entry) = &old_db_value {
+            key.len() as u64 + memory::estimate_db_value_size(entry.value()).await
+        } else {
+            0
+        };
+
+        let current_val = match old_db_value.as_deref() {
+            Some(DbValue::Json(v)) => v.clone(),
+            Some(DbValue::JsonB(b)) => serde_json::from_slice(b).unwrap_or(json!({})),
+            Some(_) => return Response::Error("WRONGTYPE Operation against a non-JSON value".to_string()),
+            None => json!({}),
+        };
+        (old_size, current_val.clone(), current_val.clone())
+    };
+
+    let pointer = json_path_to_pointer(inner_path);
+    if pointer.is_empty() {
+        current_val = value;
+    } else if let Some(target) = current_val.pointer_mut(&pointer) {
+        *target = value;
+    } else {
+        let mut current = &mut current_val;
+        for part in inner_path.split('.') {
+            if part.is_empty() { continue; }
+            if current.is_object() {
+                current = current.as_object_mut().unwrap().entry(part).or_insert(json!({}));
+            } else {
+                return Response::Error("Path creation failed: part is not an object".to_string());
+            }
+        }
+        *current = value;
     }
 
-    let mut old_size = 0;
-    if let Some(entry) = ctx.db.get(&key) {
-        old_size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
-    }
+    let new_value_bytes = match serde_json::to_vec(&current_val) {
+        Ok(b) => b,
+        Err(_) => return Response::Error("Failed to serialize new JSON value".to_string()),
+    };
 
     if ctx.memory.is_enabled() {
-        // Pessimistic estimation: assume the value is added to existing data
-        let added_size = value.to_string().len() as u64;
-        let needed = added_size; // Conservative: assume it's all new data
+        let new_size = key.len() as u64 + new_value_bytes.len() as u64;
+        let needed = new_size.saturating_sub(old_size);
         if let Err(e) = ctx.memory.ensure_memory_for(needed, ctx).await {
             return Response::Error(e.to_string());
         }
     }
 
-    let old_value: Option<Value> = ctx.db.get(&key).and_then(|entry| match entry.value() {
-        DbValue::Json(v) => Some(v.clone()),
-        _ => None,
-    });
-
-    let log_entry = LogEntry::JsonSet {
-        path: path.clone(),
-        value: value_str,
+    let log_entry = LogEntry::SetJsonB {
+        key: key.clone(),
+        value: new_value_bytes.clone(),
     };
     let ack_response = log_and_wait!(ctx.logger, log_entry).await;
 
     if let Response::Ok = ack_response {
-        if let Err(e) = apply_json_set_to_db(&ctx.db, &path, value) {
-            return Response::Error(e.to_string());
+        ctx.db.insert(key.clone(), DbValue::JsonB(new_value_bytes.clone()));
+
+        let new_size = key.len() as u64 + new_value_bytes.len() as u64;
+        ctx.memory.decrease_memory(old_size);
+        ctx.memory.increase_memory(new_size);
+        if ctx.memory.is_enabled() {
+            ctx.memory.track_access(&key).await;
         }
 
-        if let Some(entry) = ctx.db.get(&key) {
-            let new_size =
-                key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
-            ctx.memory.decrease_memory(old_size);
-            ctx.memory.increase_memory(new_size);
-            if ctx.memory.is_enabled() {
-                ctx.memory.track_access(&key).await;
-            }
-        }
-
-        if let Some(ref old_val) = old_value {
-            ctx.index_manager
-                .remove_key_from_indexes(&key, old_val)
-                .await;
-        }
-        if let Some(entry) = ctx.db.get(&key) {
-            if let DbValue::Json(new_val) = entry.value() {
-                ctx.index_manager.add_key_to_indexes(&key, new_val).await;
-            }
-        }
+        ctx.index_manager
+            .remove_key_from_indexes(&key, &old_val_for_index)
+            .await;
+        ctx.index_manager
+            .add_key_to_indexes(&key, &current_val)
+            .await;
     }
     ack_response
 }
@@ -370,6 +323,20 @@ async fn handle_json_get(command: Command, ctx: &AppContext) -> Response {
                         None => Response::Nil,
                     }
                 }
+                DbValue::JsonB(b) => {
+                    let v: Value = match serde_json::from_slice(b) {
+                        Ok(val) => val,
+                        Err(_) => return Response::Error("Could not parse JSONB value".to_string()),
+                    };
+                    if inner_path.is_empty() || inner_path == "." {
+                        return Response::Bytes(v.to_string().into_bytes());
+                    }
+                    let pointer = json_path_to_pointer(inner_path);
+                    match v.pointer(&pointer) {
+                        Some(val) => Response::Bytes(val.to_string().into_bytes()),
+                        None => Response::Nil,
+                    }
+                }
                 _ => Response::Error("WRONGTYPE Operation against a non-JSON value".to_string()),
             }
         }
@@ -386,54 +353,92 @@ async fn handle_json_del(command: Command, ctx: &AppContext) -> Response {
         Err(_) => return Response::Error("Invalid path".to_string()),
     };
 
-    let key = path.split('.').next().unwrap_or("").to_string();
-    if key.is_empty() {
-        return Response::Error("Invalid path: missing key".to_string());
-    }
+    let mut parts = path.splitn(2, '.');
+    let key = match parts.next() {
+        Some(k) if !k.is_empty() => k.to_string(),
+        _ => return Response::Error("Invalid path: missing key".to_string()),
+    };
+    let inner_path = parts.next().unwrap_or("");
 
-    let mut old_size = 0;
-    if let Some(entry) = ctx.db.get(&key) {
-        old_size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
-    }
+    let (old_size, mut current_val, old_val_for_index) = {
+        let old_db_value = match ctx.db.get(&key) {
+            Some(val) => val,
+            None => return Response::Integer(0),
+        };
 
-    let old_value: Option<Value> = ctx.db.get(&key).and_then(|entry| match entry.value() {
-        DbValue::Json(v) => Some(v.clone()),
-        _ => None,
-    });
+        let old_size = key.len() as u64 + memory::estimate_db_value_size(old_db_value.value()).await;
 
-    let log_entry = LogEntry::JsonDelete { path: path.clone() };
-    let ack_response = log_and_wait!(ctx.logger, log_entry).await;
+        let current_val = match old_db_value.value() {
+            DbValue::Json(v) => v.clone(),
+            DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or(json!({})),
+            _ => return Response::Error("WRONGTYPE Operation against a non-JSON value".to_string()),
+        };
+        (old_size, current_val.clone(), current_val.clone())
+    };
 
-    if let Response::Ok = ack_response {
-        match apply_json_delete_to_db(&ctx.db, &path) {
-            Ok(true) => {
-                if let Some(entry) = ctx.db.get(&key) {
-                    let new_size =
-                        key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
-                    ctx.memory.decrease_memory(old_size);
-                    ctx.memory.increase_memory(new_size);
-                    if ctx.memory.is_enabled() {
-                        ctx.memory.track_access(&key).await;
-                    }
-                } else {
-                    // The whole key was deleted
-                    ctx.memory.decrease_memory(old_size);
-                    if ctx.memory.is_enabled() {
-                        ctx.memory.forget_key(&key).await;
-                    }
-                }
-                if let Some(ref old_val) = old_value {
-                    ctx.index_manager
-                        .remove_key_from_indexes(&key, old_val)
-                        .await;
-                }
-                Response::Integer(1)
+    if inner_path.is_empty() || inner_path == "." {
+        let log_entry = LogEntry::Delete { key: key.clone() };
+        let ack_response = log_and_wait!(ctx.logger, log_entry).await;
+        if let Response::Ok = ack_response {
+            ctx.db.remove(&key);
+            ctx.memory.decrease_memory(old_size);
+            if ctx.memory.is_enabled() {
+                ctx.memory.forget_key(&key).await;
             }
-            Ok(false) => Response::Integer(0),
-            Err(e) => Response::Error(e.to_string()),
+            ctx.index_manager
+                .remove_key_from_indexes(&key, &old_val_for_index)
+                .await;
+            Response::Integer(1)
+        } else {
+            ack_response
         }
     } else {
-        ack_response
+        let mut pointer_parts: Vec<&str> = inner_path.split('.').collect();
+        let final_key = pointer_parts.pop().unwrap();
+        let parent_pointer = json_path_to_pointer(&pointer_parts.join("."));
+        let mut modified = false;
+
+        if let Some(target) = current_val.pointer_mut(&parent_pointer) {
+            if let Some(obj) = target.as_object_mut() {
+                if obj.remove(final_key).is_some() {
+                    modified = true;
+                }
+            }
+        }
+
+        if !modified {
+            return Response::Integer(0);
+        }
+
+        let new_value_bytes = match serde_json::to_vec(&current_val) {
+            Ok(b) => b,
+            Err(_) => return Response::Error("Failed to serialize new JSON value".to_string()),
+        };
+
+        let log_entry = LogEntry::SetJsonB {
+            key: key.clone(),
+            value: new_value_bytes.clone(),
+        };
+        let ack_response = log_and_wait!(ctx.logger, log_entry).await;
+
+        if let Response::Ok = ack_response {
+            ctx.db.insert(key.clone(), DbValue::JsonB(new_value_bytes.clone()));
+            let new_size = key.len() as u64 + new_value_bytes.len() as u64;
+            ctx.memory.decrease_memory(old_size);
+            ctx.memory.increase_memory(new_size);
+            if ctx.memory.is_enabled() {
+                ctx.memory.track_access(&key).await;
+            }
+            ctx.index_manager
+                .remove_key_from_indexes(&key, &old_val_for_index)
+                .await;
+            ctx.index_manager
+                .add_key_to_indexes(&key, &current_val)
+                .await;
+            Response::Integer(1)
+        } else {
+            ack_response
+        }
     }
 }
 
@@ -1058,7 +1063,7 @@ async fn handle_createindex(command: Command, ctx: &AppContext) -> Response {
     handle_idx_create(adapted_command, ctx).await
 }
 
-async fn handle_idx_create(command: Command, ctx: &AppContext) -> Response {
+pub async fn handle_idx_create(command: Command, ctx: &AppContext) -> Response {
     if command.args.len() != 4 {
         return Response::Error(
             "IDX.CREATE requires an index name, a key prefix, and a JSON path".to_string(),
@@ -1084,6 +1089,9 @@ async fn handle_idx_create(command: Command, ctx: &AppContext) -> Response {
     let full_index_name = format!("{}|{}", key_prefix, json_path);
 
     if ctx.index_manager.indexes.contains_key(&full_index_name) {
+        return Response::Error(format!("Index on this prefix and path already exists"));
+    }
+    if ctx.index_manager.name_to_internal_name.contains_key(&index_name) {
         return Response::Error(format!("Index '{}' already exists", index_name));
     }
 
@@ -1091,6 +1099,9 @@ async fn handle_idx_create(command: Command, ctx: &AppContext) -> Response {
     ctx.index_manager
         .indexes
         .insert(full_index_name.clone(), index.clone());
+    ctx.index_manager
+        .name_to_internal_name
+        .insert(index_name.clone(), full_index_name.clone());
     ctx.index_manager
         .prefix_to_indexes
         .entry(key_prefix.clone())
@@ -1104,16 +1115,20 @@ async fn handle_idx_create(command: Command, ctx: &AppContext) -> Response {
 
     for entry in ctx.db.iter() {
         if entry.key().starts_with(pattern) {
-            if let DbValue::Json(val) = entry.value() {
-                if let Some(indexed_val) = val.pointer(&pointer) {
-                    let index_key = serde_json::to_string(indexed_val).unwrap_or_default();
-                    let mut index_data = index.write().await;
-                    index_data
-                        .entry(index_key)
-                        .or_default()
-                        .insert(entry.key().clone());
-                    backfilled_count += 1;
-                }
+            let val = match entry.value() {
+                DbValue::Json(v) => v.clone(),
+                DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
+                _ => continue,
+            };
+
+            if let Some(indexed_val) = val.pointer(&pointer) {
+                let index_key = serde_json::to_string(indexed_val).unwrap_or_default();
+                let mut index_data = index.write().await;
+                index_data
+                    .entry(index_key)
+                    .or_default()
+                    .insert(entry.key().clone());
+                backfilled_count += 1;
             }
         }
     }
@@ -1125,7 +1140,7 @@ async fn handle_idx_create(command: Command, ctx: &AppContext) -> Response {
     Response::Ok
 }
 
-async fn handle_idx_drop(command: Command, ctx: &AppContext) -> Response {
+pub async fn handle_idx_drop(command: Command, ctx: &AppContext) -> Response {
     if command.args.len() != 2 {
         return Response::Error("IDX.DROP requires an index name".to_string());
     }
@@ -1134,32 +1149,11 @@ async fn handle_idx_drop(command: Command, ctx: &AppContext) -> Response {
         Err(_) => return Response::Error("Invalid index name".to_string()),
     };
 
-    let mut found_key: Option<String> = None;
-    for item in ctx.index_manager.indexes.iter() {
-        let internal_name = item.key();
-        let parts: Vec<&str> = internal_name.splitn(2, '|').collect();
-        if parts.len() == 2 {
-            let key_prefix = parts[0];
-            let json_path = parts[1];
-
-            let fabricated_name = format!(
-                "{}_{}",
-                key_prefix.trim_end_matches('*'),
-                json_path.replace('.', "_")
-            );
-
-            if fabricated_name == index_name_to_drop {
-                found_key = Some(internal_name.clone());
-                break;
-            }
-        }
-    }
-
-    if let Some(key) = found_key {
-        ctx.index_manager.indexes.remove(&key);
-        let prefix = key.split('|').next().unwrap().to_string();
+    if let Some((_, internal_name)) = ctx.index_manager.name_to_internal_name.remove(&index_name_to_drop) {
+        ctx.index_manager.indexes.remove(&internal_name);
+        let prefix = internal_name.split('|').next().unwrap().to_string();
         if let Some(mut prefixes) = ctx.index_manager.prefix_to_indexes.get_mut(&prefix) {
-            prefixes.retain(|name| name != &key);
+            prefixes.retain(|name| name != &internal_name);
         }
         Response::Integer(1)
     } else {
@@ -1178,4 +1172,88 @@ async fn handle_idx_list(command: Command, ctx: &AppContext) -> Response {
         .map(|item| item.key().as_bytes().to_vec())
         .collect();
     Response::MultiBytes(index_names)
+}
+
+pub fn apply_json_set_to_db(db: &crate::types::Db, path: &str, value: Value) -> Result<()> {
+    let mut parts = path.splitn(2, '.');
+    let key = match parts.next() {
+        Some(k) if !k.is_empty() => k.to_string(),
+        _ => bail!("Invalid path: missing key"),
+    };
+    let inner_path = parts.next().unwrap_or("");
+
+    let mut current_val = db.get(&key).map(|entry| {
+        match entry.value() {
+            DbValue::Json(v) => v.clone(),
+            DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or(json!({})),
+            _ => json!({})
+        }
+    }).unwrap_or(json!({}));
+
+    let pointer = json_path_to_pointer(inner_path);
+    if pointer.is_empty() {
+        current_val = value;
+    } else if let Some(target) = current_val.pointer_mut(&pointer) {
+        *target = value;
+    } else {
+        let mut current = &mut current_val;
+        for part in inner_path.split('.') {
+            if part.is_empty() { continue; }
+            if current.is_object() {
+                current = current.as_object_mut().unwrap().entry(part).or_insert(json!({}));
+            } else {
+                bail!("Path creation failed: part is not an object");
+            }
+        }
+        *current = value;
+    }
+
+    let new_value_bytes = serde_json::to_vec(&current_val)?;
+    db.insert(key, DbValue::JsonB(new_value_bytes));
+    Ok(())
+}
+
+pub fn apply_json_delete_to_db(db: &crate::types::Db, path: &str) -> Result<i64> {
+    let mut parts = path.splitn(2, '.');
+    let key = match parts.next() {
+        Some(k) if !k.is_empty() => k.to_string(),
+        _ => bail!("Invalid path: missing key"),
+    };
+    let inner_path = parts.next().unwrap_or("");
+
+    if inner_path.is_empty() || inner_path == "." {
+        if db.remove(&key).is_some() {
+            Ok(1)
+        } else {
+            Ok(0)
+        }
+    } else {
+        if let Some(entry) = db.get(&key) {
+            let mut current_val = match entry.value() {
+                DbValue::Json(v) => v.clone(),
+                DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or(json!({})),
+                _ => bail!("WRONGTYPE Operation against a non-JSON value"),
+            };
+
+            let mut pointer_parts: Vec<&str> = inner_path.split('.').collect();
+            let final_key = pointer_parts.pop().unwrap();
+            let parent_pointer = json_path_to_pointer(&pointer_parts.join("."));
+            let mut modified = false;
+
+            if let Some(target) = current_val.pointer_mut(&parent_pointer) {
+                if let Some(obj) = target.as_object_mut() {
+                    if obj.remove(final_key).is_some() {
+                        modified = true;
+                    }
+                }
+            }
+
+            if modified {
+                let new_bytes = serde_json::to_vec(&current_val)?;
+                db.insert(key, DbValue::JsonB(new_bytes));
+                return Ok(1);
+            }
+        }
+        Ok(0)
+    }
 }

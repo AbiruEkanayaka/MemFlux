@@ -3,6 +3,7 @@
   "port": 8360,
   "requirepass": "",
   "wal_file": "memflux.wal",
+  "wal_overflow_file": "memflux.wal.overflow",
   "snapshot_file": "memflux.snapshot",
   "snapshot_temp_file": "memflux.snapshot.tmp",
   "wal_size_threshold_mb": 128,

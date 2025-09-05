@@ -1,14 +1,18 @@
 use anyhow::{anyhow, Result};
+use chrono::{DateTime, NaiveDate, NaiveTime};
 use regex;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
+use uuid::Uuid;
+use hex;
 
 use super::ast::*;
 use crate::schema::{DataType, VirtualSchema};
-use crate::types::{AppContext, FunctionRegistry, SchemaCache};
+use crate::types::{AppContext, FunctionRegistry, SchemaCache, ViewCache};
 
 pub(crate) fn cast_value_to_type(value: Value, target_type: &DataType) -> Result<Value> {
     // Allow nulls to pass through without casting. Nullability is a separate check.
@@ -17,29 +21,145 @@ pub(crate) fn cast_value_to_type(value: Value, target_type: &DataType) -> Result
     }
 
     match target_type {
+        DataType::SmallInt => match value {
+            Value::Number(n) => {
+                // Replace the old f64-only cast/unwrap with explicit integer and float handling:
+                if let Some(i) = n.as_i64() {
+                    if i > i16::MAX as i64 || i < i16::MIN as i64 {
+                        Err(anyhow!("Value {} out of range for SMALLINT", i))
+                    } else {
+                        Ok(serde_json::json!(i as i16))
+                    }
+                } else if let Some(f) = n.as_f64() {
+                    if f.is_nan() || f > i16::MAX as f64 || f < i16::MIN as f64 {
+                        Err(anyhow!("Value {} out of range for SMALLINT", f))
+                    } else {
+                        // Truncate toward zero rather than rounding
+                        Ok(serde_json::json!(f.trunc() as i16))
+                    }
+                } else {
+                    // Neither integer nor float: invalid JSON number
+                    Err(anyhow!("Invalid numeric value for SMALLINT"))
+                }
+            },
+            Value::String(s) => Ok(serde_json::json!(s.parse::<i16>()?)),
+            Value::Bool(b) => Ok(serde_json::json!(if b { 1 } else { 0 })),
+            _ => Err(anyhow!("Cannot cast {:?} to SMALLINT", value)),
+        },
         DataType::Integer => match value {
             Value::Number(n) => {
-                if n.is_f64() {
-                    Ok(serde_json::json!(n.as_f64().unwrap() as i64))
+                if let Some(i) = n.as_i64() {
+                    if i > i32::MAX as i64 || i < i32::MIN as i64 {
+                        Err(anyhow!("Value {} out of range for INTEGER", i))
+                    } else {
+                        Ok(serde_json::json!(i as i32))
+                    }
+                } else if let Some(f) = n.as_f64() {
+                    if f.is_nan() || f > i32::MAX as f64 || f < i32::MIN as f64 {
+                        Err(anyhow!("Value {} out of range for INTEGER", f))
+                    } else {
+                        Ok(serde_json::json!(f.trunc() as i32))
+                    }
                 } else {
-                    Ok(Value::Number(n))
+                    Err(anyhow!("Invalid numeric value for INTEGER"))
                 }
             }
-            Value::String(s) => {
-                if let Ok(i) = s.parse::<i64>() {
-                    Ok(serde_json::json!(i))
-                } else if let Ok(f) = s.parse::<f64>() {
-                    Ok(serde_json::json!(f as i64))
-                } else {
-                    Err(anyhow!("Cannot cast string '{}' to INTEGER", s))
-                }
-            }
+            Value::String(s) => Ok(serde_json::json!(s.parse::<i32>()?)),
             Value::Bool(b) => Ok(serde_json::json!(if b { 1 } else { 0 })),
             _ => Err(anyhow!("Cannot cast {:?} to INTEGER", value)),
         },
+        DataType::BigInt => match value {
+            Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Ok(serde_json::json!(i))
+                } else if let Some(f) = n.as_f64() {
+                    if f.is_nan() {
+                        Err(anyhow!("NaN value cannot be cast to BIGINT"))
+                    } else {
+                        Ok(serde_json::json!(f.trunc() as i64))
+                    }
+                } else {
+                    Err(anyhow!("Invalid numeric value for BIGINT"))
+                }
+            }
+            Value::String(s) => Ok(serde_json::json!(s.parse::<i64>()?)),
+            Value::Bool(b) => Ok(serde_json::json!(if b { 1 } else { 0 })),
+            _ => Err(anyhow!("Cannot cast {:?} to BIGINT", value)),
+        },
+        DataType::Real => match value {
+            Value::Number(n) => Ok(serde_json::json!(n.as_f64().unwrap_or_default() as f32)),
+            Value::String(s) => Ok(serde_json::json!(s.parse::<f32>()?)),
+            _ => Err(anyhow!("Cannot cast {:?} to REAL", value)),
+        },
+        DataType::DoublePrecision => match value {
+            Value::Number(n) => Ok(serde_json::json!(n.as_f64().unwrap_or_default())),
+            Value::String(s) => Ok(serde_json::json!(s.parse::<f64>()?)),
+            _ => Err(anyhow!("Cannot cast {:?} to DOUBLE PRECISION", value)),
+        },
+        DataType::Numeric { scale, .. } => {
+            // For now, treat as f64. A proper implementation would use a decimal type.
+            let val = match value {
+                Value::Number(n) => n.as_f64().ok_or_else(|| anyhow!("Invalid numeric value"))?,
+                Value::String(s) => s.parse::<f64>()?,
+                _ => return Err(anyhow!("Cannot cast {:?} to NUMERIC", value)),
+            };
+
+            if let Some(s) = scale {
+                let multiplier = 10f64.powi(*s as i32);
+                Ok(serde_json::json!((val * multiplier).round() / multiplier))
+            } else {
+                Ok(serde_json::json!(val))
+            }
+        }
         DataType::Text => match value {
             Value::String(s) => Ok(Value::String(s)),
             other => Ok(Value::String(other.to_string())),
+        },
+        DataType::Varchar(n) => match value {
+            Value::String(s) => {
+                if s.len() > *n as usize {
+                    Err(anyhow!(
+                        "Value too long for type VARCHAR({}): len={} > max={}",
+                        n,
+                        s.len(),
+                        n
+                    ))
+                } else {
+                    Ok(Value::String(s))
+                }
+            }
+            other => {
+                let s = other.to_string();
+                if s.len() > *n as usize {
+                    Err(anyhow!(
+                        "Value too long for type VARCHAR({}): len={} > max={}",
+                        n,
+                        s.len(),
+                        n
+                    ))
+                } else {
+                    Ok(Value::String(s))
+                }
+            }
+        },
+        DataType::Char(n) => match value {
+            Value::String(s) => {
+                let n = *n as usize;
+                if s.len() > n {
+                    Ok(Value::String(s.chars().take(n).collect()))
+                } else {
+                    Ok(Value::String(format!("{:width$}", s, width = n)))
+                }
+            }
+            other => {
+                let s = other.to_string();
+                let n = *n as usize;
+                if s.len() > n {
+                    Ok(Value::String(s.chars().take(n).collect()))
+                } else {
+                    Ok(Value::String(format!("{:width$}", s, width = n)))
+                }
+            }
         },
         DataType::Boolean => match value {
             Value::Bool(b) => Ok(Value::Bool(b)),
@@ -59,17 +179,111 @@ pub(crate) fn cast_value_to_type(value: Value, target_type: &DataType) -> Result
             }
             _ => Err(anyhow!("Cannot cast {:?} to BOOLEAN", value)),
         },
-        DataType::Timestamp => {
-            // For now, we'll just expect a string and store it as text.
-            // A more robust implementation would parse it with chrono.
-            match value {
-                Value::String(s) => Ok(Value::String(s)),
-                _ => Err(anyhow!(
-                    "Cannot cast {:?} to TIMESTAMP, expected string",
-                    value
-                )),
+        DataType::Timestamp => match value {
+            Value::String(s) => {
+                if DateTime::parse_from_rfc3339(&s).is_ok() {
+                    Ok(Value::String(s))
+                } else if chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S").is_ok() {
+                    Ok(Value::String(s))
+                } else {
+                    Err(anyhow!("Invalid TIMESTAMP format for string: {}", s))
+                }
             }
-        }
+            _ => Err(anyhow!(
+                "Cannot cast {:?} to TIMESTAMP, expected string",
+                value
+            )),
+        },
+        DataType::TimestampTz => match value {
+            Value::String(s) => {
+                if DateTime::parse_from_rfc3339(&s).is_ok() {
+                    Ok(Value::String(s))
+                } else {
+                    Err(anyhow!("Invalid TIMESTAMPTZ format for string: {}", s))
+                }
+            }
+            _ => Err(anyhow!(
+                "Cannot cast {:?} to TIMESTAMPTZ, expected string",
+                value
+            )),
+        },
+        DataType::Date => match value {
+            Value::String(s) => {
+                if NaiveDate::parse_from_str(&s, "%Y-%m-%d").is_ok() {
+                    Ok(Value::String(s))
+                } else {
+                    Err(anyhow!(
+                        "Invalid DATE format for string: {}. Expected YYYY-MM-DD.",
+                        s
+                    ))
+                }
+            }
+            _ => Err(anyhow!("Cannot cast {:?} to DATE, expected string", value)),
+        },
+        DataType::Time => match value {
+            Value::String(s) => {
+                if NaiveTime::parse_from_str(&s, "%H:%M:%S").is_ok() {
+                    Ok(Value::String(s))
+                } else if NaiveTime::parse_from_str(&s, "%H:%M:%S%.f").is_ok() {
+                    Ok(Value::String(s))
+                } else {
+                    Err(anyhow!(
+                        "Invalid TIME format for string: {}. Expected HH:MM:SS[.FFF].",
+                        s
+                    ))
+                }
+            }
+            _ => Err(anyhow!("Cannot cast {:?} to TIME, expected string", value)),
+        },
+        DataType::Bytea => match value {
+            Value::String(s) => {
+                let s = s.strip_prefix("\\x").unwrap_or(&s);
+                match hex::decode(s) {
+                    Ok(bytes) => Ok(Value::String(format!("\\x{}", hex::encode(bytes)))),
+                    Err(_) => Err(anyhow!("Invalid hex string for BYTEA")),
+                }
+            }
+            _ => Err(anyhow!("Cannot cast {:?} to BYTEA, expected hex string", value)),
+        },
+        DataType::Uuid => match value {
+            Value::String(s) => match Uuid::parse_str(&s) {
+                Ok(uuid) => Ok(Value::String(uuid.to_string())),
+                Err(_) => Err(anyhow!("Invalid UUID format for string: {}", s)),
+            },
+            _ => Err(anyhow!("Cannot cast {:?} to UUID, expected string", value)),
+        },
+        DataType::Array(inner_type) => match value {
+            Value::String(s) => {
+                let s = s.trim();
+                if !s.starts_with('{') || !s.ends_with('}') {
+                    return Err(anyhow!("Invalid array literal: {}", s));
+                }
+                let s = &s[1..s.len() - 1];
+                let parts = s.split(',');
+                let mut result = Vec::new();
+                for part in parts {
+                    let part = part.trim();
+                    let val = cast_value_to_type(Value::String(part.to_string()), inner_type)?;
+                    result.push(val);
+                }
+                Ok(Value::Array(result))
+            }
+            Value::Array(arr) => {
+                let mut result = Vec::new();
+                for val in arr {
+                    result.push(cast_value_to_type(val, inner_type)?);
+                }
+                Ok(Value::Array(result))
+            }
+            _ => Err(anyhow!("Cannot cast {:?} to ARRAY", value)),
+        },
+        DataType::JsonB => match value {
+            Value::String(s) => {
+                let json_val: Value = serde_json::from_str(&s)?;
+                Ok(json_val)
+            }
+            _ => Ok(value),
+        },
     }
 }
 
@@ -363,16 +577,17 @@ fn like_to_regex(pattern: &str) -> String {
         match c {
             '%' => regex.push_str(".*"),
             '_' => regex.push('.'),
-            // FIX 1: Use '\\' to match a literal backslash character.
             '\\' => {
                 if let Some(escaped_char) = chars.next() {
-                    if ".+*?()|[]{}|^$\\".contains(escaped_char) {
-                        // FIX 2: Push an escaped backslash.
+                    if ".+*?()|[]{}|^$\\".contains(escaped_char) {  
+                        regex.push('\\');
+                    } else if escaped_char == '\\' {
+                        // This is a literal backslash, which needs to be escaped for regex
                         regex.push('\\');
                     }
                     regex.push(escaped_char);
                 } else {
-                    // This correctly pushes two backslashes to the regex string.
+                    // Trailing backslash, treat as literal
                     regex.push_str("\\\\");
                 }
             }
@@ -389,7 +604,7 @@ fn like_to_regex(pattern: &str) -> String {
     regex
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Expression {
     Column(String),
     Literal(Value),
@@ -466,7 +681,7 @@ impl fmt::Display for Expression {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LogicalOperator {
     And,
     Or,
@@ -481,7 +696,7 @@ impl fmt::Display for LogicalOperator {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Operator {
     Eq,
     NotEq,
@@ -510,7 +725,7 @@ impl fmt::Display for Operator {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LogicalPlan {
     TableScan {
         table_name: String,
@@ -546,11 +761,20 @@ pub enum LogicalPlan {
     CreateTable {
         table_name: String,
         columns: Vec<ColumnDef>,
+        if_not_exists: bool,
+        constraints: Vec<TableConstraint>,
+    },
+    CreateSchema {
+        schema_name: String,
+    },
+    CreateView {
+        view_name: String,
+        query: SelectStatement,
     },
     Insert {
         table_name: String,
         columns: Vec<String>,
-        values: Vec<Expression>,
+        values: Vec<Vec<Expression>>,
     },
     Delete {
         from: Box<LogicalPlan>,
@@ -563,6 +787,9 @@ pub enum LogicalPlan {
     DropTable {
         table_name: String,
     },
+    DropView {
+        view_name: String,
+    },
     AlterTable {
         table_name: String,
         action: AlterTableAction,
@@ -572,9 +799,12 @@ pub enum LogicalPlan {
         right: Box<LogicalPlan>,
         all: bool,
     },
+    CreateIndex {
+        statement: CreateIndexStatement,
+    },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JoinType {
     Inner,
     Left,
@@ -583,9 +813,10 @@ pub enum JoinType {
     Cross,
 }
 
-fn simple_expr_to_expression(
+pub(crate) fn simple_expr_to_expression(
     expr: SimpleExpression,
     schema_cache: &SchemaCache,
+    view_cache: &ViewCache,
     function_registry: &FunctionRegistry,
 ) -> Result<Expression> {
     match expr {
@@ -618,12 +849,14 @@ fn simple_expr_to_expression(
                 left: Box::new(simple_expr_to_expression(
                     *left,
                     schema_cache,
+                    view_cache,
                     function_registry,
                 )?),
                 op,
                 right: Box::new(simple_expr_to_expression(
                     *right,
                     schema_cache,
+                    view_cache,
                     function_registry,
                 )?),
             })
@@ -638,12 +871,14 @@ fn simple_expr_to_expression(
                 left: Box::new(simple_expr_to_expression(
                     *left,
                     schema_cache,
+                    view_cache,
                     function_registry,
                 )?),
                 op,
                 right: Box::new(simple_expr_to_expression(
                     *right,
                     schema_cache,
+                    view_cache,
                     function_registry,
                 )?),
             })
@@ -662,7 +897,7 @@ fn simple_expr_to_expression(
         SimpleExpression::FunctionCall { func, args } => {
             let args_expr = args
                 .into_iter()
-                .map(|e| simple_expr_to_expression(e, schema_cache, function_registry))
+                .map(|e| simple_expr_to_expression(e, schema_cache, view_cache, function_registry))
                 .collect::<Result<_>>()?;
             Ok(Expression::FunctionCall {
                 func,
@@ -678,11 +913,13 @@ fn simple_expr_to_expression(
                         Box::new(simple_expr_to_expression(
                             w,
                             schema_cache,
+                            view_cache,
                             function_registry,
                         )?),
                         Box::new(simple_expr_to_expression(
                             t,
                             schema_cache,
+                            view_cache,
                             function_registry,
                         )?),
                     ))
@@ -693,6 +930,7 @@ fn simple_expr_to_expression(
                 Some(Box::new(simple_expr_to_expression(
                     *else_expr,
                     schema_cache,
+                    view_cache,
                     function_registry,
                 )?))
             } else {
@@ -705,17 +943,12 @@ fn simple_expr_to_expression(
             })
         }
         SimpleExpression::Cast { expr, data_type } => {
-            let dt = match data_type.to_uppercase().as_str() {
-                "INTEGER" => DataType::Integer,
-                "TEXT" => DataType::Text,
-                "BOOLEAN" => DataType::Boolean,
-                "TIMESTAMP" => DataType::Timestamp,
-                _ => return Err(anyhow!("Unsupported data type for CAST: {}", data_type)),
-            };
+            let dt = DataType::from_str(&data_type)?;
             Ok(Expression::Cast {
                 expr: Box::new(simple_expr_to_expression(
                     *expr,
                     schema_cache,
+                    view_cache,
                     function_registry,
                 )?),
                 data_type: dt,
@@ -723,7 +956,7 @@ fn simple_expr_to_expression(
         }
         SimpleExpression::Subquery(select_statement) => {
             let logical_plan =
-                ast_to_logical_plan(AstStatement::Select(*select_statement), schema_cache, function_registry)?;
+                ast_to_logical_plan(AstStatement::Select(*select_statement), schema_cache, view_cache, function_registry)?;
             Ok(Expression::Subquery(Box::new(logical_plan)))
         }
     }
@@ -733,6 +966,7 @@ fn simple_expr_to_expression(
 fn validate_expression(
     expr: &SimpleExpression,
     schemas: &HashMap<String, Arc<VirtualSchema>>,
+    view_cache: &ViewCache,
     function_registry: &FunctionRegistry,
 ) -> Result<()> {
     if schemas.is_empty() {
@@ -742,7 +976,7 @@ fn validate_expression(
                 return Err(anyhow!("Function '{}' not found", func));
             }
             for arg in args {
-                validate_expression(arg, schemas, function_registry)?;
+                validate_expression(arg, schemas, view_cache, function_registry)?;
             }
         }
         return Ok(());
@@ -786,16 +1020,16 @@ fn validate_expression(
             Ok(())
         }
         SimpleExpression::BinaryOp { left, right, .. } => {
-            validate_expression(left, schemas, function_registry)?;
-            validate_expression(right, schemas, function_registry)
+            validate_expression(left, schemas, view_cache, function_registry)?;
+            validate_expression(right, schemas, view_cache, function_registry)
         }
         SimpleExpression::LogicalOp { left, right, .. } => {
-            validate_expression(left, schemas, function_registry)?;
-            validate_expression(right, schemas, function_registry)
+            validate_expression(left, schemas, view_cache, function_registry)?;
+            validate_expression(right, schemas, view_cache, function_registry)
         }
         SimpleExpression::AggregateFunction { arg, .. } => {
             if arg != "*" {
-                validate_expression(&SimpleExpression::Column(arg.clone()), schemas, function_registry)?;
+                validate_expression(&SimpleExpression::Column(arg.clone()), schemas, view_cache, function_registry)?;
             }
             Ok(())
         }
@@ -804,23 +1038,23 @@ fn validate_expression(
                 return Err(anyhow!("Function '{}' not found", func));
             }
             for arg in args {
-                validate_expression(arg, schemas, function_registry)?;
+                validate_expression(arg, schemas, view_cache, function_registry)?;
             }
             Ok(())
         }
         SimpleExpression::Literal(_) => Ok(()),
         SimpleExpression::Case(case_expr) => {
             for (when_expr, then_expr) in &case_expr.when_then_pairs {
-                validate_expression(when_expr, schemas, function_registry)?;
-                validate_expression(then_expr, schemas, function_registry)?;
+                validate_expression(when_expr, schemas, view_cache, function_registry)?;
+                validate_expression(then_expr, schemas, view_cache, function_registry)?;
             }
             if let Some(else_expr) = &case_expr.else_expression {
-                validate_expression(else_expr, schemas, function_registry)?;
+                validate_expression(else_expr, schemas, view_cache, function_registry)?;
             }
             Ok(())
         }
         SimpleExpression::Cast { expr, .. } => {
-            validate_expression(expr, schemas, function_registry)
+            validate_expression(expr, schemas, view_cache, function_registry)
         }
         SimpleExpression::Subquery(select_statement) => {
             // We need to validate the subquery in its own context.
@@ -835,10 +1069,10 @@ fn validate_expression(
             }
 
             for col in &select_statement.columns {
-                validate_expression(&col.expr, &sub_schemas, function_registry)?;
+                validate_expression(&col.expr, &sub_schemas, view_cache, function_registry)?;
             }
             if let Some(where_clause) = &select_statement.where_clause {
-                validate_expression(where_clause, &sub_schemas, function_registry)?;
+                validate_expression(where_clause, &sub_schemas, view_cache, function_registry)?;
             }
             // TODO: Validate other parts of the subquery (GROUP BY, ORDER BY etc)
             Ok(())
@@ -849,15 +1083,30 @@ fn validate_expression(
 pub fn ast_to_logical_plan(
     statement: AstStatement,
     schema_cache: &SchemaCache,
+    view_cache: &ViewCache,
     function_registry: &FunctionRegistry,
 ) -> Result<LogicalPlan> {
     match statement {
-        AstStatement::CreateTable(statement) => Ok(LogicalPlan::CreateTable {
-            table_name: statement.table_name,
-            columns: statement.columns,
+        AstStatement::CreateSchema(statement) => Ok(LogicalPlan::CreateSchema {
+            schema_name: statement.schema_name,
         }),
+        AstStatement::CreateView(statement) => Ok(LogicalPlan::CreateView {
+            view_name: statement.view_name,
+            query: statement.query,
+        }),
+        AstStatement::CreateTable(statement) => {
+            Ok(LogicalPlan::CreateTable {
+                table_name: statement.table_name,
+                columns: statement.columns,
+                if_not_exists: statement.if_not_exists,
+                constraints: statement.constraints,
+            })
+        }
         AstStatement::DropTable(statement) => Ok(LogicalPlan::DropTable {
             table_name: statement.table_name,
+        }),
+        AstStatement::DropView(statement) => Ok(LogicalPlan::DropView {
+            view_name: statement.view_name,
         }),
         AstStatement::Select(mut statement) => {
             let union_clause = statement.union.take();
@@ -875,24 +1124,31 @@ pub fn ast_to_logical_plan(
 
             // We can validate expressions even with no schemas, for function calls
             for col in &statement.columns {
-                validate_expression(&col.expr, &schemas_in_scope, function_registry)?;
+                validate_expression(&col.expr, &schemas_in_scope, view_cache, function_registry)?;
             }
             if let Some(where_clause) = &statement.where_clause {
-                validate_expression(where_clause, &schemas_in_scope, function_registry)?;
+                validate_expression(where_clause, &schemas_in_scope, view_cache, function_registry)?;
             }
             for group_expr in &statement.group_by {
-                validate_expression(group_expr, &schemas_in_scope, function_registry)?;
+                validate_expression(group_expr, &schemas_in_scope, view_cache, function_registry)?;
             }
             for order_expr in &statement.order_by {
-                validate_expression(&order_expr.expression, &schemas_in_scope, function_registry)?;
+                validate_expression(&order_expr.expression, &schemas_in_scope, view_cache, function_registry)?;
             }
             for join in &statement.joins {
-                validate_expression(&join.on_condition, &schemas_in_scope, function_registry)?;
+                validate_expression(&join.on_condition, &schemas_in_scope, view_cache, function_registry)?;
             }
             // --- VALIDATION END ---
 
-            let mut plan = LogicalPlan::TableScan {
-                table_name: statement.from_table,
+            // Check if the FROM table is a view
+            let mut plan = if let Some(view_def) = view_cache.get(&statement.from_table) {
+                // It's a view, so we use its query as the base plan.
+                ast_to_logical_plan(AstStatement::Select(view_def.query.clone()), schema_cache, view_cache, function_registry)?
+            } else {
+                // It's a real table.
+                LogicalPlan::TableScan {
+                    table_name: statement.from_table,
+                }
             };
 
             for join in statement.joins {
@@ -904,14 +1160,23 @@ pub fn ast_to_logical_plan(
                     "CROSS JOIN" => JoinType::Cross,
                     _ => return Err(anyhow!("Unsupported join type: {}", join.join_type)),
                 };
+
+                // Check if the JOIN table is a view
+                let right_plan = if let Some(view_def) = view_cache.get(&join.table) {
+                    ast_to_logical_plan(AstStatement::Select(view_def.query.clone()), schema_cache, view_cache, function_registry)?
+                } else {
+                    LogicalPlan::TableScan {
+                        table_name: join.table,
+                    }
+                };
+
                 plan = LogicalPlan::Join {
                     left: Box::new(plan),
-                    right: Box::new(LogicalPlan::TableScan {
-                        table_name: join.table,
-                    }),
+                    right: Box::new(right_plan),
                     condition: simple_expr_to_expression(
                         join.on_condition,
                         schema_cache,
+                        view_cache,
                         function_registry,
                     )?,
                     join_type,
@@ -924,6 +1189,7 @@ pub fn ast_to_logical_plan(
                     predicate: simple_expr_to_expression(
                         selection,
                         schema_cache,
+                        view_cache,
                         function_registry,
                     )?,
                 };
@@ -933,7 +1199,7 @@ pub fn ast_to_logical_plan(
                 .columns
                 .into_iter()
                 .map(|c| {
-                    simple_expr_to_expression(c.expr, schema_cache, function_registry)
+                    simple_expr_to_expression(c.expr, schema_cache, view_cache, function_registry)
                         .map(|expr| (expr, c.alias))
                 })
                 .collect::<Result<_>>()?;
@@ -956,7 +1222,7 @@ pub fn ast_to_logical_plan(
                     .group_by
                     .clone()
                     .into_iter()
-                    .map(|e| simple_expr_to_expression(e, schema_cache, function_registry))
+                    .map(|e| simple_expr_to_expression(e, schema_cache, view_cache, function_registry))
                     .collect::<Result<_>>()?;
 
                 for proj_expr in &non_agg_expressions {
@@ -991,7 +1257,7 @@ pub fn ast_to_logical_plan(
                         .order_by
                         .into_iter()
                         .map(|o| {
-                            simple_expr_to_expression(o.expression, schema_cache, function_registry)
+                            simple_expr_to_expression(o.expression, schema_cache, view_cache, function_registry)
                                 .map(|e| (e, o.asc))
                         })
                         .collect::<Result<_>>()?,
@@ -1015,6 +1281,7 @@ pub fn ast_to_logical_plan(
                 let right_plan = ast_to_logical_plan(
                     AstStatement::Select(*union_clause.select),
                     schema_cache,
+                    view_cache,
                     function_registry,
                 )?;
                 plan = LogicalPlan::Union {
@@ -1027,10 +1294,16 @@ pub fn ast_to_logical_plan(
             Ok(plan)
         }
         AstStatement::Insert(statement) => {
-            if let Some(schema) = schema_cache.get(&statement.table) {
-                for col in &statement.columns {
-                    if !schema.columns.contains_key(col) {
-                        return Err(anyhow!("Column '{}' does not exist in table '{}'", col, statement.table));
+            if !statement.columns.is_empty() {
+                if let Some(schema) = schema_cache.get(&statement.table) {
+                    for col in &statement.columns {
+                        if !schema.columns.contains_key(col) {
+                            return Err(anyhow!(
+                                "Column '{}' does not exist in table '{}'",
+                                col,
+                                statement.table
+                            ));
+                        }
                     }
                 }
             }
@@ -1038,8 +1311,16 @@ pub fn ast_to_logical_plan(
             let values = statement
                 .values
                 .into_iter()
-                .map(|e| simple_expr_to_expression(e, schema_cache, function_registry))
-                .collect::<Result<Vec<_>>>()?;
+                .map(|row_values| {
+                    row_values
+                        .into_iter()
+                        .map(|e| {
+                            simple_expr_to_expression(e, schema_cache, view_cache, function_registry)
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<Vec<Vec<_>>>>()?;
+
             Ok(LogicalPlan::Insert {
                 table_name: statement.table,
                 columns: statement.columns,
@@ -1053,7 +1334,7 @@ pub fn ast_to_logical_plan(
             }
 
             if let Some(where_clause) = &statement.where_clause {
-                validate_expression(where_clause, &schemas_in_scope, function_registry)?;
+                validate_expression(where_clause, &schemas_in_scope, view_cache, function_registry)?;
             }
 
             let mut plan = LogicalPlan::TableScan {
@@ -1062,7 +1343,7 @@ pub fn ast_to_logical_plan(
             if let Some(selection) = statement.where_clause {
                 plan = LogicalPlan::Filter {
                     input: Box::new(plan),
-                    predicate: simple_expr_to_expression(selection, schema_cache, function_registry)?,
+                    predicate: simple_expr_to_expression(selection, schema_cache, view_cache, function_registry)?,
                 };
             }
             Ok(LogicalPlan::Delete {
@@ -1081,10 +1362,10 @@ pub fn ast_to_logical_plan(
                         return Err(anyhow!("Column '{}' does not exist in table '{}'", col, statement.table));
                     }
                 }
-                validate_expression(expr, &schemas_in_scope, function_registry)?;
+                validate_expression(expr, &schemas_in_scope, view_cache, function_registry)?;
             }
             if let Some(where_clause) = &statement.where_clause {
-                validate_expression(where_clause, &schemas_in_scope, function_registry)?;
+                validate_expression(where_clause, &schemas_in_scope, view_cache, function_registry)?;
             }
 
 
@@ -1094,13 +1375,13 @@ pub fn ast_to_logical_plan(
             if let Some(selection) = statement.where_clause {
                 plan = LogicalPlan::Filter {
                     input: Box::new(plan),
-                    predicate: simple_expr_to_expression(selection, schema_cache, function_registry)?,
+                    predicate: simple_expr_to_expression(selection, schema_cache, view_cache, function_registry)?,
                 };
             }
             let set = statement
                 .set
                 .into_iter()
-                .map(|(col, expr)| simple_expr_to_expression(expr, schema_cache, function_registry).map(|e| (col, e)))
+                .map(|(col, expr)| simple_expr_to_expression(expr, schema_cache, view_cache, function_registry).map(|e| (col, e)))
                 .collect::<Result<Vec<_>>>()?;
 
             Ok(LogicalPlan::Update {
@@ -1120,8 +1401,7 @@ pub fn ast_to_logical_plan(
             Ok(LogicalPlan::Delete {
                 from: Box::new(plan),
             })
-        }
+        },
+        AstStatement::CreateIndex(statement) => Ok(LogicalPlan::CreateIndex { statement }),
     }
 }
-
-

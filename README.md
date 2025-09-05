@@ -38,10 +38,12 @@ MemFlux is an experimental, high-performance, in-memory, multi-model database se
     *   **JSON Documents:** Rich, schemaless JSON manipulation at the key or sub-path level.
     *   **Lists & Sets:** Redis-compatible list and set operations.
 *   **Integrated SQL Query Engine:** A powerful, built-from-scratch query engine that operates directly on your in-memory data. Supports:
-    *   Complex `SELECT` queries with `JOIN`s, `GROUP BY`, aggregates (`COUNT`, `SUM`, `AVG`), `ORDER BY`, `LIMIT`, and more.
+    *   Complex `SELECT` queries with `JOIN`s, `GROUP BY`, aggregates (`COUNT`, `SUM`, `AVG`), `ORDER BY`, `LIMIT`, subqueries, and `CASE` statements.
     *   Data Manipulation Language (DML): `INSERT`, `UPDATE`, `DELETE`.
-    *   Data Definition Language (DDL): `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE` for managing "virtual schemas".
-    *   Advanced features like subqueries, `CASE` statements, and a rich function library (`LOWER`, `NOW()`, `ABS()`, etc.).
+    *   Data Definition Language (DDL): `CREATE/DROP/ALTER TABLE`, `CREATE/DROP VIEW`, and `CREATE SCHEMA` for managing virtual schemas and namespaces.
+    *   Rich Data Types: `INTEGER`, `TEXT`, `TIMESTAMPTZ`, `NUMERIC`, `UUID`, `BYTEA`, arrays (`INTEGER[]`), and more.
+    *   Advanced Constraints: `PRIMARY KEY`, `UNIQUE`, `CHECK`, and `FOREIGN KEY` with referential actions (`ON DELETE CASCADE`, `ON UPDATE SET NULL`, etc.).
+    *   A rich function library (`LOWER`, `NOW()`, `DATE_PART`, `ABS()`, etc.).
 *   **Redis (RESP) Compatible Protocol:** Use your favorite Redis client or the provided interactive script to connect and issue commands.
 *   **Durable Persistence:** Durability is achieved through a Write-Ahead Log (WAL) and periodic snapshotting, ensuring your data is safe even if the server restarts.
 *   **Secondary Indexing:** Create indexes on JSON fields to dramatically accelerate SQL query performance.
