@@ -87,7 +87,32 @@ fn get_expression_type(
     }
 }
 
-/// Compares two serde_json Values, respecting the virtual data type.
+/// Compare two JSON `Value`s using optional type guidance.
+///
+/// Returns an `Ordering` where `null` is treated as smallest (NULLS FIRST).
+/// If `target_type` is a numeric-like type, both values are parsed as numbers
+/// (accepting JSON numbers or numeric strings) and compared numerically when
+/// possible. Otherwise falls back to natural JSON value comparisons for
+/// numbers, strings, and booleans. If types are incompatible or cannot be
+/// parsed, the values are considered equal for ordering purposes.
+///
+/// # Examples
+///
+/// ```
+/// use serde_json::json;
+/// use std::cmp::Ordering;
+///
+/// // Nulls first
+/// assert_eq!(super::compare_typed_values(&json!(null), &json!(1), &None), Ordering::Less);
+/// assert_eq!(super::compare_typed_values(&json!(null), &json!(null), &None), Ordering::Equal);
+///
+/// // Numeric comparison when target_type is numeric
+/// let t = Some(crate::types::DataType::Integer);
+/// assert_eq!(super::compare_typed_values(&json!(2), &json!("10"), &t), Ordering::Less);
+///
+/// // String comparison fallback
+/// assert_eq!(super::compare_typed_values(&json!("a"), &json!("b"), &None), Ordering::Less);
+/// ```
 fn compare_typed_values(
     val_a: &Value,
     val_b: &Value,
@@ -140,6 +165,38 @@ fn compare_typed_values(
     }
 }
 
+/// Execute a physical query plan against the given application context and return an asynchronous stream of result rows.
+///
+/// This function evaluates a PhysicalPlan and produces a pinned, boxed async Stream of Result<Row> (JSON values). Each yielded Row is a serde_json::Value representing one result tuple (rows produced by scans, projections, joins, aggregates, DDL/DML status objects, etc.). The executor is WAL-backed for mutating operations: DDL and DML paths persist entries to the write-ahead log (via `log_and_wait_qe!`) before mutating in-memory state or the database. The stream yields Errors for runtime failures (constraint violations, schema errors, index issues, I/O/WAL failures, or evaluation errors) as they occur during execution.
+///
+/// Supported plan behaviors (non-exhaustive):
+/// - Scans: TableScan and IndexScan produce table-namespaced JSON rows and inject metadata keys like `id` and `_key`.
+/// - Filtering/Projection: Filter and Projection evaluate expressions with context; Projection supports `*`, aliases, and aggregates (aggregates are expected to be pre-computed or available in the row).
+/// - Joins/Aggregation/Sort/Limit/Union: Implement standard semantics (including LEFT/RIGHT/FULL outer behavior where applicable).
+/// - DDL/DML: Create/Drop Table/View/Schema, CreateIndex, AlterTable, Insert/Update/Delete apply validations (NOT NULL, UNIQUE, CHECK, FOREIGN KEY), persist changes via WAL, and update indexes and in-memory caches. Referential actions (ON DELETE / ON UPDATE) are applied where supported.
+/// - Errors are surfaced through the Result items in the returned stream; consumers should handle them when polling the stream.
+///
+/// Notes:
+/// - The executor captures and uses the provided AppContext (shared state, caches, index manager, DB, logger). Do not document the AppContext parameter here since it is a shared service object passed through the codebase.
+/// - The optional `outer_row` provides an evaluation context for correlated subqueries or expression evaluation when present.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use futures::StreamExt;
+///
+/// // Assume `plan` is a constructed PhysicalPlan and `ctx` is an Arc<AppContext>.
+/// // `execute` returns a stream of `Result<Row>`. Here we consume the stream to collect all rows.
+/// # async fn example(plan: crate::query_engine::PhysicalPlan, ctx: Arc<crate::AppContext>) -> anyhow::Result<()> {
+/// let mut stream = crate::query_engine::execution::execute(plan, ctx, None);
+/// while let Some(row_res) = stream.next().await {
+///     let row = row_res?;
+///     println!("{}", row);
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub fn execute<'a>(
     plan: PhysicalPlan,
     ctx: Arc<AppContext>,
@@ -1264,6 +1321,34 @@ pub fn execute<'a>(
     })
 }
 
+/// Compute a SQL-style aggregation over a set of rows.
+///
+/// Supported aggregation functions:
+/// - `COUNT`: returns the number of input rows (as JSON number).
+/// - `SUM`: numeric sum of `arg` evaluated for each row (non-numeric or null evaluations are ignored), returned as JSON number.
+/// - `AVG`: numeric average of `arg` over rows that yield numeric values; returns `null` when no numeric values are present.
+/// - `MIN` / `MAX`: return the minimum / maximum `arg` value across rows, comparing numeric results; `null` if no values encountered.
+/// Any unsupported `func` name yields `null`.
+///
+/// `arg` is evaluated against each input row (and an optional `outer_row`) via `Expression::evaluate_with_context`.
+/// Non-numeric or null evaluation results are ignored by `SUM`/`AVG`; `MIN`/`MAX` treat null as absent for comparisons.
+/// The function returns a `serde_json::Value` representing the aggregated result.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use serde_json::json;
+/// // `Expression` and `AppContext` are part of the query engine; this example is illustrative and not intended to compile here.
+/// # async fn example() -> anyhow::Result<()> {
+/// let rows = vec![json!({"a": 1}), json!({"a": 2}), json!({"a": 3})];
+/// let expr = Expression::Column("a".into()); // evaluate `a` for each row
+/// let ctx = Arc::new(AppContext::default());
+/// let avg = run_agg_fn("AVG", &expr, &rows, None, ctx).await?;
+/// assert_eq!(avg, json!(2.0));
+/// # Ok(())
+/// # }
+/// ```
 async fn run_agg_fn<'a>(
     func: &str,
     arg: &Expression,
@@ -1318,7 +1403,35 @@ async fn run_agg_fn<'a>(
     Ok(result)
 }
 
-/// Checks if inserting or updating a row in a child table violates any foreign key constraints.
+/// Validate foreign key constraints for a prospective insert or update on a child table.
+///
+/// This inspects the table's defined FOREIGN KEY constraints and, for each constraint:
+/// - Collects the child-side column values from `row_data`.
+/// - Treats the constraint as satisfied if any referenced child value is `NULL` (MATCH SIMPLE).
+/// - Otherwise, constructs a predicate that looks up a matching parent row in the referenced table
+///   and queries the engine (LIMIT 1). If no parent row is found, returns an error describing
+///   the violated constraint.
+///
+/// Parameters:
+/// - `table_name`: child table name whose constraints are being validated.
+/// - `row_data`: JSON object representing the row to be inserted or updated; column values are read
+///   by column name to build the foreign-key lookup.
+///
+/// Returns:
+/// - `Ok(())` when all foreign key constraints are satisfied.
+/// - `Err(...)` when any foreign key constraint is violated or when underlying plan execution fails.
+///
+/// # Examples
+///
+/// ```
+/// # async fn example_usage() -> Result<(), anyhow::Error> {
+/// #     // `ctx` would be your shared AppContext; this is only illustrative.
+/// #     let table = "orders";
+/// #     let row = serde_json::json!({ "customer_id": 42, "amount": 100.0 });
+/// #     // check_foreign_key_constraints(table, &row, &ctx).await?;
+/// #     Ok(())
+/// # }
+/// ```
 async fn check_foreign_key_constraints(
     table_name: &str,
     row_data: &Value,
@@ -1392,6 +1505,42 @@ async fn check_foreign_key_constraints(
 
 
 
+/// Apply configured ON DELETE actions for all child tables that reference a parent table row.
+///
+/// This inspects every table schema in the context for foreign-key constraints that reference
+/// `parent_table_name`. For each matching child table it finds child rows that reference the
+/// given `parent_row_data` and applies the foreign-key's `ON DELETE` action:
+/// - CASCADE: deletes matching child rows (persisted to WAL and removed from storage/indexes)
+/// - SET NULL: sets the referencing child columns to NULL (persisted and re-indexed)
+/// - SET DEFAULT: sets the referencing child columns to their column default (errors if no default)
+/// - NO ACTION / RESTRICT (or any other unspecified action): returns an error and aborts
+///
+/// The function persists modifications via the WAL and updates in-memory storage and indexes.
+/// It returns Err(...) if any required metadata is missing or if a restricting action prevents the delete.
+///
+/// # Parameters
+///
+/// - `parent_table_name`: name of the parent table whose deletion triggered these actions.
+/// - `parent_row_data`: the JSON object representing the parent row's column values (used to match FK columns).
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - a child key cannot be extracted for a required operation,
+/// - a column referenced for SET DEFAULT has no default,
+/// - an unsupported/RESTRICT/NO ACTION policy prevents the delete,
+/// - or if WAL/index/storage operations fail.
+///
+/// # Examples
+///
+/// ```
+/// # async fn example() -> anyhow::Result<()> {
+/// use std::sync::Arc;
+/// // assume `ctx` and `parent_row` are available and valid in test setup
+/// // apply_on_delete_actions("parents", &parent_row, &ctx).await?;
+/// # Ok(())
+/// # }
+/// ```
 async fn apply_on_delete_actions(
     parent_table_name: &str,
     parent_row_data: &Value, // The inner object of the parent row
@@ -1555,7 +1704,44 @@ async fn apply_on_delete_actions(
     Ok(())
 }
 
-/// Checks for rows in other tables that reference a given parent row, and applies ON UPDATE actions.
+/// Apply ON UPDATE referential actions to child rows that reference a changed parent row.
+///
+/// This inspects every table schema in the context for FOREIGN KEY constraints that reference
+/// `parent_table_name`. For each matching foreign key it:
+/// - Builds a predicate that matches child rows referencing the *old* parent key values (skips if any old key value is NULL).
+/// - Executes a filtered scan to collect matching child rows.
+/// - For each matched child row applies the FK's ON UPDATE action:
+///   - "CASCADE": overwrite the child FK columns with the corresponding new parent key values.
+///   - "SET NULL": set the child FK columns to JSON null.
+///   - "SET DEFAULT": evaluate and apply each column's default expression (errors if a default is missing).
+///   - Otherwise ("NO ACTION"/"RESTRICT"/unknown): returns an error indicating the constraint violation.
+///
+/// Side effects:
+/// - Persists each child-row modification to the WAL (via `log_and_wait_qe!`), updates in-memory indexes,
+///   and writes the new JSON value into the key/value store.
+/// - Returns an error if required child keys cannot be retrieved or if an unsupported action is encountered.
+///
+/// Parameters:
+/// - `parent_table_name`: name of the parent table whose row was updated.
+/// - `old_parent_row_data`: the parent's previous inner JSON object (the row data as stored in child FK `references_columns`).
+/// - `new_parent_row_data`: the parent's new inner JSON object (used to source replacement FK values).
+/// - `ctx`: application context (contains schema cache, index manager, DB, logger, etc.; omitted from parameter docs as a service client).
+///
+/// Returns:
+/// - Ok(()) on success; an error when a constraint prevents the update or when required data or defaults are missing.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// # use serde_json::json;
+/// # async fn example(ctx: Arc<AppContext>) -> anyhow::Result<()> {
+/// let old = json!({"id": 1, "name": "old"});
+/// let new = json!({"id": 2, "name": "new"});
+/// apply_on_update_actions("parents", &old, &new, &ctx).await?;
+/// # Ok(())
+/// # }
+/// ```
 async fn apply_on_update_actions(
     parent_table_name: &str,
     old_parent_row_data: &Value, // The old inner object of the parent row

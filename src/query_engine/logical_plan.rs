@@ -14,6 +14,27 @@ use super::ast::*;
 use crate::schema::{DataType, VirtualSchema};
 use crate::types::{AppContext, FunctionRegistry, SchemaCache, ViewCache};
 
+/// Cast a serde_json::Value into the given SQL-like DataType, performing validation and conversions.
+///
+/// Null values are allowed through unchanged (nullability is validated elsewhere).
+/// Supported conversions include numeric, string, boolean, temporal (date/time/timestamp), binary (bytea),
+/// UUID, arrays (from JSON arrays or PostgreSQL-style `{...}` literals), and JSONB (parses JSON text).
+/// Returns an error when conversion is not possible or when values are out of the target type's range/format.
+///
+/// # Examples
+///
+/// ```
+/// use serde_json::json;
+/// // Cast a numeric string to INTEGER
+/// let v = json!("123");
+/// let out = crate::query_engine::logical_plan::cast_value_to_type(v, &crate::types::DataType::Integer).unwrap();
+/// assert_eq!(out, json!(123));
+///
+/// // Null passes through
+/// let n = serde_json::Value::Null;
+/// let out = crate::query_engine::logical_plan::cast_value_to_type(n, &crate::types::DataType::Text).unwrap();
+/// assert!(out.is_null());
+/// ```
 pub(crate) fn cast_value_to_type(value: Value, target_type: &DataType) -> Result<Value> {
     // Allow nulls to pass through without casting. Nullability is a separate check.
     if value.is_null() {
@@ -568,7 +589,22 @@ impl Expression {
     }
 }
 
-/// Converts a SQL LIKE pattern to a regex pattern.
+/// Convert a SQL LIKE pattern into an anchored regular expression string.
+///
+/// - `%` is translated to `.*` (match any sequence of characters).
+/// - `_` is translated to `.` (match any single character).
+/// - `\` escapes the following character; a trailing `\` is treated as a literal backslash.
+/// - Other regex-special characters are escaped so they match literally.
+///
+/// # Examples
+///
+/// ```
+/// // Simple translation without regex crate
+/// assert_eq!(like_to_regex("foo%bar"), "^foo.*bar$");
+/// assert_eq!(like_to_regex("a_b"), "^a.b$");
+/// assert_eq!(like_to_regex(r"abc\%def"), "^abc%def$"); // escaped percent
+/// assert_eq!(like_to_regex(r"trailing\\"), r"^trailing\\$"); // literal trailing backslash
+/// ```
 fn like_to_regex(pattern: &str) -> String {
     let mut regex = String::with_capacity(pattern.len() * 2);
     regex.push('^');
@@ -638,6 +674,36 @@ pub enum Expression {
 }
 
 impl fmt::Display for Expression {
+    /// Formats an `Expression` as a human-readable, SQL-like string.
+    ///
+    /// Special cases:
+    /// - Aggregate functions use `FUNC(*)` when the argument is the literal string `"*"`.
+    /// - Subqueries are rendered as the placeholder `(SELECT ...subquery...)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crate::query_engine::logical_plan::Expression;
+    /// use serde_json::Value;
+    ///
+    /// let col = Expression::Column("users.name".to_string());
+    /// assert_eq!(format!("{}", col), "users.name");
+    ///
+    /// let lit = Expression::Literal(Value::String("hello".to_string()));
+    /// assert_eq!(format!("{}", lit), "\"hello\"");
+    ///
+    /// let agg = Expression::AggregateFunction {
+    ///     func: "COUNT".to_string(),
+    ///     arg: Box::new(Expression::Literal(Value::String("*".to_string()))),
+    /// };
+    /// assert_eq!(format!("{}", agg), "COUNT(*)");
+    ///
+    /// let func = Expression::FunctionCall {
+    ///     func: "LOWER".to_string(),
+    ///     args: vec![Expression::Column("name".to_string())],
+    /// };
+    /// assert_eq!(format!("{}", func), "LOWER(name)");
+    /// ```
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Expression::Column(name) => write!(f, "{}", name),
@@ -688,6 +754,17 @@ pub enum LogicalOperator {
 }
 
 impl fmt::Display for LogicalOperator {
+    /// Formats the logical operator as its SQL textual representation ("AND" or "OR").
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt::Write;
+    /// let op = crate::LogicalOperator::And;
+    /// let mut s = String::new();
+    /// write!(&mut s, "{}", op).unwrap();
+    /// assert_eq!(s, "AND");
+    /// ```
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LogicalOperator::And => write!(f, "AND"),
@@ -710,6 +787,18 @@ pub enum Operator {
 }
 
 impl fmt::Display for Operator {
+    /// Formats an `Operator` as its SQL textual representation.
+    ///
+    /// This implements the textual form used in SQL-like expressions (e.g. `=`, `!=`, `<`, `LIKE`, `IN`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crate::Operator;
+    /// assert_eq!(format!("{}", Operator::Eq), "=");
+    /// assert_eq!(format!("{}", Operator::ILike), "ILIKE");
+    /// assert_eq!(format!("{}", Operator::In), "IN");
+    /// ```
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Operator::Eq => write!(f, "="),
@@ -813,6 +902,30 @@ pub enum JoinType {
     Cross,
 }
 
+/// Convert a parsed SimpleExpression (from the AST) into an internal Expression.
+///
+/// This performs a recursive translation of the AST-level expression forms into the
+/// engine's Expression enum, including:
+/// - Column and Literal conversion.
+/// - Binary and logical operators (maps operator text to Operator/LogicalOperator).
+/// - Aggregate functions and function calls (recursively converting arguments).
+/// - CASE expressions, CASTs (parsing the target DataType), and Subqueries
+///   (by planning the subquery into a LogicalPlan).
+///
+/// Returns an Err if the AST contains an unsupported operator, if data-type parsing fails,
+/// or if subquery planning/recursive conversions produce an error.
+///
+/// # Examples
+///
+/// ```no_run
+/// use crate::ast::SimpleExpression;
+/// // `schema_cache`, `view_cache`, and `function_registry` are expected to be available
+/// // in the caller's context and passed through here.
+/// let simple = SimpleExpression::Column("id".to_string());
+/// let expr = simple_expr_to_expression(simple, &schema_cache, &view_cache, &function_registry)?;
+/// // `expr` will be an Expression::Column("id".to_string())
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 pub(crate) fn simple_expr_to_expression(
     expr: SimpleExpression,
     schema_cache: &SchemaCache,
@@ -962,7 +1075,31 @@ pub(crate) fn simple_expr_to_expression(
     }
 }
 
-/// Validates that columns used in an expression exist in the provided schemas.
+/// Validate that all columns and referenced functions in a SimpleExpression exist in the provided scope.
+///
+/// This checks:
+/// - Qualified column names (`table.column`) exist in the matching schema when present.
+/// - Unqualified column names exist in exactly one schema (errors on missing or ambiguous).
+/// - `*` is accepted for column and aggregate arguments.
+/// - Function calls are validated against `function_registry`; all function arguments are validated recursively.
+/// - Aggregate functions with a non-`*` argument validate that argument as a column reference.
+/// - Subqueries are validated in a derived schema context built from the subquery's FROM table and JOINs (columns and WHERE are checked; GROUP BY/ORDER BY are not validated).
+/// - If `schemas` is empty the function registry is still checked but column validation is skipped.
+///
+/// Errors are returned for missing/ambiguous columns, unknown functions, or malformed qualified column names.
+///
+/// # Examples
+///
+/// ```
+/// # use std::collections::HashMap;
+/// # use std::sync::Arc;
+/// # // The following types (`SimpleExpression`, `ViewCache`, `FunctionRegistry`, `VirtualSchema`, `Value`) are assumed to be in scope in the real codebase.
+/// let expr = SimpleExpression::Literal(serde_json::Value::Null);
+/// let schemas: HashMap<String, Arc<VirtualSchema>> = HashMap::new();
+/// let view_cache = ViewCache::default();
+/// let function_registry = FunctionRegistry::default();
+/// assert!(validate_expression(&expr, &schemas, &view_cache, &function_registry).is_ok());
+/// ```
 fn validate_expression(
     expr: &SimpleExpression,
     schemas: &HashMap<String, Arc<VirtualSchema>>,
@@ -1080,6 +1217,30 @@ fn validate_expression(
     }
 }
 
+/// Convert an AST statement into an executable LogicalPlan.
+///
+/// This function validates expressions (columns, joins, where/group/order clauses),
+/// expands views (using `view_cache`) into their underlying queries, and constructs
+/// a LogicalPlan representing the statement (DDL, DML, or DQL). It ensures referenced
+/// columns exist (via `schema_cache`) and validates function calls using `function_registry`.
+///
+/// Returns an error if validation fails, a referenced object is missing/ambiguous,
+/// or the statement contains unsupported constructs (e.g., unsupported join type).
+///
+/// # Examples
+///
+/// ```
+/// use crate::query_engine::{ast::AstStatement, planner::ast_to_logical_plan, schema::SchemaCache, view::ViewCache, functions::FunctionRegistry};
+///
+/// // minimal caches/registry for example (in real use these are populated)
+/// let schema_cache = SchemaCache::new();
+/// let view_cache = ViewCache::new();
+/// let function_registry = FunctionRegistry::default();
+///
+/// let ast = AstStatement::Select(/* ... build a Select AST ... */);
+/// let plan = ast_to_logical_plan(ast, &schema_cache, &view_cache, &function_registry);
+/// assert!(plan.is_ok());
+/// ```
 pub fn ast_to_logical_plan(
     statement: AstStatement,
     schema_cache: &SchemaCache,

@@ -364,6 +364,35 @@ async fn load_from_snapshot(snapshot_path: &str, db: &Db) -> Result<()> {
     Ok(())
 }
 
+/// Replays a write-ahead log (WAL) file into the in-memory database.
+///
+/// Reads length-prefixed serialized `LogEntry` records from `wal_path` and applies each entry
+/// to `db`, restoring mutations such as sets, deletes, list and set operations, JSON changes,
+/// and table renames. If the WAL file does not exist this is a no-op. On encountering a
+/// deserialization error the function stops replaying further entries and returns successfully
+/// after applying the entries processed so far.
+///
+/// # Parameters
+///
+/// - `wal_path`: filesystem path to the WAL file to replay.
+/// - `db`: in-memory database to apply the replayed entries to.
+///
+/// # Returns
+///
+/// Returns `Ok(())` on success (including the case where the WAL file is missing). I/O errors
+/// are returned as `Err`.
+///
+/// # Examples
+///
+/// ```
+/// # tokio_test::block_on(async {
+/// use std::sync::Arc;
+/// // construct or load an empty Db (example helper not shown here)
+/// let db = crate::persistence::load_db_from_disk("snapshot.lz4", "primary.wal", "overflow.wal").await.unwrap();
+/// // replay a WAL into `db`
+/// crate::persistence::replay_wal("path/to/wal.log", &db).await.unwrap();
+/// # });
+/// ```
 async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
     use std::collections::{HashSet, VecDeque};
     use tokio::sync::RwLock;

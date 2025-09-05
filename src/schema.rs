@@ -38,6 +38,23 @@ pub enum DataType {
 }
 
 impl fmt::Display for DataType {
+    /// Formats the DataType as a canonical SQL-like type string.
+    ///
+    /// The output matches common SQL type notation:
+    /// - Arrays are printed as `<inner>[]` (recursively).
+    /// - `NUMERIC` includes optional precision and scale: `NUMERIC`, `NUMERIC(p)`, or `NUMERIC(p, s)`.
+    /// - Fixed-length types include their length, e.g. `VARCHAR(n)` and `CHAR(n)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crate::data::DataType;
+    ///
+    /// assert_eq!(format!("{}", DataType::SmallInt), "SMALLINT");
+    /// assert_eq!(format!("{}", DataType::Varchar(255)), "VARCHAR(255)");
+    /// assert_eq!(format!("{}", DataType::Numeric { precision: Some(10), scale: Some(2) }), "NUMERIC(10, 2)");
+    /// assert_eq!(format!("{}", DataType::Array(Box::new(DataType::Integer))), "INTEGER[]");
+    /// ```
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DataType::SmallInt => write!(f, "SMALLINT"),
@@ -71,6 +88,34 @@ impl fmt::Display for DataType {
 }
 
 impl DataType {
+    /// Parse a SQL-like type name into a DataType.
+    ///
+    /// The parser is case-insensitive and supports:
+    /// - Array types using the `[]` suffix (recursive), e.g. `INTEGER[]`.
+    /// - `NUMERIC` with optional precision and scale: `NUMERIC`, `NUMERIC(p)`, `NUMERIC(p,s)`.
+    /// - `VARCHAR(n)` and `CHAR(n)` with an unsigned integer length.
+    /// - The exact token `DOUBLE PRECISION`.
+    /// - Common base types: SMALLINT, INTEGER/INT, BIGINT, REAL, TEXT, BYTEA, JSONB, UUID,
+    ///   BOOLEAN, TIMESTAMP, TIMESTAMPTZ, DATE, TIME.
+    ///
+    /// Returns an `Err` if the string is not a supported/valid type or if numeric
+    /// conversions fail.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use crate::DataType;
+    /// assert_eq!(DataType::from_str("integer").unwrap(), DataType::Integer);
+    /// assert_eq!(DataType::from_str("VARCHAR(255)").unwrap(), DataType::Varchar(255));
+    /// assert_eq!(
+    ///     DataType::from_str("numeric(10,2)").unwrap(),
+    ///     DataType::Numeric { precision: Some(10), scale: Some(2) }
+    /// );
+    /// assert_eq!(
+    ///     DataType::from_str("text[]").unwrap(),
+    ///     DataType::Array(Box::new(DataType::Text))
+    /// );
+    /// ```
     pub fn from_str(s: &str) -> Result<DataType> {
         let upper = s.to_uppercase();
         if upper.ends_with("[]") {
@@ -143,6 +188,20 @@ impl DataType {
 }
 
 impl Serialize for DataType {
+    /// Serialize the DataType as its canonical SQL-like string (using `Display`).
+    ///
+    /// This writes the same string form produced by `DataType::to_string()` (e.g. `INTEGER`,
+    /// `VARCHAR(255)`, `NUMERIC(10,2)`, `TEXT[]`) into the provided `Serializer`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use serde_json;
+    /// // Assuming `DataType::Integer` exists and implements Display as "INTEGER".
+    /// let dt = crate::DataType::Integer;
+    /// let s = serde_json::to_string(&dt).unwrap();
+    /// assert_eq!(s, "\"INTEGER\"");
+    /// ```
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -152,6 +211,18 @@ impl Serialize for DataType {
 }
 
 impl<'de> Deserialize<'de> for DataType {
+    /// Deserialize a `DataType` from its string representation.
+    ///
+    /// The deserializer expects a JSON string like `"INTEGER"`, `"VARCHAR(255)"`,
+    /// `"NUMERIC(10,2)"`, or `"TEXT[]"` and uses `DataType::from_str` to parse it.
+    /// Any parse error is converted into a serde deserialization error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let dt: DataType = serde_json::from_str("\"varchar(32)\"").unwrap();
+    /// assert_eq!(dt, DataType::Varchar(32));
+    /// ```
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -180,6 +251,24 @@ pub struct VirtualSchema {
     pub constraints: Vec<TableConstraint>,
 }
 
+/// Load all stored virtual table schemas from the database into the provided schema cache.
+///
+/// This scans every item in `db`, selects keys that start with `SCHEMA_PREFIX`, and attempts to
+/// deserialize their values as `VirtualSchema`. Supported value types are JSON (`DbValue::Json`)
+/// and raw bytes containing JSON (`DbValue::Bytes`). Successfully parsed schemas are wrapped in
+/// `Arc` and inserted into `schema_cache` keyed by each schema's `table_name`. Items with
+/// non-JSON/bytes value types are skipped with a warning; deserialization failures are reported
+/// and skipped. The function returns `Ok(())` after processing all items.
+///
+/// # Examples
+///
+/// ```no_run
+/// # async fn example() -> anyhow::Result<()> {
+/// // assume `db` and `schema_cache` are available in scope
+/// load_schemas_from_db(&db, &schema_cache).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub async fn load_schemas_from_db(db: &Db, schema_cache: &SchemaCache) -> Result<()> {
     for item in db.iter() {
         let key = item.key();

@@ -31,6 +31,14 @@ except ImportError:
 
 def unit_test(sock, reader, mode):
     # Existing tests
+    """
+    Dispatch and run test suites against the given connection based on the requested mode.
+    
+    Runs one or more test_* functions against the provided server connection according to mode. Passing "all" executes every available test; otherwise a mode name (e.g., "json", "lists", "advanced", "constraints", "ddl_enhancements", etc.) runs the corresponding subset. The "recovery" mode is a special case: it restarts the connection and returns new socket/reader objects produced by test_recovery.
+    
+    Returns:
+        tuple: (sock, reader) — the (possibly updated) connection pair. For the "recovery" mode this will be the new socket and reader returned by test_recovery.
+    """
     if mode in ("byte", "all"):
         test_byte(sock, reader)
     if mode in ("json", "all"):

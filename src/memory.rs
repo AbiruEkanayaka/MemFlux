@@ -10,6 +10,32 @@ use crate::types::{AppContext, DbValue, LogEntry, LogRequest};
 
 // A rough estimation of the memory used by a DbValue.
 // It's not perfect but gives us a baseline for memory management.
+/// Estimate the approximate in-memory size (in bytes) of a `DbValue` variant.
+///
+/// This async helper returns a rough, best-effort size for different `DbValue` kinds:
+/// - `Json`: length of the JSON string representation.
+/// - `JsonB`: length of the binary JSON payload.
+/// - `Bytes`: length of the byte slice.
+/// - `List`/`Set`: acquires a read lock and sums the lengths of contained byte slices.
+/// - `Array`: sums the string lengths of each element's representation.
+///
+/// The result is an estimate used for bookkeeping and eviction heuristics, not an exact
+/// measurement of heap usage.
+///
+/// # Examples
+///
+/// ```
+/// # use crate::types::DbValue;
+/// # async fn doc() {
+/// let v = DbValue::Json(serde_json::json!({"a":1}));
+/// let size = crate::memory::estimate_db_value_size(&v).await;
+/// assert!(size > 0);
+///
+/// let b = DbValue::Bytes(vec![0u8; 10]);
+/// let size_b = crate::memory::estimate_db_value_size(&b).await;
+/// assert_eq!(size_b, 10);
+/// # }
+/// ```
 pub async fn estimate_db_value_size(value: &DbValue) -> u64 {
     match value {
         DbValue::Json(v) => v.to_string().len() as u64,

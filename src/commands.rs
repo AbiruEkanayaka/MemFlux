@@ -65,6 +65,29 @@ pub async fn process_command(command: Command, ctx: &AppContext) -> Response {
     }
 }
 
+/// Retrieves the value for a key and returns it as a Response.
+///
+/// Validates that the command contains exactly one argument (the key) and that the key is valid UTF-8.
+/// If the key exists:
+/// - For DbValue::Bytes and DbValue::JsonB returns Response::Bytes containing the stored bytes.
+/// - For DbValue::Json returns Response::Bytes containing the JSON string bytes.
+/// - For non-scalar types (List, Set, Array) returns a WRONGTYPE Response error.
+/// If the key does not exist returns Response::Nil.
+/// If memory tracking is enabled in the context, the access is recorded.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// // Example usage (context setup omitted):
+/// let cmd = Command::new(vec![b"GET".to_vec(), b"mykey".to_vec()]);
+/// let resp = handle_get(cmd, &ctx).await;
+/// match resp {
+///     Response::Bytes(b) => println!("got bytes: {:?}", b),
+///     Response::Nil => println!("key not found"),
+///     Response::Error(e) => println!("error: {}", e),
+///     _ => {}
+/// }
+/// ```
 async fn handle_get(command: Command, ctx: &AppContext) -> Response {
     if command.args.len() != 2 {
         return Response::Error("GET requires one argument".to_string());
@@ -188,6 +211,19 @@ async fn handle_delete(command: Command, ctx: &AppContext) -> Response {
     Response::Integer(deleted_count)
 }
 
+/// Convert a dot-delimited JSON path into a JSON Pointer string.
+///
+/// The input uses '.' as a separator (e.g., "a.b.c") and may optionally begin with a leading '.'.
+/// A single dot "." or an empty string returns an empty pointer (used to indicate the root).
+///
+/// # Examples
+///
+/// ```
+/// assert_eq!(json_path_to_pointer("a.b.c"), "/a/b/c");
+/// assert_eq!(json_path_to_pointer(".a.b"), "/a/b");
+/// assert_eq!(json_path_to_pointer("."), "");
+/// assert_eq!(json_path_to_pointer(""), "");
+/// ```
 pub fn json_path_to_pointer(path: &str) -> String {
     if path == "." || path.is_empty() {
         return "".to_string();
@@ -196,6 +232,27 @@ pub fn json_path_to_pointer(path: &str) -> String {
     format!("/{}", p.replace('.', "/"))
 }
 
+/// Set or update a JSON value at a dotted key.path in the database.
+///
+/// Expects `command.args` to contain exactly two arguments after the command name:
+/// 1) a key path of the form `key` or `key.inner.path` and 2) a JSON-encoded value string.
+/// The function parses the provided JSON value, loads the current value (supports both in-memory `Json` and stored `JsonB`),
+/// then replaces the root value when the path is empty or updates/creates the nested value at the specified inner path.
+/// The new value is serialized to JSON bytes (stored as JSONB), persisted via a WAL `SetJsonB` entry (awaiting acknowledgement),
+/// and on success the in-memory DB, memory accounting, access tracking, and indexes are updated to reflect the change.
+///
+/// Error responses are returned for invalid arguments, malformed JSON, type mismatches (non-JSON existing value),
+/// serialization failures, or if memory allocation for the new value cannot be ensured. The final returned `Response`
+/// reflects the WAL acknowledgement (success or WAL-related error).
+///
+/// # Examples
+///
+/// ```
+/// // Pseudocode example; adapt to test harness and AppContext construction in this crate:
+/// // let cmd = Command::from_args(&["JSON.SET", "user:1.profile", "{\"name\":\"alice\"}"]);
+/// // let resp = tokio::runtime::Handle::current().block_on(handle_json_set(cmd, &app_ctx));
+/// // assert!(matches!(resp, Response::Ok));
+/// ```
 async fn handle_json_set(command: Command, ctx: &AppContext) -> Response {
     if command.args.len() != 3 {
         return Response::Error("JSON.SET requires a key/path and a value".to_string());
@@ -294,6 +351,36 @@ async fn handle_json_set(command: Command, ctx: &AppContext) -> Response {
     ack_response
 }
 
+/// Retrieve a JSON value (or a nested path) stored at a key.
+///
+/// The command must have exactly one argument: the "key.path" string where `key` is the database key
+/// and `path` is a dot-delimited JSON path. If `path` is empty or `"."` the entire JSON value is
+/// returned.
+///
+/// Behavior:
+/// - If the key is not present: returns `Response::Nil`.
+/// - If the stored value is `DbValue::Json` or `DbValue::JsonB`:
+///   - If the requested inner path points to a JSON value, returns `Response::Bytes` with the JSON
+///     serialization of that value.
+///   - If the pointer does not exist, returns `Response::Nil`.
+///   - If the inner path is empty or `"."` for `JsonB`, returns the full JSON serialization.
+/// - If the stored value is not JSON: returns `Response::Error("WRONGTYPE Operation against a non-JSON value")`.
+/// - If the provided path bytes are not valid UTF-8 or a stored JSONB blob cannot be parsed, returns
+///   a `Response::Error` describing the problem.
+///
+/// Memory access is tracked via the application context when memory tracking is enabled.
+///
+/// # Examples
+///
+/// ```no_run
+/// use tokio::runtime::Runtime;
+/// // Construct `command` where args[1] is the UTF-8 bytes of "user:1.address.city"
+/// // and `ctx` is your AppContext. Call from an async runtime:
+/// # let rt = Runtime::new().unwrap();
+/// # let command = /* build Command with args */ unimplemented!();
+/// # let ctx = /* obtain AppContext */ unimplemented!();
+/// # let _ = rt.block_on(async { crate::commands::handle_json_get(command, &ctx).await });
+/// ```
 async fn handle_json_get(command: Command, ctx: &AppContext) -> Response {
     if command.args.len() != 2 {
         return Response::Error("JSON.GET requires a key/path".to_string());
@@ -344,6 +431,38 @@ async fn handle_json_get(command: Command, ctx: &AppContext) -> Response {
     }
 }
 
+/// Delete a JSON value or a nested member at a JSON path for a given key.
+///
+/// If the provided path refers to the root (empty string or "."), the entire key is deleted.
+/// If the path targets a nested member (e.g., "mykey.a.b"), the function removes the final
+/// member from the JSON object at that path and writes the updated JSON back as JSONB.
+/// Behavior summary:
+/// - Returns Integer(1) when a deletion (key removal or nested-member removal) occurs.
+/// - Returns Integer(0) when the key does not exist or the targeted nested member was absent.
+/// - Returns Error("WRONGTYPE ...") if the key exists but is not a JSON value.
+/// - Returns Error on invalid input (bad UTF-8 path, invalid path) or on WAL/serialization failures.
+///
+/// Side effects:
+/// - Writes a Delete or SetJsonB entry to the WAL and waits for acknowledgement; failures from the
+///   WAL acknowledgement are returned directly.
+/// - On successful mutation, updates memory accounting, optional memory-tracking structures,
+///   and index entries (removes old index mappings; for nested-member removals, adds updated mappings).
+///
+/// # Examples
+///
+/// no_run:
+/// ```no_run
+/// // Construct a JSON.DEL command targeting key "user" and nested path "profile.age":
+/// let cmd = Command { args: vec![b"JSON.DEL".to_vec(), b"user.profile.age".to_vec()] };
+/// // `ctx` is an application context available in the server; call the handler:
+/// let resp = tokio::runtime::Handle::current().block_on(handle_json_del(cmd, &ctx));
+/// match resp {
+///     Response::Integer(1) => println!("Deleted successfully"),
+///     Response::Integer(0) => println!("Nothing to delete"),
+///     Response::Error(e) => eprintln!("Error: {}", e),
+///     _ => {}
+/// }
+/// ```
 async fn handle_json_del(command: Command, ctx: &AppContext) -> Response {
     if command.args.len() != 2 {
         return Response::Error("JSON.DEL requires a key/path".to_string());
@@ -1030,6 +1149,32 @@ async fn handle_memory_usage(command: Command, ctx: &AppContext) -> Response {
     Response::Integer(usage as i64)
 }
 
+/// Create an index for JSON values under keys matching a prefix.
+///
+/// Expects a `CREATEINDEX <key-prefix> ON <json-path>` command:
+/// - `<key-prefix>` must be a UTF-8 string (may end with `*` to indicate a prefix).
+/// - The third token must be the literal `ON` (case-insensitive).
+/// - `<json-path>` is a UTF-8 dot-delimited path used to extract values from stored JSON.
+///
+/// The function synthesizes an internal index name from the prefix and JSON path, converts
+/// the command into an `IDX.CREATE` command, and delegates to `handle_idx_create`.
+///
+/// Returns the `Response` produced by `handle_idx_create`. If the input arguments are invalid
+/// (wrong count or non-UTF-8 prefix/path), returns a `Response::Error` with usage or parse info.
+///
+/// # Examples
+///
+/// ```
+/// # // Illustrative example; types and context values depend on the surrounding crate.
+/// # async fn example(ctx: &AppContext) {
+/// let cmd = Command {
+///     name: "CREATEINDEX".to_string(),
+///     args: vec![b"CREATEINDEX".to_vec(), b"user:*".to_vec(), b"ON".to_vec(), b"address.city".to_vec()],
+/// };
+/// let resp = handle_createindex(cmd, ctx).await;
+/// // inspect `resp` for success or error
+/// # }
+/// ```
 async fn handle_createindex(command: Command, ctx: &AppContext) -> Response {
     if command.args.len() != 4 || String::from_utf8_lossy(&command.args[2]).to_uppercase() != "ON" {
         return Response::Error("Usage: CREATEINDEX <key-prefix> ON <json-path>".to_string());
@@ -1063,6 +1208,28 @@ async fn handle_createindex(command: Command, ctx: &AppContext) -> Response {
     handle_idx_create(adapted_command, ctx).await
 }
 
+/// Create a new index for keys matching a prefix and a JSON path, backfilling existing entries.
+///
+/// The command must have exactly three arguments after the command name:
+/// 1. index name (user-facing name)
+/// 2. key prefix (must end with `*`)
+/// 3. JSON path (dot-delimited)
+///
+/// If an index with the same (prefix, path) pair already exists, or the provided index name
+/// is already in use, the function returns an error Response. On success it registers the
+/// index, scans the database to backfill entries that match the prefix and contain a value at
+/// the JSON path, and returns `Response::Ok`.
+///
+/// # Examples
+///
+/// ```no_run
+/// // Minimal usage sketch (context and command must be constructed from the application).
+/// // let command = Command::from_parts("IDX.CREATE", vec![b"myidx".to_vec(), b"user:*".to_vec(), b".name".to_vec()]);
+/// // let resp = tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// //     handle_idx_create(command, &app_context).await
+/// // });
+/// // assert!(matches!(resp, Response::Ok));
+/// ```
 pub async fn handle_idx_create(command: Command, ctx: &AppContext) -> Response {
     if command.args.len() != 4 {
         return Response::Error(
@@ -1140,6 +1307,25 @@ pub async fn handle_idx_create(command: Command, ctx: &AppContext) -> Response {
     Response::Ok
 }
 
+/// Drop an index by its external name.
+///
+/// Expects a single argument: the external index name. If the argument count is not exactly
+/// one (i.e., `command.args.len() != 2` because the first arg is the command name), returns
+/// `Response::Error("IDX.DROP requires an index name")`. If the provided name is not valid
+/// UTF-8, returns `Response::Error("Invalid index name")`.
+///
+/// On success, removes the index mapping and any prefix->index association:
+/// - Returns `Response::Integer(1)` when an index with the given name was found and removed.
+/// - Returns `Response::Integer(0)` when no index with that external name existed.
+///
+/// # Examples
+///
+/// ```
+/// // Pseudocode / illustrative example:
+/// // let cmd = Command::new(vec![b"IDX.DROP".to_vec(), b"my_index".to_vec()]);
+/// // let resp = tokio::runtime::Runtime::new().unwrap().block_on(handle_idx_drop(cmd, &ctx));
+/// // assert_eq!(resp, Response::Integer(1) | Response::Integer(0));
+/// ```
 pub async fn handle_idx_drop(command: Command, ctx: &AppContext) -> Response {
     if command.args.len() != 2 {
         return Response::Error("IDX.DROP requires an index name".to_string());
@@ -1161,6 +1347,21 @@ pub async fn handle_idx_drop(command: Command, ctx: &AppContext) -> Response {
     }
 }
 
+/// Returns the list of existing index names.
+///
+/// Expects no command arguments; if any are provided, returns an error Response.
+/// On success returns `Response::MultiBytes` containing the index names as UTF-8 bytes.
+///
+/// # Examples
+///
+/// ```
+/// // Returns a MultiBytes response with index names (as Vec<Vec<u8>>).
+/// let resp = handle_idx_list(command, &ctx).await;
+/// match resp {
+///     Response::MultiBytes(names) => { /* use names */ }
+///     _ => panic!("unexpected response"),
+/// }
+/// ```
 async fn handle_idx_list(command: Command, ctx: &AppContext) -> Response {
     if command.args.len() != 1 {
         return Response::Error("IDX.LIST takes no arguments".to_string());
@@ -1174,6 +1375,39 @@ async fn handle_idx_list(command: Command, ctx: &AppContext) -> Response {
     Response::MultiBytes(index_names)
 }
 
+/// Applies a JSON set operation to the given database without logging.
+///
+/// Splits `path` at the first dot into a storage key and an inner JSON path:
+/// - `key` is required (the portion before the first dot).
+/// - `inner_path` is the optional dot-delimited path inside the JSON value (empty means the root).
+///
+/// Behavior:
+/// - Loads the current value for `key` from `db`. Accepts both `DbValue::Json` and `DbValue::JsonB`; non-JSON or missing entries are treated as `{}`.
+/// - If `inner_path` is empty or `"."`, replaces the entire stored value with `value`.
+/// - If the pointer for `inner_path` exists, replaces that target with `value`.
+/// - If the pointer does not exist, creates nested objects along `inner_path` as needed; fails if a non-object is encountered while creating the path.
+/// - Serializes the resulting JSON to bytes and writes it back as `DbValue::JsonB` under `key`.
+///
+/// Returns an error when:
+/// - `path` does not contain a valid key (empty key),
+/// - a non-object is encountered while creating nested path elements,
+/// - or JSON serialization fails.
+///
+/// # Examples
+///
+/// ```
+/// use serde_json::json;
+/// use serde_json::Value;
+///
+/// // Assuming `db` is an initialized `crate::types::Db` instance available in your context:
+/// // let mut db = crate::types::Db::default();
+///
+/// // Replace the whole value for key "user:1"
+/// let _ = apply_json_set_to_db(&db, "user:1", json!({"name":"alice"}));
+///
+/// // Set a nested field creating intermediate objects as needed
+/// let _ = apply_json_set_to_db(&db, "user:1.profile.age", json!(30));
+/// ```
 pub fn apply_json_set_to_db(db: &crate::types::Db, path: &str, value: Value) -> Result<()> {
     let mut parts = path.splitn(2, '.');
     let key = match parts.next() {
@@ -1213,6 +1447,34 @@ pub fn apply_json_set_to_db(db: &crate::types::Db, path: &str, value: Value) -> 
     Ok(())
 }
 
+/// Delete a member from a JSON value stored under a key, or remove the whole key.
+///
+/// If `path` is `"<key>"` or `"<key>."` or `"<key>."` (i.e., no inner path or `.`), the entire key is removed from the DB:
+/// returns `Ok(1)` if the key existed and was removed, `Ok(0)` if it did not exist.
+///
+/// If `path` is `"<key>.<a>.<b>...<field>"`, the function attempts to delete the final member (`field`) from the JSON object
+/// located at the nested path. On success the JSON is serialized to JSONB bytes and written back as `DbValue::JsonB`.
+/// Returns `Ok(1)` if a deletion occurred, or `Ok(0)` if the key or target member was not present.
+///
+/// Errors:
+/// - Returns an error if `path` does not begin with a non-empty key.
+/// - Returns an error with message `WRONGTYPE Operation against a non-JSON value` if the value at `key` is not JSON.
+///
+/// # Examples
+///
+/// ```no_run
+/// use serde_json::json;
+///
+/// // Assume `db` is an existing `crate::types::Db` populated with:
+/// //   key "user:1" => JSON { "profile": { "name": "alice", "age": 30 } }
+/// // Deleting a nested field:
+/// let _ = crate::commands::apply_json_delete_to_db(&db, "user:1.profile.age")?;
+/// // returns Ok(1) and updates stored JSON to { "profile": { "name": "alice" } }
+///
+/// // Deleting the whole key:
+/// let _ = crate::commands::apply_json_delete_to_db(&db, "user:1")?;
+/// // returns Ok(1) if the key existed
+/// ```
 pub fn apply_json_delete_to_db(db: &crate::types::Db, path: &str) -> Result<i64> {
     let mut parts = path.splitn(2, '.');
     let key = match parts.next() {

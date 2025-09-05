@@ -88,6 +88,27 @@ pub enum PhysicalPlan {
     },
 }
 
+/// Convert a LogicalPlan into an equivalent PhysicalPlan, applying simple index-based
+/// optimizations where possible.
+///
+/// This translates each LogicalPlan variant into the corresponding PhysicalPlan variant.
+/// For Filter nodes the function tries to detect a column = literal predicate and,
+/// when the input is a table scan, prefers an IndexScan if an index for that column
+/// exists in the provided IndexManager.
+///
+/// # Examples
+///
+/// ```
+/// # use crate::query_engine::{logical_to_physical_plan, LogicalPlan, PhysicalPlan};
+/// # use crate::indexing::IndexManager;
+/// let plan = LogicalPlan::TableScan { table_name: "users".into() };
+/// let index_manager = IndexManager::new();
+/// let phys = logical_to_physical_plan(plan, &index_manager).unwrap();
+/// match phys {
+///     PhysicalPlan::TableScan { prefix } => assert_eq!(prefix, "users:"),
+///     _ => panic!("expected TableScan"),
+/// }
+/// ```
 pub fn logical_to_physical_plan(
     plan: LogicalPlan,
     index_manager: &IndexManager,

@@ -8,20 +8,50 @@ import ssl
 # --- Test Runner ---
 class TestResult:
     def __init__(self):
+        """
+        Initialize a TestResult collector.
+        
+        Creates counters for passed and failed tests and an ordered list to hold failure records.
+        Each entry appended to `failed_tests` is a dict with keys: 'desc' (str), 'expected', and 'actual'.
+        """
         self.passed = 0
         self.failed = 0
         self.failed_tests = []
 
     def record_pass(self, desc):
+        """
+        Record a successful test.
+        
+        Increments the TestResult.passed counter and prints a `[PASS] {desc}` line to stdout.
+        
+        Parameters:
+            desc (str): Human-readable description or name of the test that passed.
+        """
         self.passed += 1
         print(f"[PASS] {desc}")
 
     def record_fail(self, actual, expected, desc):
+        """
+        Record a failed test case.
+        
+        Increments the internal failure counter, appends a failure record (description, expected, and actual values)
+        to the instance's failed_tests list, and prints a short failure message to stdout.
+        
+        Parameters:
+            actual: The observed value/result from the test.
+            expected: The expected value/result for the test.
+            desc (str): A short description or name of the test case.
+        """
         self.failed += 1
         self.failed_tests.append({'desc': desc, 'expected': expected, 'actual': actual})
         print(f"[FAIL] {desc}")
 
     def summary(self):
+        """
+        Print a summary of recorded unit test results and exit with code 1 if any tests failed.
+        
+        Displays counts of passed and failed tests, lists individual failure details (description, expected, actual) when present, and reports when no tests were run. If one or more tests failed, calls sys.exit(1).
+        """
         print("\n--- Unit Test Summary ---")
         if self.failed == 0 and self.passed > 0:
             print(f"All {self.passed} unit tests passed!")
@@ -46,6 +76,23 @@ test_result = TestResult()
 
 
 def create_connection(retry=False):
+    """
+    Create a TCP connection to 127.0.0.1:8360, optionally upgrade it to TLS and authenticate using settings from config.json.
+    
+    This function attempts to open a socket to the local test server, then:
+    - If config.json exists and contains "encrypt": wraps the socket with an SSL/TLS context that disables hostname and certificate verification.
+    - If config.json contains a non-empty "requirepass": sends an AUTH command and verifies the server response contains "OK".
+    
+    Parameters:
+        retry (bool): When False (default) the function will print status messages and call sys.exit(1) on unrecoverable failures (missing auth, connection errors). When True the function suppresses status prints and returns (None, None) instead of exiting on failure so the caller can retry or handle the error.
+    
+    Returns:
+        tuple: (sock, reader) on success where `sock` is the connected socket (possibly wrapped with TLS) and `reader` is a binary file-like object for reading from the socket. If retry is True and a failure occurs, returns (None, None).
+    
+    Side effects:
+    - May call sys.exit(1) when retry is False and connection or authentication fails.
+    - Opens files/sockets and may close the socket on error.
+    """
     host = "127.0.0.1"
     port = 8360
     sock = None
@@ -145,6 +192,26 @@ def read_resp_response(reader):
 
 
 def send_resp_command(sock, reader, parts):
+    """
+    Send a RESP-formatted command (array of bulk strings), read the full RESP response, and return the decoded response with timing metrics.
+    
+    Builds a Redis/RESP request from the iterable of string parts, sends it over `sock` (UTF-8), then reads and parses the full RESP reply via read_resp_response(reader). Timing values are measured with time.perf_counter() and returned in milliseconds.
+    
+    Parameters:
+        parts (iterable[str]): The command parts (e.g., ["SET", "key", "value"]). Each part is encoded as a RESP bulk string.
+    
+    Returns:
+        tuple[str, float, float, float]: A 4-tuple containing:
+            - decoded_response (str): The RESP response decoded as UTF-8 with errors replaced.
+            - send_time_ms (float): Time (ms) spent sending bytes (between before send and after send).
+            - latency_ms (float): Time (ms) between send completion and response parsing completion.
+            - total_ms (float): Total round-trip time (ms) from before send to after parsing.
+    
+    Notes:
+        - On BrokenPipeError (socket closed during send) the function prints an error and exits the process.
+        - If read_resp_response raises an exception while reading/parsing the reply, the function prints an error and exits the process.
+        - Encoding for outgoing parts and decoding of the response use UTF-8.
+    """
     resp = f"*{len(parts)}\r\n"
     for p in parts:
         p_bytes = p.encode('utf-8')
@@ -174,13 +241,36 @@ def send_resp_command(sock, reader, parts):
 
 def assert_eq(actual, expected, desc):
     # Use the global test_result instance
+    """
+    Assert that two values are equal and record the result on the global test_result.
+    
+    If actual == expected, records a pass with the provided description; otherwise records a failure including actual and expected values.
+    
+    Parameters:
+        actual: The observed value produced by the code under test.
+        expected: The value expected.
+        desc (str): Short description of the assertion / test case used in test output.
+    """
     if actual == expected:
         test_result.record_pass(desc)
     else:
         test_result.record_fail(actual, expected, desc)
 
 def extract_json_from_bulk(resp):
-    """Extract JSON payload from RESP bulk string ($len\r\n...json...)"""
+    """
+    Parse a RESP bulk-string bytes object and return its JSON content as a Python object.
+    
+    Given a RESP bulk-string response (bytes) that begins with `$<length>\r\n`, this function:
+    - Returns None for a RESP null bulk string (`$-1`).
+    - Strips the terminating `\r\n` from the bulk payload, decodes it as UTF-8, and returns the result of json.loads on the payload.
+    - On any parsing or decoding error, prints an error and returns None.
+    
+    Parameters:
+        resp (bytes): A RESP response expected to be a bulk string (starts with `b"$"`).
+    
+    Returns:
+        Any | None: The JSON-decoded Python object on success, or None for null bulk strings or on error.
+    """
     if resp.startswith(b"$"):
         try:
             # Find the first \r\n to get the length part, then the actual data.

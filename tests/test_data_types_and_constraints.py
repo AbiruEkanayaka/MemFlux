@@ -1,11 +1,37 @@
 from .common import send_resp_command, assert_eq, extract_json_from_bulk
 
 def test_data_types_and_constraints(sock, reader):
+    """
+    Run an end-to-end test suite that exercises data types, constraints, and foreign-key behavior over the SQL-like socket protocol.
+    
+    The test performs three phases:
+    1) Data Types: creates a table covering many SQL types, inserts a valid row, verifies returned values (including CHAR padding, BYTEA, UUID and arrays), and checks that invalid inserts (e.g., out-of-range SMALLINT, oversized VARCHAR, malformed UUID/DATE) return errors.
+    2) Constraints: creates a table with PRIMARY KEY, NOT NULL, UNIQUE, DEFAULT and CHECK constraints and verifies expected enforcement for NOT NULL, DEFAULT behavior, UNIQUE/PRIMARY KEY violations, and CHECK constraints.
+    3) Foreign Keys: creates parent/child tables with a FOREIGN KEY, verifies valid and invalid child inserts, and checks that DELETE/UPDATE on a referenced parent is rejected until dependent children are removed.
+    
+    Side effects: sends SQL commands over the provided socket/reader, modifies server state (creates/drops tables, inserts/deletes rows) and uses assertions to validate responses.
+    """
     def send(parts):
         resp, *_ = send_resp_command(sock, reader, parts)
         return resp.strip()
 
     def send_and_parse(cmd_list, description):
+        """
+        Send a RESP command list, parse the server response, and return either a raw RESP reply or a list of JSON row dicts extracted from a bulk-array reply.
+        
+        If the server reply begins with '-', ':', or '+' the raw response string is returned unchanged. Otherwise the function expects a RESP bulk-array (lines starting with '*') where each bulk string contains a JSON row; it extracts each JSON object using extract_json_from_bulk and returns a list of parsed row dictionaries. If the response is not in the expected bulk format, an empty list is returned.
+        
+        Parameters:
+            cmd_list: list
+                RESP command parts to be sent (passed through to send()).
+            description: str
+                Human-readable description used in warning/info messages to identify the command context.
+        
+        Returns:
+            str or list[dict]:
+                - A raw RESP reply string when the response is a simple error/ok/integer (starts with '-', ':', '+').
+                - Otherwise, a list of parsed JSON row dictionaries extracted from a RESP bulk-array. An empty list is returned if the reply is not a bulk-array or contains no valid JSON rows.
+        """
         resp = send(cmd_list)
         if resp.startswith(("-", ":", "+")):
             return resp

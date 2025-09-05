@@ -1,4 +1,3 @@
-
 use anyhow::Result;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -26,6 +25,24 @@ pub enum DbValue {
 }
 
 impl fmt::Debug for DbValue {
+    /// Formats a DbValue for debug output.
+    ///
+    /// Produces concise, human-readable representations for each DbValue variant:
+    /// - `Json(...)` prints the debug representation of the contained `Value`.
+    /// - `JsonB(...)` prints the contained bytes in debug form.
+    /// - `List(<RwLock>)` and `Set(<RwLock>)` print placeholder text to avoid locking during debug.
+    /// - `Bytes(...)` prints a UTF-8 lossy string representation of the bytes.
+    /// - `Array(...)` prints the debug representation of the contained array.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fmt;
+    /// // assume DbValue is in scope
+    /// let v = DbValue::Bytes(b"hello".to_vec());
+    /// let s = format!("{:?}", v);
+    /// assert_eq!(s, "Bytes(\"hello\")");
+    /// ```
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DbValue::Json(v) => write!(f, "Json({:?})", v),
@@ -49,6 +66,24 @@ pub enum SerializableDbValue {
 }
 
 impl SerializableDbValue {
+    /// Convert a `DbValue` into its serializable `SerializableDbValue` form.
+    ///
+    /// For `List` and `Set` variants this asynchronously acquires a read lock to clone the
+    /// contained collection; other variants are cloned directly.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use your_crate::types::{DbValue, SerializableDbValue};
+    /// # tokio_test::block_on(async {
+    /// let v = DbValue::Bytes(b"hello".to_vec());
+    /// let s = SerializableDbValue::from_db_value(&v).await;
+    /// match s {
+    ///     SerializableDbValue::Bytes(b) => assert_eq!(b, b"hello".to_vec()),
+    ///     _ => panic!("unexpected variant"),
+    /// }
+    /// # });
+    /// ```
     pub async fn from_db_value(db_value: &DbValue) -> Self {
         match db_value {
             DbValue::Json(v) => SerializableDbValue::Json(v.clone()),
@@ -66,6 +101,26 @@ impl SerializableDbValue {
         }
     }
 
+    /// Convert a SerializableDbValue into an owned in-memory DbValue.
+    ///
+    /// This consumes the serializable representation and produces the corresponding
+    /// runtime `DbValue`. Containers that require interior mutability are rebuilt:
+    /// - `List` becomes `DbValue::List(RwLock::new(...))`
+    /// - `Set` becomes `DbValue::Set(RwLock::new(...))` (the vector is converted into a `HashSet`)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use tokio::sync::RwLock;
+    /// // example: convert a JSON-serializable value into a runtime DbValue
+    /// let s = SerializableDbValue::Json(serde_json::json!({"a": 1}));
+    /// let dbv = s.into_db_value();
+    /// match dbv {
+    ///     DbValue::Json(v) => assert_eq!(v["a"], 1),
+    ///     _ => panic!("expected Json variant"),
+    /// }
+    /// ```
     pub fn into_db_value(self) -> DbValue {
         match self {
             SerializableDbValue::Json(v) => DbValue::Json(v),

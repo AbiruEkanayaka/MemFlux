@@ -1,11 +1,35 @@
 from .common import send_resp_command, assert_eq, extract_json_from_bulk
 
 def test_ddl_enhancements(sock, reader):
+    """
+    Run the comprehensive DDL enhancements integration test suite against a server connection.
+    
+    This function drives a sequence of SQL/RESP commands over the provided socket/reader connection to validate DDL features including:
+    create/drop tables and schemas, CREATE VIEW, ALTER TABLE (rename table/column, add/drop constraints, set/drop DEFAULT, set/drop NOT NULL, change column TYPE), and foreign-key referential actions (ON DELETE CASCADE, ON UPDATE SET NULL, ON UPDATE CASCADE). It parses bulk RESP JSON rows, asserts expected server responses and query results, performs cleanup before and after tests, and prints progress logs.
+    
+    The test mutates server state (creates and drops objects, inserts/deletes rows) and will fail via assertions if any behavior deviates from expected outcomes.
+    """
     def send(parts):
         resp, *_ = send_resp_command(sock, reader, parts)
         return resp.strip()
 
     def send_and_parse(cmd_list, description):
+        """
+        Send a RESP command list to the server, parse a bulk-array response into JSON rows, and return the parsed results.
+        
+        Sends the command described by cmd_list to the server and interprets the server's RESP reply. If the reply is a non-bulk/simple status or error (starts with '-', ':', or '+'), the raw response string is returned unchanged. If the reply is a RESP bulk array ('*'), each bulk string element is passed through extract_json_from_bulk and any resulting JSON objects are collected and returned as a list.
+        
+        Parameters:
+            cmd_list (list): RESP command parts to send (e.g., ['SQL.QUERY', 'SELECT ...']).
+            description (str): Short text used in informational/warning messages to identify this command.
+        
+        Returns:
+            list | str: A list of parsed JSON rows when a bulk-array response is present; otherwise the raw response string for non-bulk/simple replies.
+        
+        Notes:
+            - Emits informational and warning prints for progress, unexpected responses, and incomplete bulk strings.
+            - Incomplete or malformed bulk elements are skipped; parsing stops if a bulk string is incomplete.
+        """
         resp = send(cmd_list)
         if resp.startswith(("-", ":", "+")):
             return resp
@@ -37,6 +61,16 @@ def test_ddl_enhancements(sock, reader):
         return results
 
     def get_column(results, column_name):
+        """
+        Extract values for a named column from a sequence of row mappings.
+        
+        Parameters:
+            results (Iterable[Mapping]): An iterable of dict-like row objects (e.g., list of dicts) representing query results.
+            column_name (str): The column/key to extract from each row.
+        
+        Returns:
+            list: A list of values in the same order as `results`. If a row does not contain `column_name`, None is returned for that position.
+        """
         return [row.get(column_name) for row in results]
 
     print("== DDL Enhancements Test Suite ==")

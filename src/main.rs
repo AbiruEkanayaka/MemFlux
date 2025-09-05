@@ -28,6 +28,18 @@ use query_engine::functions;
 use schema::{load_schemas_from_db, VIEW_PREFIX};
 use types::{AppContext, FunctionRegistry, Response, ViewCache, ViewDefinition};
 
+/// Generate a self-signed TLS certificate and private key and write them to disk.
+///
+/// The certificate will include "localhost" as a Subject Alternative Name (SAN).
+/// Both files are written in PEM format to the provided paths. Any I/O or
+/// certificate-generation error is propagated to the caller.
+///
+/// # Examples
+///
+/// ```
+/// // Writes `cert.pem` and `key.pem` in the current directory.
+/// let _ = generate_self_signed_cert("cert.pem", "key.pem");
+/// ```
 fn generate_self_signed_cert(cert_path: &str, key_path: &str) -> Result<()> {
     println!("Generating self-signed certificate...");
     let subject_alt_names = vec!["localhost".to_string()];
@@ -74,6 +86,31 @@ fn load_tls_config(config: &Config) -> Result<Arc<rustls::ServerConfig>> {
     Ok(Arc::new(tls_config))
 }
 
+/// Starts the MemFlux server: loads configuration and database state, initializes caches,
+/// persistence, memory/index managers and function registry, then binds a TCP listener
+/// (optionally with TLS) and enters the accept loop to handle RESP protocol clients.
+///
+/// This is the program entry point and performs the full server startup sequence:
+/// - Loads `config.json`.
+/// - Restores the on-disk database (snapshot + WAL).
+/// - Spawns the persistence engine in a background task (fatal persistence errors terminate the process).
+/// - Loads virtual schemas and views into in-memory caches (warnings are logged on failure).
+/// - Initializes memory management, computes initial memory usage and performs eviction if needed.
+/// - Builds the application context (DB, caches, index manager, function registry, memory manager).
+/// - Binds a TCP listener on configured host:port and, if enabled, configures TLS.
+/// - Accepts connections and spawns per-connection tasks running the RESP request loop.
+///
+/// Returns an error if startup fails (config, DB restore, binding listener, or TLS setup).
+/// The function runs indefinitely once the accept loop starts (until the process is terminated).
+///
+/// # Examples
+///
+/// ```no_run
+/// // Start the server (no-op in doctest)
+/// # async fn run() -> anyhow::Result<()> {
+/// tokio::spawn(async { let _ = crate::main().await; });
+/// # Ok(()) }
+/// ```
 #[tokio::main]
 async fn main() -> Result<()> {
     // 1. Load configuration
@@ -253,6 +290,28 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Load view definitions stored in the database into the provided view cache.
+///
+/// Scans all database entries and for each key starting with `VIEW_PREFIX`:
+/// - If the value is bytes, attempts to parse it as JSON into a `ViewDefinition`.
+/// - If parsing succeeds and the view has a non-empty `name`, inserts the definition
+///   (wrapped in `Arc`) into `view_cache` keyed by the view name.
+/// - Non-bytes values, parse failures, and definitions with empty names are logged to
+///   stderr and skipped; processing continues for other entries.
+///
+/// This function never fails on a per-entry parse/validation error; it returns `Ok(())`
+/// after processing all items. Use the returned `Result` for future extension or
+/// to propagate errors if the implementation changes.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// # async fn example(db: &types::Db, view_cache: &ViewCache) {
+/// // Loads all views from `db` into `view_cache`.
+/// let _ = load_views_from_db(db, view_cache).await;
+/// # }
+/// ```
 async fn load_views_from_db(db: &types::Db, view_cache: &ViewCache) -> Result<()> {
     for item in db.iter() {
         let key = item.key();
@@ -287,7 +346,39 @@ async fn load_views_from_db(db: &types::Db, view_cache: &ViewCache) -> Result<()
     Ok(())
 }
 
-/// Handles a single client connection.
+/// Handle a single client connection using the server's RESP-like protocol.
+///
+/// This asynchronous routine reads commands from `stream`, enforces optional password
+/// authentication (via the `AUTH` command when `ctx.config.requirepass` is set),
+/// special-cases the `SQL` command to parse/plan/execute queries with streaming
+/// semantics (SELECT rows are returned as a RESP array of JSON bulk-strings; DML/DDL
+/// return an integer rows-affected or `OK`), and delegates all other commands to
+/// `commands::process_command`. I/O and protocol errors are translated into protocol
+/// Error responses sent back to the client; an unexpected EOF closes the connection.
+///
+/// The stream type `S` must implement `AsyncRead + AsyncWrite + Unpin`. The function
+/// clones and uses `ctx` (AppContext) for planning and execution, including access to
+/// schema and view caches, index manager, and function registry.
+///
+/// # Examples
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use tokio::io::{duplex, AsyncRead, AsyncWrite};
+/// # use tokio::runtime::Runtime;
+/// # use mycrate::types::AppContext;
+/// # use mycrate::server::handle_connection;
+/// // Minimal smoke example: create an in-memory duplex stream pair and spawn the handler.
+/// let rt = Runtime::new().unwrap();
+/// rt.block_on(async {
+///     let (client, server) = duplex(1024);
+///     // Construct a minimal AppContext suitable for tests (fields elided).
+///     let ctx = Arc::new(AppContext::test_instance());
+///     // Run the server side handler (in background).
+///     tokio::spawn(async move { let _ = handle_connection(server, ctx).await; });
+///     // The `client` half can be used to send commands and read responses in tests.
+/// });
+/// ```
 async fn handle_connection<S>(stream: S, ctx: Arc<AppContext>) -> Result<()> 
 where
     S: AsyncRead + AsyncWrite + Unpin,

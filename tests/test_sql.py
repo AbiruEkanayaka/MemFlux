@@ -1,6 +1,28 @@
 from .common import send_resp_command, assert_eq, extract_json_from_bulk
 
 def test_sql(sock, reader):
+    """
+    Run a comprehensive end-to-end SQL test suite against a server connection.
+    
+    This function exercises SQL features (DDL, DML, SELECT, JOINs, aggregates, ORDER/LIMIT/OFFSET,
+    CASE expressions, and index/schema operations) by sending commands over the provided connection,
+    parsing bulk JSON responses, and asserting expected results. It mutates server state (creates
+    schemas, inserts/updates/deletes rows, creates and drops tables/indexes) and restores or cleans
+    up changes where possible so the suite can be re-run.
+    
+    The function performs multiple phased tests (data setup, WHERE/LIKE/ILIKE, ORDER BY, GROUP BY,
+    JOIN variants including LEFT/RIGHT/FULL/CROSS, complex multi-table joins, aggregates, LIMIT/OFFSET,
+    INSERT/UPDATE/DELETE, CREATE/DROP/ALTER/TRUNCATE table operations, and CASE expressions). It prints
+    progress markers and uses assertions to validate results; assertion failures will propagate as test
+    failures.
+    
+    Parameters:
+        sock, reader: connection objects used to send RESP commands and read responses (treated as
+        transport utilities and therefore not documented in detail).
+    
+    Returns:
+        None
+    """
     def send(parts):
         resp, *_ = send_resp_command(sock, reader, parts)
         return resp.strip()
