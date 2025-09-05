@@ -233,4 +233,49 @@ def test_ddl_enhancements(sock, reader):
     send(["SQL", "DROP", "TABLE", "alter_type_test"])
     print("[PASS] ALTER TABLE ALTER COLUMN TYPE tests complete.")
 
+    print("[PASS] ALTER TABLE ALTER COLUMN TYPE tests complete.")
+
+    # --- 11. Foreign Key Referential Actions -- -
+    print("\n-- Phase 11: Foreign Key Referential Actions --")
+    # ON DELETE CASCADE
+    send(["SQL", "CREATE", "TABLE", "fk_cascade_parent", "(id INTEGER PRIMARY KEY)"])
+    send(["SQL", "CREATE", "TABLE", "fk_cascade_child", "(id INTEGER PRIMARY KEY, parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES fk_cascade_parent(id) ON DELETE CASCADE)"])
+    send(["SQL", "INSERT", "INTO", "fk_cascade_parent", "(id)", "VALUES", "(1)", ",", "(2)"])
+    send(["SQL", "INSERT", "INTO", "fk_cascade_child", "(id, parent_id)", "VALUES", "(101, 1)", ",", "(102, 1)", ",", "(103, 2)"])
+    results = send_and_parse(["SQL", "SELECT", "id", "FROM", "fk_cascade_child"], "SELECT before CASCADE DELETE")
+    assert_eq(len(results), 3, "Should have 3 child rows before delete")
+    send(["SQL", "DELETE", "FROM", "fk_cascade_parent", "WHERE", "id", "=", "1"])
+    results = send_and_parse(["SQL", "SELECT", "id", "FROM", "fk_cascade_child"], "SELECT after CASCADE DELETE")
+    assert_eq(len(results), 1, "Should have 1 child row after delete")
+    assert_eq(results[0].get('id'), 103, "Remaining child row should be correct")
+    send(["SQL", "DROP", "TABLE", "fk_cascade_child"])
+    send(["SQL", "DROP", "TABLE", "fk_cascade_parent"])
+    print("[PASS] ON DELETE CASCADE tests complete.")
+
+    # ON UPDATE SET NULL
+    send(["SQL", "CREATE", "TABLE", "fk_setnull_parent", "(id INTEGER PRIMARY KEY)"])
+    send(["SQL", "CREATE", "TABLE", "fk_setnull_child", "(id INTEGER PRIMARY KEY, parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES fk_setnull_parent(id) ON UPDATE SET NULL)"])
+    send(["SQL", "INSERT", "INTO", "fk_setnull_parent", "(id)", "VALUES", "(1)", ",", "(2)"])
+    send(["SQL", "INSERT", "INTO", "fk_setnull_child", "(id, parent_id)", "VALUES", "(101, 1)", ",", "(102, 2)"])
+    send(["SQL", "UPDATE", "fk_setnull_parent", "SET", "id", "=", "11", "WHERE", "id", "=", "1"])
+    results = send_and_parse(["SQL", "SELECT", "parent_id", "FROM", "fk_setnull_child", "ORDER", "BY", "id"], "SELECT after SET NULL UPDATE")
+    assert_eq(len(results), 2, "Should have 2 child rows after update")
+    assert_eq(get_column(results, 'parent_id'), [None, 2], "parent_id should be NULL for updated row")
+    send(["SQL", "DROP", "TABLE", "fk_setnull_child"])
+    send(["SQL", "DROP", "TABLE", "fk_setnull_parent"])
+    print("[PASS] ON UPDATE SET NULL tests complete.")
+
+    # ON UPDATE CASCADE
+    send(["SQL", "CREATE", "TABLE", "fk_cascade_update_parent", "(id INTEGER PRIMARY KEY)"])
+    send(["SQL", "CREATE", "TABLE", "fk_cascade_update_child", "(id INTEGER PRIMARY KEY, parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES fk_cascade_update_parent(id) ON UPDATE CASCADE)"])
+    send(["SQL", "INSERT", "INTO", "fk_cascade_update_parent", "(id)", "VALUES", "(1)", ",", "(2)"])
+    send(["SQL", "INSERT", "INTO", "fk_cascade_update_child", "(id, parent_id)", "VALUES", "(101, 1)", ",", "(102, 2)"])
+    send(["SQL", "UPDATE", "fk_cascade_update_parent", "SET", "id", "=", "11", "WHERE", "id", "=", "1"])
+    results = send_and_parse(["SQL", "SELECT", "parent_id", "FROM", "fk_cascade_update_child", "ORDER", "BY", "id"], "SELECT after CASCADE UPDATE")
+    assert_eq(len(results), 2, "Should have 2 child rows after update")
+    assert_eq(get_column(results, 'parent_id'), [11, 2], "parent_id should be updated for cascaded row")
+    send(["SQL", "DROP", "TABLE", "fk_cascade_update_child"])
+    send(["SQL", "DROP", "TABLE", "fk_cascade_update_parent"])
+    print("[PASS] ON UPDATE CASCADE tests complete.")
+
     print("\n== All DDL Enhancements tests passed! ==")

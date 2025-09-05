@@ -718,21 +718,45 @@ impl Parser {
         self.expect(")")?;
 
         let mut on_delete = None;
-        if self.current().map_or(false, |t| t.eq_ignore_ascii_case("ON")) {
-            self.advance();
-            self.expect("DELETE")?;
-            let action = self.current().ok_or_else(|| anyhow!("Expected ON DELETE action"))?.to_string();
-            self.advance();
-            on_delete = Some(action.to_string());
-        }
-
         let mut on_update = None;
-        if self.current().map_or(false, |t| t.eq_ignore_ascii_case("ON")) {
-            self.advance();
-            self.expect("UPDATE")?;
-            let action = self.current().ok_or_else(|| anyhow!("Expected ON UPDATE action"))?.to_string();
-            self.advance();
-            on_update = Some(action.to_string());
+
+        loop {
+            if self.current().map_or(false, |t| t.eq_ignore_ascii_case("ON")) {
+                self.advance(); // consume ON
+                if self.current().map_or(false, |t| t.eq_ignore_ascii_case("DELETE")) {
+                    self.advance(); // consume DELETE
+                    let mut action = self.current().ok_or_else(|| anyhow!("Expected ON DELETE action"))?.to_string();
+                    self.advance();
+                    if action.eq_ignore_ascii_case("SET") {
+                        if let Some(next_token) = self.current() {
+                            if next_token.eq_ignore_ascii_case("NULL") || next_token.eq_ignore_ascii_case("DEFAULT") {
+                                action.push(' ');
+                                action.push_str(next_token);
+                                self.advance();
+                            }
+                        }
+                    }
+                    on_delete = Some(action);
+                } else if self.current().map_or(false, |t| t.eq_ignore_ascii_case("UPDATE")) {
+                    self.advance(); // consume UPDATE
+                    let mut action = self.current().ok_or_else(|| anyhow!("Expected ON UPDATE action"))?.to_string();
+                    self.advance();
+                    if action.eq_ignore_ascii_case("SET") {
+                        if let Some(next_token) = self.current() {
+                            if next_token.eq_ignore_ascii_case("NULL") || next_token.eq_ignore_ascii_case("DEFAULT") {
+                                action.push(' ');
+                                action.push_str(next_token);
+                                self.advance();
+                            }
+                        }
+                    }
+                    on_update = Some(action);
+                } else {
+                    return Err(anyhow!("Expected DELETE or UPDATE after ON"));
+                }
+            } else {
+                break;
+            }
         }
 
         Ok(ForeignKeyClause {
