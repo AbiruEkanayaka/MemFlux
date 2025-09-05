@@ -103,3 +103,4 @@ This documentation is organized into the following sections:
 *   **[Persistence](./persistence.md):** An explanation of how data durability is achieved through WAL and snapshots.
 *   **[Indexing](./indexing.md):** Guide to creating and using indexes for JSON data.
 *   **[Memory Management](./memory.md):** How to configure memory limits and the eviction policy.
+*   **[Advanced SQL](./advanced_sql.md):** A guide to advanced features like Views, additional data types, and constraints.
