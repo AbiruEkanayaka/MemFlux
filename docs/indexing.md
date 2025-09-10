@@ -22,7 +22,7 @@ IDX.CREATE <index-name> <key-prefix> <json-path>
 CREATEINDEX <key-prefix> ON <json-path>
 ```
 
-*   `<index-name>`: A unique name for your index. **Note:** This name is currently only used for display purposes (e.g., in logs or future inspection commands). To drop an index, you must use the auto-generated name, regardless of which command was used to create it.
+*   `<index-name>`: A unique name for your index. This is the name you will use to manage the index (e.g., with `IDX.DROP`).
 *   `<key-prefix>`: A key pattern with a trailing `*` that specifies which keys this index applies to. For example, `user:*` would apply to `user:1`, `user:100`, etc.
 *   `<json-path>`: The dot-notation path to the field within the JSON object you want to index.
 
@@ -51,7 +51,7 @@ Or using the alias:
 > CREATEINDEX user:* ON profile.city
 +OK
 ```
-The `CREATEINDEX` alias automatically generates an index name for you based on the key prefix and path. The generated name is created by joining the prefix (without the trailing `*`) and the path with underscores (e.g., `user_profile_city`). You will need this name if you want to drop the index later.
+The `CREATEINDEX` alias automatically generates an index name by concatenating the key prefix (with trailing `*` removed) and the JSON path, separated by underscores. It only trims `*` from the prefix and replaces `.` in the path with `_`; no other normalization (such as lowercasing or collapsing non-alphanumerics) is performed. For example, `user:*` + `profile.city` → `user:_profile_city`.
 
 When an index is created, MemFlux automatically **backfills** it by scanning all existing keys matching the prefix and adding them to the index.
 
@@ -69,19 +69,13 @@ The response is an array of the full **internal** index names, which are compose
 
 ### Dropping an Index
 
-To remove an index, you must use `IDX.DROP` with its **auto-generated name**. The name is created by joining the key prefix (without the trailing `*`) and the JSON path with underscores.
+To remove an index, use `IDX.DROP` with the name that was used to create it.
 
-For example, for an index created with either of the following commands:
+- If you used `IDX.CREATE user_city_idx ...`, you drop it with `IDX.DROP user_city_idx`.
+- If you used the `CREATEINDEX user:* ON profile.city` alias, the name was auto-generated as `user_profile_city`, so you drop it with `IDX.DROP user_profile_city`.
+**Example:**
 ```
-> IDX.CREATE user_city_idx user:* profile.city
-+OK
-> CREATEINDEX user:* ON profile.city
-+OK
-```
-
-The auto-generated name is `user_profile_city`. You must use this name to drop it:
-```
-> IDX.DROP user_profile_city
+> IDX.DROP user_city_idx
 :1
 ```
 This will remove the index and free up the memory it was using. It returns the number of indexes dropped (1 or 0).

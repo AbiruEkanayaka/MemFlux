@@ -18,11 +18,7 @@ CREATE TABLE table_name (
 ### Parameters
 - `table_name`: The name of the table, which corresponds to the key prefix (e.g., `user` for keys like `user:1`).
 - `column_name`: The name of a field in the JSON objects.
-- `data_type`: The virtual type to associate with the column. Supported types are:
-    - `INTEGER`: 64-bit integer.
-    - `TEXT`: A string of characters.
-    - `BOOLEAN`: `true` or `false`.
-    - `TIMESTAMP`: An ISO 8601-formatted date-time string.
+- `data_type`: The virtual type to associate with the column. For a complete list of supported data types, see the [Data Types documentation](../types.md#sql-data-types).
 
 ### Behavior
 - When a `CREATE TABLE` statement is executed, a schema definition is stored internally.

@@ -30,7 +30,7 @@ Specifies the columns (fields) to be returned.
 ### `WHERE` Clause
 Filters the rows based on a condition.
 - **Operators:** `=`, `!=`, `>`, `<`, `>=`, `<=`.
-- **Pattern Matching:** `LIKE` (case-sensitive) and `ILIKE` (case-insensitive). The wildcards are `%` (matches any number of characters) and `_` (matches a single character). To match a literal wildcard character, you can escape it with a backslash (e.g., `\%` matches a literal `%`).
+- **Pattern Matching:** `LIKE` (case-sensitive) and `ILIKE` (case-insensitive). The wildcards are `%` (matches any number of characters) and `_` (matches a single character). To match a literal wildcard character (like `%` or `_`), you can escape it with a backslash (e.g., `\%` matches a literal `%`). To match a literal backslash, use two backslashes (`\\`).
 - **Logical Operators:** `AND`, `OR`.
 - **Subqueries:** `IN (SELECT ...)` and `= (SELECT ...)` are supported.
 

@@ -14,6 +14,12 @@ use super::ast::*;
 use crate::schema::{DataType, VirtualSchema};
 use crate::types::{AppContext, FunctionRegistry, SchemaCache, ViewCache};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OnConflictAction {
+    DoNothing,
+    DoUpdate(Vec<(String, Expression)>),
+}
+
 pub(crate) fn cast_value_to_type(value: Value, target_type: &DataType) -> Result<Value> {
     // Allow nulls to pass through without casting. Nullability is a separate check.
     if value.is_null() {
@@ -774,15 +780,20 @@ pub enum LogicalPlan {
     Insert {
         table_name: String,
         columns: Vec<String>,
-        values: Vec<Vec<Expression>>,
+        source: Box<LogicalPlan>,
+        on_conflict: Option<(Vec<String>, OnConflictAction)>,
+        returning: Vec<(Expression, Option<String>)>
     },
     Delete {
+        table_name: String,
         from: Box<LogicalPlan>,
+        returning: Vec<(Expression, Option<String>)>,
     },
     Update {
         table_name: String,
         from: Box<LogicalPlan>,
         set: Vec<(String, Expression)>,
+        returning: Vec<(Expression, Option<String>)>,
     },
     DropTable {
         table_name: String,
@@ -801,6 +812,9 @@ pub enum LogicalPlan {
     },
     CreateIndex {
         statement: CreateIndexStatement,
+    },
+    Values {
+        values: Vec<Vec<Expression>>,
     },
 }
 
@@ -1308,29 +1322,89 @@ pub fn ast_to_logical_plan(
                 }
             }
 
-            let values = statement
-                .values
-                .into_iter()
-                .map(|row_values| {
-                    row_values
+            let source_plan = match statement.source {
+                InsertSource::Values(values) => {
+                    let expressions = values
                         .into_iter()
-                        .map(|e| {
-                            simple_expr_to_expression(e, schema_cache, view_cache, function_registry)
+                        .map(|row_values| {
+                            row_values
+                                .into_iter()
+                                .map(|e| {
+                                    simple_expr_to_expression(e, schema_cache, view_cache, function_registry)
+                                })
+                                .collect::<Result<Vec<_>>>()
                         })
-                        .collect::<Result<Vec<_>>>()
+                        .collect::<Result<Vec<Vec<_>>>>()?;
+                    // Validate that all rows have the same number of values
+                    if !expressions.is_empty() {
+                        let expected_len = expressions[0].len();
+                        for (idx, row) in expressions.iter().enumerate().skip(1) {
+                            if row.len() != expected_len {
+                                return Err(anyhow!(
+                                    "VALUES row {} has {} values, expected {}",
+                                    idx + 1,
+                                    row.len(),
+                                    expected_len
+                                ));
+                            }
+                        }
+                    }
+                    LogicalPlan::Values { values: expressions }
+                }
+                InsertSource::Select(select_stmt) => {
+                    ast_to_logical_plan(
+                        AstStatement::Select(*select_stmt),
+                        schema_cache,
+                        view_cache,
+                        function_registry,
+                    )?
+                }
+            };
+
+            let returning = statement
+                .returning
+                .into_iter()
+                .map(|c| {
+                    simple_expr_to_expression(c.expr, schema_cache, view_cache, function_registry)
+                        .map(|expr| (expr, c.alias))
                 })
-                .collect::<Result<Vec<Vec<_>>>>()?;
+                .collect::<Result<_>>()?;
+
+            let on_conflict_action = if let Some((target, action)) = statement.on_conflict {
+                let new_action = match action {
+                    OnConflict::DoNothing => OnConflictAction::DoNothing,
+                    OnConflict::DoUpdate(set) => {
+                        let new_set = set
+                            .into_iter()
+                            .map(|(col, expr)| {
+                                simple_expr_to_expression(expr, schema_cache, view_cache, function_registry).map(|e| (col, e))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        OnConflictAction::DoUpdate(new_set)
+                    }
+                };
+                Some((target, new_action))
+            } else {
+                None
+            };
 
             Ok(LogicalPlan::Insert {
                 table_name: statement.table,
                 columns: statement.columns,
-                values,
+                source: Box::new(source_plan),
+                on_conflict: on_conflict_action,
+                returning,
             })
         }
         AstStatement::Delete(statement) => {
             let mut schemas_in_scope = HashMap::new();
             if let Some(schema) = schema_cache.get(&statement.from_table) {
                 schemas_in_scope.insert(statement.from_table.clone(), schema.clone());
+            }
+            for using_table in &statement.using_list {
+                if let Some(schema) = schema_cache.get(using_table) {
+                    schemas_in_scope.insert(using_table.clone(), schema.clone());
+                }
             }
 
             if let Some(where_clause) = &statement.where_clause {
@@ -1340,20 +1414,52 @@ pub fn ast_to_logical_plan(
             let mut plan = LogicalPlan::TableScan {
                 table_name: statement.from_table.clone(),
             };
+
+            if !statement.using_list.is_empty() {
+                let mut from_plan = plan;
+                for using_table in statement.using_list {
+                    let right_plan = LogicalPlan::TableScan { table_name: using_table };
+                    from_plan = LogicalPlan::Join {
+                        left: Box::new(from_plan),
+                        right: Box::new(right_plan),
+                        condition: Expression::Literal(Value::Bool(true)), // Cross join, filter in WHERE
+                        join_type: JoinType::Cross,
+                    };
+                }
+                plan = from_plan;
+            }
+
             if let Some(selection) = statement.where_clause {
                 plan = LogicalPlan::Filter {
                     input: Box::new(plan),
                     predicate: simple_expr_to_expression(selection, schema_cache, view_cache, function_registry)?,
                 };
             }
+
+            let returning = statement
+                .returning
+                .into_iter()
+                .map(|c| {
+                    simple_expr_to_expression(c.expr, schema_cache, view_cache, function_registry)
+                        .map(|expr| (expr, c.alias))
+                })
+                .collect::<Result<_>>()?;
+
             Ok(LogicalPlan::Delete {
+                table_name: statement.from_table,
                 from: Box::new(plan),
+                returning,
             })
         }
         AstStatement::Update(statement) => {
             let mut schemas_in_scope = HashMap::new();
             if let Some(schema) = schema_cache.get(&statement.table) {
                 schemas_in_scope.insert(statement.table.clone(), schema.clone());
+            }
+            for from_table in &statement.from_list {
+                if let Some(schema) = schema_cache.get(from_table) {
+                    schemas_in_scope.insert(from_table.clone(), schema.clone());
+                }
             }
 
             for (col, expr) in &statement.set {
@@ -1368,10 +1474,24 @@ pub fn ast_to_logical_plan(
                 validate_expression(where_clause, &schemas_in_scope, view_cache, function_registry)?;
             }
 
-
             let mut plan = LogicalPlan::TableScan {
                 table_name: statement.table.clone(),
             };
+
+            if !statement.from_list.is_empty() {
+                let mut from_plan = plan;
+                for from_table in statement.from_list {
+                    let right_plan = LogicalPlan::TableScan { table_name: from_table };
+                    from_plan = LogicalPlan::Join {
+                        left: Box::new(from_plan),
+                        right: Box::new(right_plan),
+                        condition: Expression::Literal(Value::Bool(true)), // Cross join, filter in WHERE
+                        join_type: JoinType::Cross,
+                    };
+                }
+                plan = from_plan;
+            }
+
             if let Some(selection) = statement.where_clause {
                 plan = LogicalPlan::Filter {
                     input: Box::new(plan),
@@ -1384,10 +1504,20 @@ pub fn ast_to_logical_plan(
                 .map(|(col, expr)| simple_expr_to_expression(expr, schema_cache, view_cache, function_registry).map(|e| (col, e)))
                 .collect::<Result<Vec<_>>>()?;
 
+            let returning = statement
+                .returning
+                .into_iter()
+                .map(|c| {
+                    simple_expr_to_expression(c.expr, schema_cache, view_cache, function_registry)
+                        .map(|expr| (expr, c.alias))
+                })
+                .collect::<Result<_>>()?;
+
             Ok(LogicalPlan::Update {
                 table_name: statement.table.clone(),
                 from: Box::new(plan),
                 set,
+                returning,
             })
         }
         AstStatement::AlterTable(statement) => Ok(LogicalPlan::AlterTable {
@@ -1396,10 +1526,12 @@ pub fn ast_to_logical_plan(
         }),
         AstStatement::TruncateTable(statement) => {
             let plan = LogicalPlan::TableScan {
-                table_name: statement.table_name,
+                table_name: statement.table_name.clone(),
             };
             Ok(LogicalPlan::Delete {
+                table_name: statement.table_name,
                 from: Box::new(plan),
+                returning: Vec::new(),
             })
         },
         AstStatement::CreateIndex(statement) => Ok(LogicalPlan::CreateIndex { statement }),

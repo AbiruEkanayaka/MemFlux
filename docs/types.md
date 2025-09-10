@@ -32,11 +32,25 @@ These are the fundamental data structures you can store in a MemFlux key.
 
 ## SQL Data Types
 
-When using the SQL engine with virtual schemas (`CREATE TABLE`), you can assign specific data types to the fields within your JSON documents. This enables type validation, casting, and more efficient query execution.
+When using the SQL engine with virtual schemas (`CREATE TABLE`), you can assign specific data types to the fields within your JSON documents. This enables type validation, casting, and more efficient query execution. These types define how the data inside the JSON is interpreted by the SQL engine.
 
-These types define how the data inside the JSON is interpreted by the SQL engine.
-
--   **`TEXT`**: Represents a string of characters.
--   **`INTEGER`**: Represents a 64-bit signed integer. Values will be cast to numbers (e.g., the string `"123"` becomes the number `123`).
--   **`BOOLEAN`**: Represents a `true` or `false` value.
--   **`TIMESTAMP`**: Represents a date and time. The SQL engine expects this to be a string formatted according to ISO 8601 / RFC 3339 (e.g., `2025-08-14T10:00:00Z`).
+| Data Type | Description |
+|---|---|
+| `TEXT` | A string of characters. |
+| `VARCHAR(n)` | A variable-length string with a maximum length of `n`. |
+| `CHAR(n)` | A fixed-length string of length `n`. |
+| `INTEGER` | A 32-bit signed integer. |
+| `SMALLINT` | A 16-bit signed integer. |
+| `BIGINT` | A 64-bit signed integer. |
+| `REAL` | A single-precision floating-point number. |
+| `DOUBLE PRECISION`| A double-precision floating-point number. |
+| `NUMERIC(p, s)` | A fixed-point number with precision `p` and scale `s`. |
+| `BOOLEAN` | A `true` or `false` value. |
+| `TIMESTAMP` | A timestamp without a time zone (e.g., `2025-09-10 12:00:00`). |
+| `TIMESTAMPTZ` | A timestamp with a time zone (RFC 3339 format, e.g., `2025-09-10T12:00:00Z`). |
+| `DATE` | A calendar date (e.g., `2025-09-10`). |
+| `TIME` | A time of day (e.g., `12:00:00`). |
+| `BYTEA` | A variable-length binary string in hex format (e.g., `\xDEADBEEF`). |
+| `JSONB` | A binary representation of a JSON object. |
+| `UUID` | A universally unique identifier. |
+| `type[]` | An array of any other supported type (e.g., `INTEGER[]`, `TEXT[]`). |

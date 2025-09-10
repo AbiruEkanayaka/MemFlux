@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::ast::{AlterTableAction, ColumnDef, CreateIndexStatement, SelectStatement, TableConstraint};
-use super::logical_plan::*;
+use super::logical_plan::{*, OnConflictAction};
 use crate::indexing::IndexManager;
 
 #[derive(Debug)]
@@ -68,15 +68,21 @@ pub enum PhysicalPlan {
     Insert {
         table_name: String,
         columns: Vec<String>,
-        values: Vec<Vec<Expression>>,
+        source: Box<PhysicalPlan>,
+        source_column_names: Vec<String>,
+        on_conflict: Option<(Vec<String>, OnConflictAction)>,
+        returning: Vec<(Expression, Option<String>)>
     },
     Delete {
+        table_name: String,
         from: Box<PhysicalPlan>,
+        returning: Vec<(Expression, Option<String>)>,
     },
     Update {
         table_name: String,
         from: Box<PhysicalPlan>,
         set: Vec<(String, Expression)>,
+        returning: Vec<(Expression, Option<String>)>,
     },
     Union {
         left: Box<PhysicalPlan>,
@@ -85,6 +91,9 @@ pub enum PhysicalPlan {
     },
     CreateIndex {
         statement: CreateIndexStatement,
+    },
+    Values {
+        values: Vec<Vec<Expression>>,
     },
 }
 
@@ -193,23 +202,48 @@ pub fn logical_to_physical_plan(
         LogicalPlan::Insert {
             table_name,
             columns,
-            values,
-        } => Ok(PhysicalPlan::Insert {
+            source,
+            on_conflict,
+            returning,
+        } => {
+            let source_column_names = if let LogicalPlan::Projection { ref expressions, .. } = *source {
+                expressions.iter().map(|(expr, alias)| {
+                    alias.clone().unwrap_or_else(|| expr.to_string())
+                }).collect()
+            } else if let LogicalPlan::Values { ref values } = *source {
+                if let Some(first_row) = values.get(0) {
+                    (0..first_row.len()).map(|i| format!("column_{}", i)).collect()
+                } else {
+                    vec![]
+                }
+            } else {
+                vec![] // Should not happen for valid plans
+            };
+
+            Ok(PhysicalPlan::Insert {
+                table_name,
+                columns,
+                source: Box::new(logical_to_physical_plan(*source, index_manager)?),
+                source_column_names,
+                on_conflict,
+                returning,
+            })
+        }
+        LogicalPlan::Delete { table_name, from, returning } => Ok(PhysicalPlan::Delete {
             table_name,
-            columns,
-            values,
-        }),
-        LogicalPlan::Delete { from } => Ok(PhysicalPlan::Delete {
             from: Box::new(logical_to_physical_plan(*from, index_manager)?),
+            returning,
         }),
         LogicalPlan::Update {
             table_name,
             from,
             set,
+            returning,
         } => Ok(PhysicalPlan::Update {
             table_name,
             from: Box::new(logical_to_physical_plan(*from, index_manager)?),
             set,
+            returning,
         }),
         LogicalPlan::AlterTable { table_name, action } => {
             Ok(PhysicalPlan::AlterTable { table_name, action })
@@ -220,6 +254,7 @@ pub fn logical_to_physical_plan(
             all,
         }),
         LogicalPlan::CreateIndex { statement } => Ok(PhysicalPlan::CreateIndex { statement }),
+        LogicalPlan::Values { values } => Ok(PhysicalPlan::Values { values }),
     }
 }
 
