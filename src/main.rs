@@ -346,6 +346,14 @@ where
                     };
 
                     let is_select = matches!(ast, query_engine::AstStatement::Select(_));
+                    let has_returning = match &ast {
+                        query_engine::AstStatement::Insert(s) => !s.returning.is_empty(),
+                        query_engine::AstStatement::Update(s) => !s.returning.is_empty(),
+                        query_engine::AstStatement::Delete(s) => !s.returning.is_empty(),
+                        _ => false,
+                    };
+                    let is_select_like = is_select || has_returning;
+
                     let _is_ddl = matches!(
                         ast,
                         query_engine::AstStatement::CreateTable(_)
@@ -384,7 +392,7 @@ where
                     let mut stream_rows =
                         Box::pin(query_engine::execute(physical_plan, ctx.clone(), None));
 
-                    if is_select {
+                    if is_select_like {
                         // For SELECT, we always stream back rows.
                         // We collect them first to set the RESP array header.
                         let mut rows = Vec::new();

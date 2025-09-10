@@ -21,6 +21,7 @@ from tests.test_recovery import test_recovery
 from tests.test_wrongtype_errors import test_wrongtype_errors
 from tests.test_data_types_and_constraints import test_data_types_and_constraints # Import new test
 from tests.test_ddl_enhancements import test_ddl_enhancements
+from tests.test_dml_enhancements import test_dml_enhancements
 
 
 # Add prompt_toolkit for better interactive input
@@ -79,6 +80,8 @@ def unit_test(sock, reader, mode):
         test_data_types_and_constraints(sock, reader)
     if mode in ("ddl_enhancements", "all"): # Add new DDL enhancements test
         test_ddl_enhancements(sock, reader)
+    if mode in ("dml_enhancements", "all"): # Add new DML enhancements test
+        test_dml_enhancements(sock, reader)
     
     return sock, reader
 
@@ -157,7 +160,7 @@ if __name__ == "__main__":
                         print(f"Send: {send:.2f}ms, Latency: {lat:.2f}ms, Total: {tot:.2f}ms")
             elif sys.argv[1] == "unit":
                 if len(sys.argv) < 3:
-                    print("Usage: python test.py unit {json,byte,lists,sets,sql,snapshot,types,schema,aliases,case,like,functions,union,advanced,operators,indexing,recovery,wrongtype,constraints,ddl_enhancements,all}")
+                    print("Usage: python test.py unit {json,byte,lists,sets,sql,snapshot,types,schema,aliases,case,like,functions,union,advanced,operators,indexing,recovery,wrongtype,constraints,ddl_enhancements,dml_enhancements,all}")
                     sys.exit(1)
                 sock, reader = unit_test(sock, reader, sys.argv[2].lower())
                 test_result.summary()

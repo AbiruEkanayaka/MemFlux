@@ -2,26 +2,7 @@
 
 This document covers advanced SQL features that are implemented in MemFlux but may not yet be fully integrated into the main documentation.
 
-## Additional Data Types
 
-Beyond the basic types, MemFlux supports a wider range of SQL data types in `CREATE TABLE` statements.
-
-| Data Type | Description |
-|---|---|
-| `SMALLINT` | A 16-bit signed integer. |
-| `BIGINT` | A 64-bit signed integer. |
-| `NUMERIC(p, s)` | A fixed-point number with precision `p` and scale `s`. |
-| `REAL` | A single-precision floating-point number. |
-| `DOUBLE PRECISION`| A double-precision floating-point number. |
-| `VARCHAR(n)` | A variable-length string with a maximum length of `n`. |
-| `CHAR(n)` | A fixed-length string of length `n`. |
-| `BYTEA` | A variable-length binary string (hex format, e.g., `\xDEADBEEF`). |
-| `JSONB` | A binary representation of a JSON object. |
-| `UUID` | A universally unique identifier. |
-| `TIMESTAMPTZ` | A timestamp with a time zone. |
-| `DATE` | A calendar date (year, month, day). |
-| `TIME` | A time of day. |
-| `type[]` | An array of any other supported type (e.g., `INTEGER[]`, `TEXT[]`). |
 
 ## Views
 

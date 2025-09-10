@@ -4,7 +4,7 @@ use super::ast::{AlterTableAction, AstStatement, CaseExpression, ColumnDef, Crea
     CreateSchemaStatement, CreateTableStatement, CreateViewStatement, DeleteStatement,
     DropTableStatement, DropViewStatement, ForeignKeyClause, InsertStatement, JoinClause,
     OrderByExpression, SelectColumn, SelectStatement, SimpleExpression, SimpleValue,
-    TableConstraint, TruncateTableStatement, UnionClause, UpdateStatement, AlterTableStatement};
+    TableConstraint, TruncateTableStatement, UnionClause, UpdateStatement, AlterTableStatement, InsertSource, OnConflict};
 
 // Very simple tokenizer
 fn tokenize(sql: &str) -> Vec<String> {
@@ -954,6 +954,16 @@ impl Parser {
         Ok(identifiers)
     }
 
+    fn parse_returning_clause(&mut self) -> Result<Vec<SelectColumn>> {
+        if self.current().map_or(false, |t| t.eq_ignore_ascii_case("RETURNING")) {
+            self.advance();
+            // The column list parser already handles expressions, aliases, and '*'
+            self.parse_column_list()
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
     fn parse_update(&mut self) -> Result<UpdateStatement> {
         self.expect("UPDATE")?;
         let table = self.parse_qualified_name()?;
@@ -972,6 +982,19 @@ impl Parser {
             }
         }
 
+        let mut from_list = Vec::new();
+        if self.current().map_or(false, |t| t.eq_ignore_ascii_case("FROM")) {
+            self.advance(); // consume FROM
+            loop {
+                from_list.push(self.parse_qualified_name()?);
+                if self.current() == Some(",") {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+
         let where_clause = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("WHERE")) {
             self.advance();
             Some(self.parse_expression()?)
@@ -979,10 +1002,14 @@ impl Parser {
             None
         };
 
+        let returning = self.parse_returning_clause()?;
+
         Ok(UpdateStatement {
             table,
             set: set_clauses,
+            from_list,
             where_clause,
+            returning,
         })
     }
 
@@ -991,6 +1018,19 @@ impl Parser {
         self.expect("FROM")?;
         let from_table = self.parse_qualified_name()?;
 
+        let mut using_list = Vec::new();
+        if self.current().map_or(false, |t| t.eq_ignore_ascii_case("USING")) {
+            self.advance(); // consume USING
+            loop {
+                using_list.push(self.parse_qualified_name()?);
+                if self.current() == Some(",") {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+
         let where_clause = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("WHERE")) {
             self.advance();
             Some(self.parse_expression()?)
@@ -998,10 +1038,56 @@ impl Parser {
             None
         };
 
+        let returning = self.parse_returning_clause()?;
+
         Ok(DeleteStatement {
             from_table,
+            using_list,
             where_clause,
+            returning,
         })
+    }
+
+    fn parse_on_conflict_clause(&mut self) -> Result<Option<(Vec<String>, OnConflict)>> {
+        if !self.current().map_or(false, |t| t.eq_ignore_ascii_case("ON")) {
+            return Ok(None);
+        }
+        self.advance(); // consume ON
+        self.expect("CONFLICT")?;
+
+        let mut target_columns = Vec::new();
+        if self.current() == Some("(") {
+            self.advance(); // consume (
+            target_columns = self.parse_identifier_list()?;
+            self.expect(")")?;
+        }
+
+        self.expect("DO")?;
+
+        let action = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("NOTHING")) {
+            self.advance(); // consume NOTHING
+            OnConflict::DoNothing
+        } else if self.current().map_or(false, |t| t.eq_ignore_ascii_case("UPDATE")) {
+            self.advance(); // consume UPDATE
+            self.expect("SET")?;
+            let mut set_clauses = Vec::new();
+            loop {
+                let column = self.parse_identifier()?;
+                self.expect("=")?;
+                let value = self.parse_expression()?;
+                set_clauses.push((column, value));
+                if self.current() == Some(",") {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            OnConflict::DoUpdate(set_clauses)
+        } else {
+            return Err(anyhow!("Expected NOTHING or UPDATE after DO"));
+        };
+
+        Ok(Some((target_columns, action)))
     }
 
     fn parse_insert(&mut self) -> Result<InsertStatement> {
@@ -1027,58 +1113,69 @@ impl Parser {
             self.expect(")")?;
         }
 
-        self.expect("VALUES")?;
-
-        let mut all_values = Vec::new();
-        loop {
-            self.expect("(")?;
-            let mut single_row_values = Vec::new();
-            if self.current() == Some(")") {
-                return Err(anyhow!("Values list cannot be empty"));
-            }
+        let source = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("VALUES")) {
+            self.advance(); // consume VALUES
+            let mut all_values = Vec::new();
             loop {
-                single_row_values.push(self.parse_expression()?);
+                self.expect("(")?;
+                let mut single_row_values = Vec::new();
+                if self.current() == Some(")") {
+                    return Err(anyhow!("Values list cannot be empty"));
+                }
+                loop {
+                    single_row_values.push(self.parse_expression()?);
+                    if self.current() == Some(",") {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(")")?;
+                all_values.push(single_row_values);
+
                 if self.current() == Some(",") {
                     self.advance();
                 } else {
                     break;
                 }
             }
-            self.expect(")")?;
-            all_values.push(single_row_values);
 
-            if self.current() == Some(",") {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-
-        if !columns.is_empty() {
-            for row_values in &all_values {
-                if columns.len() != row_values.len() {
+            if !columns.is_empty() {
+                for row_values in &all_values {
+                    if columns.len() != row_values.len() {
+                        return Err(anyhow!(
+                            "INSERT has mismatch between number of columns ({}) and values ({})",
+                            columns.len(),
+                            row_values.len()
+                        ));
+                    }
+                }
+            } else if all_values.len() > 1 {
+                let first_row_len = all_values[0].len();
+                if all_values.iter().any(|row| row.len() != first_row_len) {
                     return Err(anyhow!(
-                        "INSERT has mismatch between number of columns ({}) and values ({})",
-                        columns.len(),
-                        row_values.len()
+                        "INSERT with multiple rows must have the same number of values in each row"
                     ));
                 }
             }
-        } else if all_values.len() > 1 {
-            // If no columns are specified, all rows must have the same number of values.
-            let first_row_len = all_values[0].len();
-            if all_values.iter().any(|row| row.len() != first_row_len) {
-                return Err(anyhow!(
-                    "INSERT with multiple rows must have the same number of values in each row"
-                ));
-            }
-        }
+            InsertSource::Values(all_values)
+        } else if self.current().map_or(false, |t| t.eq_ignore_ascii_case("SELECT")) {
+            let select_stmt = self.parse_select()?;
+            InsertSource::Select(Box::new(select_stmt))
+        } else {
+            return Err(anyhow!("Expected VALUES or SELECT after INSERT INTO"));
+        };
 
+        let on_conflict = self.parse_on_conflict_clause()?;
+
+        let returning = self.parse_returning_clause()?;
 
         Ok(InsertStatement {
             table,
             columns,
-            values: all_values,
+            source,
+            on_conflict,
+            returning,
         })
     }
 

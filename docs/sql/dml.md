@@ -9,7 +9,9 @@ Adds a new row (a new key-value pair) to a table.
 ### Syntax
 ```sql
 INSERT INTO table_name (column1, column2, ...)
-VALUES (value1, value2, ...);
+VALUES (value1, value2, ...)
+[ON CONFLICT (target_column) DO UPDATE SET ... | ON CONFLICT DO NOTHING]
+[RETURNING column1, column2 | *];
 ```
 
 ### Behavior
@@ -20,13 +22,43 @@ VALUES (value1, value2, ...);
     - The operation will fail if a value cannot be cast (e.g., inserting `'hello'` into an `INTEGER` column).
 - The entire new row is stored as a single JSON object.
 
-### Example
+### `ON CONFLICT` Clause
+
+MemFlux supports an `ON CONFLICT` clause for `INSERT` statements to handle unique constraint violations, often referred to as an "upsert" operation.
+
+**Syntax:**
+```sql
+INSERT INTO table_name (...) VALUES (...)
+ON CONFLICT (column_name) DO UPDATE SET ...;
+
+INSERT INTO table_name (...) VALUES (...)
+ON CONFLICT (column_name) DO NOTHING;
+```
+
+**Behavior:**
+- The `(column_name)` specifies the column (or columns) with a `UNIQUE` or `PRIMARY KEY` constraint that might conflict.
+- **`DO NOTHING`**: If a conflict occurs, the `INSERT` operation is simply ignored.
+- **`DO UPDATE`**: If a conflict occurs, an `UPDATE` operation is performed on the existing row instead.
+    - In the `SET` clause of the `DO UPDATE` action, you can reference the values that were proposed for insertion using the special `excluded` table. For example, `SET name = excluded.name`.
+
+### `RETURNING` Clause
+
+The `RETURNING` clause can be used to return data from the row that was inserted or updated (in the case of `ON CONFLICT ... DO UPDATE`). You can return all columns with `*` or specify a list of columns.
+
+### Examples
 ```sql
 -- Assumes a 'users' table schema exists
 INSERT INTO users (id, name, age, is_active)
 VALUES ('user123', 'Alice', 30, true);
 ```
 This creates a key `users:user123` with a JSON value `{"name":"Alice","age":30,"is_active":true}`.
+
+```sql
+-- Insert a new user, or update their city if they already exist, and return the result
+INSERT INTO users (id, name, city) VALUES ('user123', 'Alice', 'SF')
+ON CONFLICT (id) DO UPDATE SET city = excluded.city
+RETURNING *;
+```
 
 ## `UPDATE`
 
@@ -36,7 +68,9 @@ Modifies existing rows in a table.
 ```sql
 UPDATE table_name
 SET column1 = value1, column2 = value2, ...
-[WHERE condition];
+[FROM from_list]
+[WHERE condition]
+[RETURNING column1, column2 | *];
 ```
 
 ### Behavior
@@ -45,12 +79,20 @@ SET column1 = value1, column2 = value2, ...
 - Like `INSERT`, the new values are cast to the types defined in the virtual schema, if one exists.
 - The operation is atomic at the row level; the entire JSON document for a key is rewritten.
 
+### `FROM` Clause
+You can include additional tables in an `UPDATE` statement using the `FROM` clause. This allows you to reference columns from other tables in your `WHERE` clause and `SET` expressions, similar to a `JOIN`.
+
+### `RETURNING` Clause
+
+The `RETURNING` clause can be used to return data from the rows that were updated. You can return all columns with `*` or specify a list of columns.
+
 ### Example
 ```sql
--- Update Alice's age and deactivate her account
+-- Update the age of a user based on information from another table
 UPDATE users
-SET age = 31, is_active = false
-WHERE name = 'Alice';
+SET age = users_metadata.age
+FROM users_metadata
+WHERE users.id = users_metadata.user_id;
 ```
 
 ## `DELETE`
@@ -59,7 +101,10 @@ Removes existing rows from a table.
 
 ### Syntax
 ```sql
-DELETE FROM table_name [WHERE condition];
+DELETE FROM table_name
+[USING using_list]
+[WHERE condition]
+[RETURNING column1, column2 | *];
 ```
 
 ### Behavior
@@ -67,8 +112,17 @@ DELETE FROM table_name [WHERE condition];
 - If no `WHERE` clause is provided, **all rows in the table are deleted**. This is the same behavior as `TRUNCATE TABLE`.
 - For each matching row, the underlying key is deleted from the database.
 
+### `USING` Clause
+You can include additional tables in a `DELETE` statement using the `USING` clause. This allows you to reference columns from other tables in your `WHERE` clause to determine which rows to delete.
+
+### `RETURNING` Clause
+
+The `RETURNING` clause can be used to return data from the rows that were deleted. You can return all columns with `*` or specify a list of columns.
+
 ### Example
 ```sql
--- Delete all inactive users
-DELETE FROM users WHERE is_active = false;
+-- Delete users who are marked for deletion in another table
+DELETE FROM users
+USING users_to_delete
+WHERE users.id = users_to_delete.user_id;
 ```

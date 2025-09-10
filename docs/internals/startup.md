@@ -23,10 +23,10 @@ The `main` function orchestrates the entire initialization sequence:
     *   It is spawned on a separate Tokio task to run in the background.
     *   This engine is responsible for receiving write commands via a channel (`Logger`), writing them to the active WAL file, and triggering snapshots when the WAL grows too large.
 
-4.  **Load Virtual Schemas:**
-    *   The `load_schemas_from_db` function is called.
-    *   It scans the newly loaded database for special keys prefixed with `_internal:schemas:`.
-    *   It parses the values of these keys into `VirtualSchema` structs and populates the `SchemaCache`. This makes table schemas available to the query engine immediately.
+4.  **Load Virtual Schemas and Views:**
+    *   The `load_schemas_from_db` function is called to scan the database for special keys prefixed with `_internal:schemas:`. It parses these into `VirtualSchema` structs and populates the `SchemaCache`.
+    *   Similarly, the `load_views_from_db` function is called to scan for keys prefixed with `_internal:views:`. It parses these into `ViewDefinition` structs and populates the `ViewCache`.
+    *   This makes all persisted table schemas and views available to the query engine immediately upon startup.
 
 5.  **Initialize Memory Manager:**
     *   A `MemoryManager` is created based on the `maxmemory_mb` and `eviction_policy` settings from the config.

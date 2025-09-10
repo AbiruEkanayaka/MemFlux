@@ -10,7 +10,7 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use super::ast::{AlterTableAction, TableConstraint};
-use super::logical_plan::{cast_value_to_type, Expression, JoinType, LogicalOperator, LogicalPlan, Operator};
+use super::logical_plan::{cast_value_to_type, Expression, JoinType, LogicalOperator, LogicalPlan, OnConflictAction, Operator};
 use super::physical_plan::PhysicalPlan;
 use crate::schema::{ColumnDefinition, DataType, VirtualSchema, SCHEMA_PREFIX, VIEW_PREFIX};
 use crate::types::{AppContext, Command, DbValue, LogEntry, LogRequest, Response, SchemaCache, ViewDefinition};
@@ -87,7 +87,6 @@ fn get_expression_type(
     }
 }
 
-/// Compares two serde_json Values, respecting the virtual data type.
 fn compare_typed_values(
     val_a: &Value,
     val_b: &Value,
@@ -138,6 +137,42 @@ fn compare_typed_values(
         (Value::Bool(b_a), Value::Bool(b_b)) => b_a.cmp(b_b),
         _ => Ordering::Equal,
     }
+}
+
+async fn project_row<'a>(
+    row: &'a Row,
+    expressions: &'a Vec<(Expression, Option<String>)>,
+    ctx: Arc<AppContext>,
+    outer_row: Option<&'a Row>,
+) -> Result<Row> {
+    let mut new_row = json!({});
+    let mut is_star = false;
+
+    if expressions.len() == 1 {
+        if let (Expression::Column(col_name), None) = &expressions[0] {
+            if col_name == "*" {
+                is_star = true;
+            }
+        }
+    }
+
+    if is_star {
+        // For DML returning, the row is not nested like in SELECT
+        if let Some(obj) = row.as_object() {
+            for (k, v) in obj {
+                if k != "_key" {
+                    new_row[k.clone()] = v.clone();
+                }
+            }
+        }
+    } else {
+        for (expr, alias) in expressions {
+            let val = expr.evaluate_with_context(row, outer_row, ctx.clone()).await?;
+            let name = alias.clone().unwrap_or_else(|| expr.to_string());
+            new_row[name] = val;
+        }
+    }
+    Ok(new_row)
 }
 
 pub fn execute<'a>(
@@ -605,43 +640,49 @@ pub fn execute<'a>(
 
                 yield json!({"status": "View dropped"});
             }
-            PhysicalPlan::Insert { table_name, columns, values } => {
+            PhysicalPlan::Insert { table_name, columns, source, source_column_names, on_conflict, returning } => {
                 let schema = ctx.schema_cache.get(&table_name);
+                let mut total_rows_affected = 0;
+                let mut returned_rows = Vec::new();
 
-                let insert_columns = if columns.is_empty() {
-                    if let Some(s) = &schema {
-                        if !s.column_order.is_empty() {
-                            s.column_order.clone()
+                // Step 1: Execute the source plan and collect all rows to prevent deadlocks.
+                let source_rows: Vec<Row> = execute(*source, ctx.clone(), outer_row).try_collect().await?;
+
+                // Step 2: Iterate over the collected rows to perform inserts.
+                for source_row in source_rows {
+                    let source_row_obj = source_row.as_object().ok_or_else(|| anyhow!("INSERT source did not produce an object"))?;
+
+                    let insert_columns = if columns.is_empty() {
+                        if let Some(s) = &schema {
+                            if !s.column_order.is_empty() {
+                                s.column_order.clone()
+                            } else {
+                                s.columns.keys().cloned().collect::<Vec<String>>()
+                            }
                         } else {
-                            s.columns.keys().cloned().collect::<Vec<String>>()
+                            Err(anyhow!("Cannot INSERT without column list into a table with no schema"))?
                         }
                     } else {
-                        Err(anyhow!("Cannot INSERT without column list into a table with no schema"))?
-                    }
-                } else {
-                    columns.clone()
-                };
+                        columns.clone()
+                    };
 
-                let mut total_rows_affected = 0;
-
-                for row_values in values {
-                    if insert_columns.len() != row_values.len() {
-                        Err(anyhow!("INSERT has mismatch between number of columns ({}) and values ({})", insert_columns.len(), row_values.len()))?;
+                    if insert_columns.len() != source_column_names.len() {
+                        Err(anyhow!("INSERT has mismatch between number of columns ({}) and values from source ({})", insert_columns.len(), source_column_names.len()))?;
                     }
 
                     let mut row_data = json!({});
 
-                    for (i, col_name) in insert_columns.iter().enumerate() {
-                        let val_expr = &row_values[i];
-                        let mut val = val_expr.evaluate_with_context(&json!({}), None, ctx.clone()).await?;
-
+                    for (i, target_col_name) in insert_columns.iter().enumerate() {
+                        let source_col_name = &source_column_names[i];
+                        let mut val = source_row_obj.get(source_col_name).cloned().unwrap_or(Value::Null);
                         if let Some(s) = &schema {
-                            if let Some(col_def) = s.columns.get(col_name) {
+                            if let Some(col_def) = s.columns.get(target_col_name) {
                                 val = cast_value_to_type(val, &col_def.data_type)?;
                             }
                         }
-                        row_data[col_name] = val;
+                        row_data[target_col_name] = val;
                     }
+
 
                     if let Some(s) = &schema {
                         for (col_name, col_def) in &s.columns {
@@ -662,7 +703,21 @@ pub fn execute<'a>(
                             }
                         }
 
-                        // Check UNIQUE constraints
+                        // Check CHECK constraints before insert/update
+                        for constraint in &s.constraints {
+                            if let TableConstraint::Check { name: _, expression } = constraint {
+                                let check_row = json!({ table_name.clone(): row_data.clone() });
+                                if !super::logical_plan::simple_expr_to_expression(expression.clone(), &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry)?.evaluate_with_context(&check_row, None, ctx.clone()).await?.as_bool().unwrap_or(false) {
+                                    Err(anyhow!("CHECK constraint failed for table '{}'", table_name))?;
+                                }
+                            }
+                        }
+                    }
+
+                    check_foreign_key_constraints(&table_name, &row_data, &ctx).await?;
+
+                    // Check UNIQUE constraints
+                    if let Some(s) = &schema {
                         for constraint in &s.constraints {
                             if let TableConstraint::Unique { name: _, columns } = constraint {
                                 if columns.len() == 1 { // Only single-column unique constraints are handled here
@@ -673,29 +728,19 @@ pub fn execute<'a>(
                                         if let Some(index) = ctx.index_manager.indexes.get(&full_index_name) {
                                             let index_key = serde_json::to_string(val)?;
                                             let index_data = index.read().await;
-                                            if index_data.contains_key(&index_key) {
-                                                Err(anyhow!("UNIQUE constraint failed for column '{}'", col_name))?;
+                                            if let Some(keys) = index_data.get(&index_key) {
+                                                // If the key already exists in the index, it's a unique violation
+                                                // unless it's the same key being updated (which is handled by ON CONFLICT)
+                                                if !keys.is_empty() {
+                                                    Err(anyhow!("UNIQUE constraint failed for column '{}'", col_name))?;
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
                         }
-
-                        // Check CHECK constraints
-                        for constraint in &s.constraints {
-                            if let TableConstraint::Check { name: _, expression } = constraint {
-                                let check_row = json!({ table_name.clone(): row_data.clone() });
-                                if !super::logical_plan::simple_expr_to_expression(expression.clone(), &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry)?.evaluate_with_context(&check_row, None, ctx.clone()).await?.as_bool().unwrap_or(false) {
-                                    Err(anyhow!("CHECK constraint failed for table '{}'", table_name))?;
-                                }
-                            }
-                        }
-
-                        
                     }
-
-                    check_foreign_key_constraints(&table_name, &row_data, &ctx).await?;
 
                     let pk_col = if let Some(s) = &schema {
                         s.constraints.iter().filter_map(|c| {
@@ -717,9 +762,63 @@ pub fn execute<'a>(
                     let key = format!("{}:{}", table_name, pk);
 
                     if ctx.db.contains_key(&key) {
-                        Err(anyhow!("PRIMARY KEY constraint failed for table '{}'. Key '{}' already exists.", table_name, key))?;
+                        if let Some((_target, action)) = &on_conflict {
+                            match action {
+                                OnConflictAction::DoNothing => {
+                                    // Skip this row
+                                    continue;
+                                }
+                                OnConflictAction::DoUpdate(set_clauses) => {
+                                    // This block is now self-contained to prevent deadlocks.
+                                    // It performs its own read, modify, and write cycle.
+                                    let mut current_val = match ctx.db.get(&key) {
+                                        Some(entry) => match entry.value() {
+                                            DbValue::JsonB(b) => serde_json::from_slice(b)?,
+                                            _ => json!({}),
+                                        },
+                                        None => continue, // Should not happen if we are in a conflict path
+                                    };
+
+                                    let excluded_row = json!({ "excluded": row_data.clone() });
+
+                                    for (col, expr) in set_clauses {
+                                        let mut val = expr.evaluate_with_context(&excluded_row, Some(&current_val), ctx.clone()).await?;
+                                        if let Some(s) = &schema {
+                                            if let Some(col_def) = s.columns.get(col) {
+                                                val = cast_value_to_type(val, &col_def.data_type)?;
+                                            }
+                                        }
+                                        current_val[col] = val;
+                                    }
+
+                                    let new_val_bytes = serde_json::to_vec(&current_val)?;
+                                    let log_entry = LogEntry::SetJsonB { key: key.clone(), value: new_val_bytes.clone() };
+                                    log_and_wait_qe!(ctx.logger, log_entry).await?;
+
+                                    // The original implementation was missing index updates here.
+                                    // This is a critical fix for data consistency.
+                                    let old_val_for_index = ctx.db.get(&key).and_then(|v| match v.value() {
+                                        DbValue::JsonB(b) => serde_json::from_slice(b).ok(),
+                                        _ => None,
+                                    }).unwrap_or_default();
+
+                                    ctx.index_manager.remove_key_from_indexes(&key, &old_val_for_index).await;
+                                    ctx.index_manager.add_key_to_indexes(&key, &current_val).await;
+
+                                    ctx.db.insert(key.clone(), DbValue::JsonB(new_val_bytes));
+                                    total_rows_affected += 1;
+                                    if !returning.is_empty() {
+                                        returned_rows.push(current_val);
+                                    }
+                                    continue;
+                                }
+                            }
+                        } else {
+                             Err(anyhow!("PRIMARY KEY constraint failed for table '{}'. Key '{}' already exists.", table_name, key))?;
+                        }
                     }
 
+                    // Standard insert path (no conflict)
                     let value_bytes = serde_json::to_vec(&row_data)?;
                     let log_entry = LogEntry::SetJsonB { key: key.clone(), value: value_bytes.clone() };
                     log_and_wait_qe!(ctx.logger, log_entry).await?;
@@ -730,101 +829,115 @@ pub fn execute<'a>(
 
                     ctx.db.insert(key, DbValue::JsonB(value_bytes));
                     total_rows_affected += 1;
+
+                    if !returning.is_empty() {
+                        returned_rows.push(row_data);
+                    }
                 }
-                yield json!({"rows_affected": total_rows_affected});
+
+                if !returning.is_empty() {
+                    for returned_row in returned_rows {
+                        let proj_row = project_row(&returned_row, &returning, ctx.clone(), outer_row).await?;
+                        yield proj_row;
+                    }
+                } else {
+                    yield json!({"rows_affected": total_rows_affected});
+                }
             }
-            PhysicalPlan::Delete { from } => {
+            PhysicalPlan::Delete { table_name, from, returning } => {
                 let stream = execute(*from, ctx.clone(), outer_row);
                 let rows_to_delete: Vec<Row> = stream.try_collect().await?;
 
                 for row in &rows_to_delete {
                     if let Some(obj) = row.as_object() {
-                        if let Some((table_name, table_obj)) = obj.iter().next() {
+                        if let Some(table_obj) = obj.get(&table_name) {
                             // table_obj is the inner JSON object, e.g., {"id": 1, "name": "Alice"}
-                            apply_on_delete_actions(table_name, table_obj, &ctx).await?;
+                            apply_on_delete_actions(&table_name, table_obj, &ctx).await?;
                         }
                     }
                 }
 
                 let keys_to_delete: Vec<String> = rows_to_delete.iter().filter_map(|row| {
-                     row.as_object()
-                        .and_then(|obj| obj.values().next())
+                     row.get(&table_name)
                         .and_then(|table_obj| table_obj.get("_key"))
                         .and_then(|k| k.as_str())
                         .map(|s| s.to_string())
                 }).collect();
 
                 let mut deleted_count = 0;
-                for key in keys_to_delete {
+                for key in &keys_to_delete {
                     let log_entry = LogEntry::Delete { key: key.clone() };
                     log_and_wait_qe!(ctx.logger, log_entry).await?;
-                    if ctx.db.remove(&key).is_some() {
+                    if ctx.db.remove(key).is_some() {
                         deleted_count += 1;
                     }
                 }
-                yield json!({"rows_affected": deleted_count});
+
+                if !returning.is_empty() {
+                    for returned_row in rows_to_delete {
+                        // The row from the plan is nested, e.g. {"users": {"id":1, ...}}
+                        // We need to un-nest it for projection.
+                        if let Some(inner_row) = returned_row.get(&table_name) {
+                            let proj_row = project_row(inner_row, &returning, ctx.clone(), outer_row).await?;
+                            yield proj_row;
+                        }
+                    }
+                } else {
+                    yield json!({"rows_affected": deleted_count});
+                }
             }
-            PhysicalPlan::Update { table_name, from, set } => {
+            PhysicalPlan::Update { table_name, from, set, returning } => {
                 let schema = ctx.schema_cache.get(&table_name);
                 let stream = execute(*from, ctx.clone(), outer_row);
                 let rows_to_update: Vec<Row> = stream.try_collect().await?;
 
-                // Check if any referenced key is being updated, which would require cascading checks.
-                // This check is now handled within apply_on_update_actions.
-
                 let mut updated_count = 0;
+                let mut returned_rows = Vec::new();
+
                 for row in rows_to_update {
-                    // The row from the 'from' plan is nested, e.g., {"user": {"name": "Alice", ...}}
-                    // We need to extract the _key from the nested object.
-                    let key = row.as_object()
-                        .and_then(|obj| obj.values().next())
-                        .and_then(|table_obj| table_obj.get("_key"))
-                        .and_then(|k| k.as_str())
-                        .map(|s| s.to_string());
+                    let table_part = match row.get(&table_name) {
+                        Some(part) => part,
+                        None => continue, // This row from the join doesn't have the target table, skip.
+                    };
 
-                    if let Some(key) = key {
-                        let old_val_for_index = ctx.db.get(&key).map(|v| match v.value() {
-                            DbValue::Json(j) => j.clone(),
-                            DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
-                            _ => Value::Null,
-                        }).unwrap_or_default();
+                    let key = match table_part.get("_key").and_then(|k| k.as_str()) {
+                        Some(k) => k.to_string(),
+                        None => continue, // No key found for this row, cannot update.
+                    };
 
-                        let mut new_val = old_val_for_index.clone();
+                    let old_val_for_index = table_part;
+                    let mut new_val = table_part.clone();
 
-                        for (col, expr) in &set {
-                            // Evaluate the SET expression against the full row context
-                            let mut val = expr.evaluate_with_context(&row, outer_row, ctx.clone()).await?;
+                    for (col, expr) in &set {
+                        let mut val = expr.evaluate_with_context(&row, outer_row, ctx.clone()).await?;
 
-                            if let Some(schema) = &schema {
-                                if let Some(col_def) = schema.columns.get(col) {
-                                    if !col_def.nullable && val.is_null() {
-                                        Err(anyhow!("NULL value in column '{}' violates not-null constraint", col))?;
-                                    }
-                                    val = cast_value_to_type(val, &col_def.data_type)?;
-                                }
-                            }
-                            new_val[col] = val;
-                        }
-
-                        // Apply ON UPDATE actions for foreign keys
-                        apply_on_update_actions(&table_name, &old_val_for_index, &new_val, &ctx).await?;
-
-                        // Check UNIQUE constraints
                         if let Some(schema) = &schema {
-                            for constraint in &schema.constraints {
-                                if let TableConstraint::Unique { name: _, columns } = constraint {
-                                    if columns.len() == 1 { // Only single-column unique constraints are handled here
-                                        let col_name = &columns[0];
-                                        if let Some(val) = new_val.get(col_name) {
-                                            let key_prefix = format!("{}:*", table_name);
-                                            let full_index_name = format!("{}|{}", key_prefix, col_name);
-                                            if let Some(index) = ctx.index_manager.indexes.get(&full_index_name) {
-                                                let index_key = serde_json::to_string(val)?;
-                                                let index_data = index.read().await;
-                                                if let Some(keys) = index_data.get(&index_key) {
-                                                    if !keys.contains(&key) { // Ensure it's not the same key
-                                                        Err(anyhow!("UNIQUE constraint failed for column '{}'", col_name))?;
-                                                    }
+                            if let Some(col_def) = schema.columns.get(col) {
+                                if !col_def.nullable && val.is_null() {
+                                    Err(anyhow!("NULL value in column '{}' violates not-null constraint", col))?;
+                                }
+                                val = cast_value_to_type(val, &col_def.data_type)?;
+                            }
+                        }
+                        new_val[col] = val;
+                    }
+
+                    apply_on_update_actions(&table_name, old_val_for_index, &new_val, &ctx).await?;
+
+                    if let Some(schema) = &schema {
+                        for constraint in &schema.constraints {
+                            if let TableConstraint::Unique { name: _, columns } = constraint {
+                                if columns.len() == 1 { // Only single-column unique constraints are handled here
+                                    let col_name = &columns[0];
+                                    if let Some(val) = new_val.get(col_name) {
+                                        let key_prefix = format!("{}:*", table_name);
+                                        let full_index_name = format!("{}|{}", key_prefix, col_name);
+                                        if let Some(index) = ctx.index_manager.indexes.get(&full_index_name) {
+                                            let index_key = serde_json::to_string(val)?;
+                                            let index_data = index.read().await;
+                                            if let Some(keys) = index_data.get(&index_key) {
+                                                if !keys.contains(&key) { // Ensure it's not the same key
+                                                    Err(anyhow!("UNIQUE constraint failed for column '{}'", col_name))?;
                                                 }
                                             }
                                         }
@@ -832,40 +945,49 @@ pub fn execute<'a>(
                                 }
                             }
                         }
+                    }
 
-                        // Check table-level CHECK constraint
-                        if let Some(schema) = &schema {
-                            for constraint in &schema.constraints {
-                                if let TableConstraint::Check { name: _, expression } = constraint {
-                                    // Wrap the new row value in a table-namespaced object
-                                    let check_row = json!({ table_name.clone(): new_val.clone() });
-                                    if !super::logical_plan::simple_expr_to_expression(expression.clone(), &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry)?.evaluate_with_context(&check_row, None, ctx.clone()).await?.as_bool().unwrap_or(false)
-                                    {
-                                        Err(anyhow!("CHECK constraint failed for table '{}'", table_name))?;
-                                    }
+                    if let Some(schema) = &schema {
+                        for constraint in &schema.constraints {
+                            if let TableConstraint::Check { name: _, expression } = constraint {
+                                let check_row = json!({ table_name.clone(): new_val.clone() });
+                                if !super::logical_plan::simple_expr_to_expression(expression.clone(), &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry)?.evaluate_with_context(&check_row, None, ctx.clone()).await?.as_bool().unwrap_or(false)
+                                {
+                                    Err(anyhow!("CHECK constraint failed for table '{}'", table_name))?;
                                 }
                             }
                         }
+                    }
 
-                        // Check foreign key constraints (for child table's FKs)
-                        check_foreign_key_constraints(&table_name, &new_val, &ctx).await?;
+                    check_foreign_key_constraints(&table_name, &new_val, &ctx).await?;
 
-                        let new_val_bytes = serde_json::to_vec(&new_val)?;
-                        let log_entry = LogEntry::SetJsonB { key: key.clone(), value: new_val_bytes.clone() };
-                        log_and_wait_qe!(ctx.logger, log_entry).await?;
+                    let new_val_bytes = serde_json::to_vec(&new_val)?;
+                    let log_entry = LogEntry::SetJsonB { key: key.clone(), value: new_val_bytes.clone() };
+                    log_and_wait_qe!(ctx.logger, log_entry).await?;
 
-                        ctx.index_manager
-                            .remove_key_from_indexes(&key, &old_val_for_index)
-                            .await;
-                        ctx.index_manager
-                            .add_key_to_indexes(&key, &new_val)
-                            .await;
+                    ctx.index_manager
+                        .remove_key_from_indexes(&key, old_val_for_index)
+                        .await;
+                    ctx.index_manager
+                        .add_key_to_indexes(&key, &new_val)
+                        .await;
 
-                        ctx.db.insert(key, DbValue::JsonB(new_val_bytes));
-                        updated_count += 1;
+                    ctx.db.insert(key, DbValue::JsonB(new_val_bytes));
+                    updated_count += 1;
+
+                    if !returning.is_empty() {
+                        returned_rows.push(new_val);
                     }
                 }
-                yield json!({"rows_affected": updated_count});
+
+                if !returning.is_empty() {
+                    for returned_row in returned_rows {
+                        let proj_row = project_row(&returned_row, &returning, ctx.clone(), outer_row).await?;
+                        yield proj_row;
+                    }
+                } else {
+                    yield json!({"rows_affected": updated_count});
+                }
             }
             PhysicalPlan::AlterTable { table_name, action } => {
                 let schema_key = format!("{}{}", SCHEMA_PREFIX, table_name);
@@ -1202,6 +1324,17 @@ pub fn execute<'a>(
                             yield row;
                         }
                     }
+                }
+            }
+            PhysicalPlan::Values { values } => {
+                for row_values in values {
+                    let mut row = json!({});
+                    for (i, value_expr) in row_values.iter().enumerate() {
+                        let value = value_expr.evaluate_with_context(&json!({}), None, ctx.clone()).await?;
+                        // Use a generic column name like "column_0", "column_1", etc.
+                        row[format!("column_{}", i)] = value;
+                    }
+                    yield row;
                 }
             }
         PhysicalPlan::CreateIndex { statement } => {

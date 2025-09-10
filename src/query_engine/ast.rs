@@ -84,16 +84,32 @@ pub struct SelectStatement {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OnConflict {
+    DoNothing,
+    DoUpdate(Vec<(String, SimpleExpression)>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum InsertSource {
+    Values(Vec<Vec<SimpleExpression>>),
+    Select(Box<SelectStatement>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InsertStatement {
     pub table: String,
     pub columns: Vec<String>,
-    pub values: Vec<Vec<SimpleExpression>>,
+    pub source: InsertSource,
+    pub on_conflict: Option<(Vec<String>, OnConflict)>,
+    pub returning: Vec<SelectColumn>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeleteStatement {
     pub from_table: String,
+    pub using_list: Vec<String>,
     pub where_clause: Option<SimpleExpression>,
+    pub returning: Vec<SelectColumn>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -226,7 +242,9 @@ pub struct CreateViewStatement {
 pub struct UpdateStatement {
     pub table: String,
     pub set: Vec<(String, SimpleExpression)>,
+    pub from_list: Vec<String>,
     pub where_clause: Option<SimpleExpression>,
+    pub returning: Vec<SelectColumn>,
 }
 
 
