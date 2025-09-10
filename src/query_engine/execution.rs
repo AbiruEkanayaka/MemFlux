@@ -771,7 +771,7 @@ pub fn execute<'a>(
                                 OnConflictAction::DoUpdate(set_clauses) => {
                                     // This block is now self-contained to prevent deadlocks.
                                     // It performs its own read, modify, and write cycle.
-                                    let mut current_val = match ctx.db.get(&key) {
+                                    let old_val = match ctx.db.get(&key) {
                                         Some(entry) => match entry.value() {
                                             DbValue::JsonB(b) => serde_json::from_slice(b)?,
                                             _ => json!({}),
@@ -779,36 +779,72 @@ pub fn execute<'a>(
                                         None => continue, // Should not happen if we are in a conflict path
                                     };
 
+                                    let mut new_val = old_val.clone();
                                     let excluded_row = json!({ "excluded": row_data.clone() });
 
                                     for (col, expr) in set_clauses {
-                                        let mut val = expr.evaluate_with_context(&excluded_row, Some(&current_val), ctx.clone()).await?;
+                                        let mut val = expr.evaluate_with_context(&excluded_row, Some(&old_val), ctx.clone()).await?;
                                         if let Some(s) = &schema {
                                             if let Some(col_def) = s.columns.get(col) {
+                                                if !col_def.nullable && val.is_null() {
+                                                    Err(anyhow!("NULL value in column '{}' violates not-null constraint", col))?;
+                                                }
                                                 val = cast_value_to_type(val, &col_def.data_type)?;
                                             }
                                         }
-                                        current_val[col] = val;
+                                        new_val[col] = val;
                                     }
 
-                                    let new_val_bytes = serde_json::to_vec(&current_val)?;
+                                    apply_on_update_actions(&table_name, &old_val, &new_val, &ctx).await?;
+
+                                    if let Some(s) = &schema {
+                                        for constraint in &s.constraints {
+                                            if let TableConstraint::Unique { name: _, columns } = constraint {
+                                                if columns.len() == 1 { // Only single-column unique constraints are handled here
+                                                    let col_name = &columns[0];
+                                                    if let Some(val) = new_val.get(col_name) {
+                                                        let key_prefix = format!("{}:*", table_name);
+                                                        let full_index_name = format!("{}|{}", key_prefix, col_name);
+                                                        if let Some(index) = ctx.index_manager.indexes.get(&full_index_name) {
+                                                            let index_key = serde_json::to_string(val)?;
+                                                            let index_data = index.read().await;
+                                                            if let Some(keys) = index_data.get(&index_key) {
+                                                                if !keys.contains(&key) { // Ensure it's not the same key
+                                                                    Err(anyhow!("UNIQUE constraint failed for column '{}'", col_name))?;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if let Some(s) = &schema {
+                                        for constraint in &s.constraints {
+                                            if let TableConstraint::Check { name: _, expression } = constraint {
+                                                let check_row = json!({ table_name.clone(): new_val.clone() });
+                                                if !super::logical_plan::simple_expr_to_expression(expression.clone(), &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry)?.evaluate_with_context(&check_row, None, ctx.clone()).await?.as_bool().unwrap_or(false)
+                                                {
+                                                    Err(anyhow!("CHECK constraint failed for table '{}'", table_name))?;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    check_foreign_key_constraints(&table_name, &new_val, &ctx).await?;
+
+                                    let new_val_bytes = serde_json::to_vec(&new_val)?;
                                     let log_entry = LogEntry::SetJsonB { key: key.clone(), value: new_val_bytes.clone() };
                                     log_and_wait_qe!(ctx.logger, log_entry).await?;
 
-                                    // The original implementation was missing index updates here.
-                                    // This is a critical fix for data consistency.
-                                    let old_val_for_index = ctx.db.get(&key).and_then(|v| match v.value() {
-                                        DbValue::JsonB(b) => serde_json::from_slice(b).ok(),
-                                        _ => None,
-                                    }).unwrap_or_default();
-
-                                    ctx.index_manager.remove_key_from_indexes(&key, &old_val_for_index).await;
-                                    ctx.index_manager.add_key_to_indexes(&key, &current_val).await;
+                                    ctx.index_manager.remove_key_from_indexes(&key, &old_val).await;
+                                    ctx.index_manager.add_key_to_indexes(&key, &new_val).await;
 
                                     ctx.db.insert(key.clone(), DbValue::JsonB(new_val_bytes));
                                     total_rows_affected += 1;
                                     if !returning.is_empty() {
-                                        returned_rows.push(current_val);
+                                        returned_rows.push(new_val);
                                     }
                                     continue;
                                 }
@@ -848,6 +884,7 @@ pub fn execute<'a>(
                 let stream = execute(*from, ctx.clone(), outer_row);
                 let rows_to_delete: Vec<Row> = stream.try_collect().await?;
 
+                // First, apply all ON DELETE actions. If any of these fail, we abort before any actual deletion.
                 for row in &rows_to_delete {
                     if let Some(obj) = row.as_object() {
                         if let Some(table_obj) = obj.get(&table_name) {
@@ -857,18 +894,26 @@ pub fn execute<'a>(
                     }
                 }
 
-                let keys_to_delete: Vec<String> = rows_to_delete.iter().filter_map(|row| {
-                     row.get(&table_name)
-                        .and_then(|table_obj| table_obj.get("_key"))
-                        .and_then(|k| k.as_str())
-                        .map(|s| s.to_string())
-                }).collect();
-
                 let mut deleted_count = 0;
-                for key in &keys_to_delete {
+                for row in &rows_to_delete {
+                    let table_part = match row.get(&table_name) {
+                        Some(part) => part,
+                        None => continue,
+                    };
+
+                    let key = match table_part.get("_key").and_then(|k| k.as_str()) {
+                        Some(k) => k.to_string(),
+                        None => continue,
+                    };
+
+                    // Remove from indexes BEFORE removing from DB
+                    ctx.index_manager
+                        .remove_key_from_indexes(&key, table_part)
+                        .await;
+
                     let log_entry = LogEntry::Delete { key: key.clone() };
                     log_and_wait_qe!(ctx.logger, log_entry).await?;
-                    if ctx.db.remove(key).is_some() {
+                    if ctx.db.remove(&key).is_some() {
                         deleted_count += 1;
                     }
                 }

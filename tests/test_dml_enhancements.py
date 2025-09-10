@@ -26,7 +26,7 @@ def test_dml_enhancements(sock, reader):
                         print(f"[WARN] Incomplete bulk string at line {i}")
                         break
                     row_json = extract_json_from_bulk(bulk_string)
-                    if row_json:
+                    if row_json is not None:
                         results.append(row_json)
                     i += 2
                 except IndexError:

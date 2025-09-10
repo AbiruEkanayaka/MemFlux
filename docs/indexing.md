@@ -51,7 +51,7 @@ Or using the alias:
 > CREATEINDEX user:* ON profile.city
 +OK
 ```
-The `CREATEINDEX` alias automatically generates an index name for you. The generated name is created by joining the prefix (without the trailing `*`) and the path with underscores (e.g., `user_profile_city`).
+The `CREATEINDEX` alias automatically generates an index name by concatenating the key prefix (with trailing `*` removed) and the JSON path, separated by underscores. It only trims `*` from the prefix and replaces `.` in the path with `_`; no other normalization (such as lowercasing or collapsing non-alphanumerics) is performed. For example, `user:*` + `profile.city` → `user:_profile_city`.
 
 When an index is created, MemFlux automatically **backfills** it by scanning all existing keys matching the prefix and adding them to the index.
 
