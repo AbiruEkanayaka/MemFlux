@@ -36,9 +36,9 @@ class _FFIResponse(ctypes.Structure):
     _fields_ = [
         ("response_type", ctypes.c_int),
         ("string_value", ctypes.c_char_p),
-        ("bytes_value", ctypes.c_char_p),
+        ("bytes_value", ctypes.c_void_p),
         ("bytes_len", ctypes.c_size_t),
-        ("multi_bytes_value", ctypes.POINTER(ctypes.c_char_p)),
+        ("multi_bytes_value", ctypes.POINTER(ctypes.c_void_p)),
         ("multi_bytes_lens", ctypes.POINTER(ctypes.c_size_t)),
         ("multi_bytes_count", ctypes.c_size_t),
         ("integer_value", ctypes.c_int64),

@@ -31,11 +31,13 @@ LIB_PATH = "./target/debug/libmemflux.so"
 # Configuration for the database instance.
 # These are the same settings as the persistence/memory sections of config.json
 DB_CONFIG = {
-    "wal_file": "memflux_py.wal",
-    "snapshot_file": "memflux_py.snapshot",
-    "wal_size_threshold_mb": 128,
-    "maxmemory_mb": 256,
-    "eviction_policy": "lru"
+  "wal_file": "memflux.wal",
+  "wal_overflow_file": "memflux.wal.overflow",
+  "snapshot_file": "memflux.snapshot",
+  "snapshot_temp_file": "memflux.snapshot.tmp",
+  "wal_size_threshold_mb": 128,
+  "maxmemory_mb": 0,
+  "eviction_policy": "lru",
 }
 
 # --- 2. Connecting to the Database ---
@@ -110,7 +112,3 @@ The library defines a clear exception hierarchy:
 - `memflux.DatabaseError`: An error reported by the core MemFlux engine (e.g., a SQL syntax error, a key not found, etc.).
 
 It's recommended to wrap database operations in a `try...except` block to handle these potential errors.
-
-```python
-
-```
