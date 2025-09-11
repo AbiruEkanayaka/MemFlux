@@ -206,18 +206,30 @@ pub fn logical_to_physical_plan(
             on_conflict,
             returning,
         } => {
-            let source_column_names = if let LogicalPlan::Projection { ref expressions, .. } = *source {
+            let mut current_source = &*source;
+            loop {
+                match current_source {
+                    LogicalPlan::Sort { input, .. } => current_source = input,
+                    LogicalPlan::Limit { input, .. } => current_source = input,
+                    _ => break,
+                }
+            }
+
+            let source_column_names = if let LogicalPlan::Projection { expressions, .. } = current_source {
                 expressions.iter().map(|(expr, alias)| {
                     alias.clone().unwrap_or_else(|| expr.to_string())
                 }).collect()
-            } else if let LogicalPlan::Values { ref values } = *source {
+            } else if let LogicalPlan::Values { values } = current_source {
                 if let Some(first_row) = values.get(0) {
                     (0..first_row.len()).map(|i| format!("column_{}", i)).collect()
                 } else {
                     vec![]
                 }
             } else {
-                vec![] // Should not happen for valid plans
+                // This case can be hit for INSERT ... SELECT * FROM ...
+                // where the projection is not explicit. We can try to get columns from the underlying scan.
+                // For now, we'll rely on the logical plan having an explicit projection.
+                vec![]
             };
 
             Ok(PhysicalPlan::Insert {

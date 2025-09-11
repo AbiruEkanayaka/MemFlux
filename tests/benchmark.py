@@ -23,19 +23,10 @@ def benchmark_ops_sec(sock, reader, parts, duration_sec, pipeline_size=1000):
     """
     print(f"Benchmarking ops/sec for {duration_sec} seconds (pipeline size: {pipeline_size})...")
     
-    # Pre-encode the command to send
-    resp = f"*{len(parts)}\r\n"
-    for p in parts:
-        p_bytes = p.encode('utf-8')
-        resp += f"${len(p_bytes)}\r\n"
-        resp += p
-        resp += "\r\n"
-    command_bytes = resp.encode('utf-8')
-
     # Send one command to make sure connection is ok and warm up
     try:
-        sock.sendall(command_bytes)
-        read_resp_response(reader)
+        # Use send_resp_command for initial warm-up, it handles both socket and FFI
+        send_resp_command(sock, reader, parts)
     except Exception as e:
         print(f"Initial command failed, aborting benchmark: {e}")
         return
@@ -44,23 +35,17 @@ def benchmark_ops_sec(sock, reader, parts, duration_sec, pipeline_size=1000):
     ops_count = 0
     
     while time.time() - start_time < duration_sec:
-        # Send a pipeline of commands
-        pipeline_data = command_bytes * pipeline_size
-        try:
-            sock.sendall(pipeline_data)
-        except BrokenPipeError:
-            print("[ERROR] Connection closed by server (Broken pipe).")
-            break
-            
-        # Read responses for the pipeline
+        # For FFI, pipelining means sending commands sequentially without waiting for
+        # the network roundtrip, but still waiting for the FFI call to complete.
+        # For socket, it means sending multiple commands before reading responses.
+        # To unify, we'll just call send_resp_command repeatedly.
         try:
             for _ in range(pipeline_size):
-                read_resp_response(reader)
-            ops_count += pipeline_size
+                # send_resp_command handles both socket and FFI modes
+                send_resp_command(sock, reader, parts)
+                ops_count += 1
         except Exception as e:
-            print(f"[ERROR] Failed to read/parse RESP response during benchmark: {e}")
-            # After a read error, the stream is likely out of sync.
-            # It's better to stop than to report incorrect numbers.
+            print(f"[ERROR] Command execution failed during benchmark: {e}")
             break
 
     end_time = time.time()
@@ -73,6 +58,7 @@ def benchmark_ops_sec(sock, reader, parts, duration_sec, pipeline_size=1000):
     print(f"  Total operations: {ops_count}")
     print(f"  Total time:       {actual_duration:.2f} seconds")
     print(f"  Operations/sec:   {ops_per_sec:,.2f}")
+
 
 
 

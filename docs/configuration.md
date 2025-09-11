@@ -40,6 +40,10 @@ Here is an example `config.json` with all available options:
 -   `cert_file` (string): The path to the TLS certificate file (in PEM format). Default: `"memflux.crt"`.
 -   `key_file` (string): The path to the TLS private key file (in PEM format). Default: `"memflux.key"`.
 
+## FFI / Library Configuration
+
+When using MemFlux as an embedded library via the FFI, a slightly different configuration structure is used. The network-related options (`host`, `port`, `requirepass`, `encrypt`, etc.) are omitted. The Python `memflux.connect()` helper function accepts a dictionary with the following persistence and memory keys.
+
 ## TLS Encryption
 
 When `encrypt` is set to `true`, MemFlux will listen for TLS connections. If the specified `cert_file` and `key_file` do not exist on startup, the server will automatically generate a new self-signed certificate and key, saving them to the specified paths. This allows for immediate secure connections for testing and development purposes.
