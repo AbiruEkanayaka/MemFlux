@@ -1,52 +1,57 @@
-# Internals: Server Startup Sequence
+# Internals: Server & Library Initialization
 
-This document outlines the step-by-step process the MemFlux server follows when it starts up.
+This document outlines the step-by-step process MemFlux follows when it starts up. Due to the refactoring to support both a server and a library, the initialization logic is now centralized in `src/lib.rs` and used by both the server (`src/main.rs`) and the FFI layer (`src/ffi.rs`).
 
-**Source File:** `src/main.rs`
+**Source Files:**
+*   `src/lib.rs` (Core initialization logic)
+*   `src/main.rs` (Server entry point)
+*   `src/ffi.rs` (Library entry point)
 
-The `main` function orchestrates the entire initialization sequence:
+## Central Initialization: `MemFluxDB::open_with_config`
 
-1.  **Load Configuration:**
-    *   The server looks for a `config.json` file in its working directory.
-    *   If found, it's parsed into the `Config` struct.
-    *   If not found, a default `config.json` is created and then loaded.
-    *   This `Config` is wrapped in an `Arc` to be shared safely across threads.
+The core of the startup sequence resides in the `MemFluxDB::open_with_config` function in `src/lib.rs`. This asynchronous function is responsible for creating a fully-hydrated database instance.
 
-2.  **Load Database from Disk:**
+1.  **Load Database from Disk:**
     *   The `load_db_from_disk` function from `src/persistence.rs` is called.
-    *   It first attempts to load the most recent snapshot file (`memflux.snapshot`). This is a compressed file that quickly restores the bulk of the data.
-    *   It then replays the records from the Write-Ahead Log (WAL) files (`memflux.wal` and `memflux.wal.overflow`) to restore any data that was written after the last snapshot was taken. This brings the database to a fully up-to-date state.
+    *   It first loads the most recent snapshot file (`memflux.snapshot`).
+    *   It then replays the records from the WAL files (`memflux.wal` and `memflux.wal.overflow`) to restore any data written after the last snapshot.
     *   The result is a `Db` (`Arc<DashMap<String, DbValue>>`), the core in-memory data store.
 
-3.  **Start Persistence Engine:**
-    *   A `PersistenceEngine` is initialized.
-    *   It is spawned on a separate Tokio task to run in the background.
-    *   This engine is responsible for receiving write commands via a channel (`Logger`), writing them to the active WAL file, and triggering snapshots when the WAL grows too large.
+2.  **Start Persistence Engine:**
+    *   A `PersistenceEngine` is initialized and spawned on a separate Tokio task.
+    *   This engine receives write commands via a channel (`Logger`), writes them to the active WAL file, and triggers snapshots when the WAL grows too large.
 
-4.  **Load Virtual Schemas and Views:**
-    *   The `load_schemas_from_db` function is called to scan the database for special keys prefixed with `_internal:schemas:`. It parses these into `VirtualSchema` structs and populates the `SchemaCache`.
-    *   Similarly, the `load_views_from_db` function is called to scan for keys prefixed with `_internal:views:`. It parses these into `ViewDefinition` structs and populates the `ViewCache`.
-    *   This makes all persisted table schemas and views available to the query engine immediately upon startup.
+3.  **Load Virtual Schemas and Views:**
+    *   The database is scanned for special keys (`_internal:schemas:` and `_internal:views:`) to populate the `SchemaCache` and `ViewCache`. This makes all persisted table schemas and views available immediately.
 
-5.  **Initialize Memory Manager:**
-    *   A `MemoryManager` is created based on the `maxmemory_mb` and `eviction_policy` settings from the config.
-    *   If `maxmemory_mb` is greater than 0, the manager calculates the initial memory usage by iterating through all the data loaded from disk.
-    *   The eviction policy data structures are then "primed" with all the keys from the database. For example, for the LRU policy, all keys are added to the LRU list.
+4.  **Initialize Memory Manager:**
+    *   A `MemoryManager` is created based on the `maxmemory_mb` and `eviction_policy` settings.
+    *   It calculates the initial memory usage of the data loaded from disk.
+    *   The eviction policy data structures (e.g., LRU list) are "primed" with all the keys from the database.
 
-6.  **Enforce `maxmemory` Limit:**
-    *   If the initial memory usage exceeds the `maxmemory_mb` limit, the server immediately begins evicting keys *before* accepting any connections.
-    *   It continues evicting keys according to the configured policy until the memory usage is below the limit. This ensures the server always starts within its configured memory bounds.
+5.  **Enforce `maxmemory` Limit:**
+    *   If the initial memory usage exceeds the `maxmemory_mb` limit, the server immediately begins evicting keys until the memory usage is below the limit. This ensures the server always starts within its configured memory bounds.
 
-7.  **Set Up Application Context:**
+6.  **Construct Application Context:**
     *   An `AppContext` struct is created. This struct bundles all the shared state of the server (the `Db`, `Logger`, `SchemaCache`, `IndexManager`, `MemoryManager`, `Config`, etc.) into a single `Arc`.
-    *   This context is cloned for each new client connection, giving them safe, shared access to the server's state.
 
-8.  **Start TCP Listener:**
-    *   The server binds to the `host` and `port` specified in the config.
-    *   **TLS Setup:** If `encrypt` is `true` in the config, it loads the specified TLS certificate and key. If they don't exist, it generates a self-signed certificate and key for immediate use in development.
-    *   The server enters its main loop, calling `listener.accept().await` to wait for new connections.
+7.  **Return `MemFluxDB` Instance:**
+    *   The function returns a `MemFluxDB` struct, which holds the `AppContext` and the handle to the persistence task, ready for use.
 
-9.  **Handle Connections:**
-    *   For each new connection, a new Tokio task is spawned.
-    *   If TLS is enabled, the TLS handshake is performed.
-    *   The connection is passed to the `handle_connection` function, which reads RESP commands, processes them, and writes responses back to the client.
+## Entry Points
+
+### Server (`src/main.rs`)
+
+The `memflux-server` binary has a very simple `main` function:
+1.  It calls `MemFluxDB::open("config.json")`, which loads the config file and then calls the central `open_with_config` function.
+2.  It takes the returned `MemFluxDB` instance.
+3.  It binds a TCP listener to the configured `host` and `port`.
+4.  It enters a loop, accepting new connections and spawning a Tokio task for each one to be handled by `handle_connection`.
+
+### FFI Library (`src/ffi.rs`)
+
+When used as a library, the entry point is `memflux_open`:
+1.  It receives a JSON configuration string from the C caller.
+2.  It deserializes this into an `FFIConfig` and then converts it into a standard `Config` object.
+3.  It calls `MemFluxDB::open_with_config` with this config, blocking on the result since it's a C function.
+4.  If successful, it wraps the `MemFluxDB` instance in a `Box` and returns it as an opaque pointer (`MemFluxDBHandle`) to the C caller.

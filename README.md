@@ -29,7 +29,9 @@
 
 ## What is MemFlux?
 
-MemFlux is an experimental, high-performance, in-memory, multi-model database server built in Rust. It aims to blend the speed and simplicity of key-value stores like Redis with the powerful querying capabilities of a SQL database.
+MemFlux is an experimental, high-performance, in-memory, multi-model database engine built in Rust. It aims to blend the speed and simplicity of key-value stores like Redis with the power and flexibility of SQL databases.
+
+Database is designed with a dual-purpose architecture: it can be run as a **standalone server** (compatible with the Redis protocol) or be **embedded directly** into your applications as a library via a C-compatible FFI. This approach allows MemFlux to function as both a fast, networked database  and a powerful, in-process database for languages like Python, C++, and more.
 
 **Core Features:**
 
@@ -44,11 +46,13 @@ MemFlux is an experimental, high-performance, in-memory, multi-model database se
     *   Rich Data Types: `INTEGER`, `TEXT`, `TIMESTAMPTZ`, `NUMERIC`, `UUID`, `BYTEA`, arrays (`INTEGER[]`), and more.
     *   Advanced Constraints: `PRIMARY KEY`, `UNIQUE`, `CHECK`, and `FOREIGN KEY` with referential actions (`ON DELETE CASCADE`, `ON UPDATE SET NULL`, etc.).
     *   A rich function library (`LOWER`, `NOW()`, `DATE_PART`, `ABS()`, etc.).
-*   **Redis (RESP) Compatible Protocol:** Use your favorite Redis client or the provided interactive script to connect and issue commands.
+*   **Dual-Mode Operation:**
+    *   **Standalone Server:** Run as a TCP server with a Redis-compatible (RESP) protocol.
+    *   **Embedded Library:** Integrate directly into your application via a C-compatible Foreign Function Interface (FFI) for zero-latency, in-process database operations.
 *   **Durable Persistence:** Durability is achieved through a Write-Ahead Log (WAL) and periodic snapshotting, ensuring your data is safe even if the server restarts.
 *   **Secondary Indexing:** Create indexes on JSON fields to dramatically accelerate SQL query performance.
 *   **Configurable Memory Management:** Set a `maxmemory` limit and choose from multiple eviction policies (`LRU`, `LFU`, `ARC`, `LFRU`, `Random`) to control memory usage.
-*   **TLS Encryption:** Secure client connections with TLS, with automatic self-signed certificate generation for easy setup.
+*   **TLS Encryption:** Secure client connections with TLS when running in server mode.
 
 > **Note:** As this is an alpha project, many of the features listed above are still under heavy development and may be incomplete or unstable.
 
@@ -61,149 +65,96 @@ While this README provides a quick start, the complete documentation contains a 
 Key sections include:
 
 *   **[Configuration](./docs/configuration.md):** How to configure the server, including memory limits, persistence, and TLS.
-*   **[Data Types](./docs/types.md):** An overview of the core data types (JSON, Lists, Sets) and the SQL type system.
+*   **[Python Library Guide](./docs/python_library.md):** A guide for using MemFlux as an embedded library in Python.
 *   **[Commands](./docs/commands.md):** Detailed reference for all non-SQL, Redis-style commands.
 *   **[SQL Reference](./docs/sql.md):** A comprehensive guide to the SQL engine, from DDL to complex `SELECT` queries.
-*   **[Persistence](./docs/persistence.md):** An explanation of how data durability is achieved.
-*   **[Indexing](./docs/indexing.md):** Guide to creating and using indexes for performance.
 
 ## How to Use It
 
-### Running the Server
+MemFlux can be used in two primary ways: as a standalone server or as an embedded library.
 
-1.  **Clone the repository:**
+### 1. As a Standalone Server
+
+In this mode, MemFlux runs as a background process and accepts client connections over the network using the Redis (RESP) protocol.
+
+**Running the Server:**
+1.  **Build the server:**
     ```sh
-    git clone https://github.com/AbiruEkanayaka/MemFlux.git
-    cd MemFlux
+    cargo build --release
     ```
-2.  **Build and run the server:**
+2.  **Run the server binary:**
     ```sh
-    cargo run --release
+    ./target/release/memflux-server
     ```
 The server will start and listen on `127.0.0.1:8360`.
 
-### Connecting to the Server
-
-You can connect using any Redis-compatible client. Alternatively, the project includes a Python-based interactive client and test runner.
-
+**Connecting to the Server:**
+You can connect using any Redis-compatible client. For interactive use, the included Python script is recommended:
 ```sh
-# Ensure you have the prompt-toolkit for the best experience
-pip install prompt-toolkit
-
 # Run the interactive client
 python3 test.py
 ```
 
-You can now enter commands at the `>` prompt.
+### 2. As an Embedded Library (via FFI)
 
-### Command Examples
+In this mode, the database engine is loaded directly into your application's process, eliminating network overhead and providing direct, high-performance access.
 
-#### 1. Key-Value Commands (Redis Style)
+The primary interface for this is the Python library included in `libs/python/`.
 
-```redis
-# Set a simple key-value pair
-> SET mykey "Hello World"
-+OK
+**Using the Python Library:**
+1.  **Build the dynamic library:**
+    ```sh
+    cargo build --release
+    ```
+2.  **Use the `memflux` Python module in your script:**
 
-# Get the value
-> GET mykey
-$11
-Hello World
+    ```python
+    import libs.python.memflux # Provided python lib relative from project source.\
+    import sys
 
-# Delete the key
-> DELETE mykey
-:1
-```
+    # Path to the compiled shared library
+    if sys.platform == "win32":
+        LIB_PATH = "./target/release/memflux.dll"
+    elif sys.platform == "darwin":
+        LIB_PATH = "./target/release/libmemflux.dylib"
+    else:
+        LIB_PATH = "./target/release/libmemflux.so"
 
-#### 2. JSON Document Commands
+    # Configuration for the database instance
+    DB_CONFIG = {
+      "wal_file": "memflux.wal",
+      "wal_overflow_file": "memflux.wal.overflow",
+      "snapshot_file": "memflux.snapshot",
+      "snapshot_temp_file": "memflux.snapshot.tmp",
+      "wal_size_threshold_mb": 128,
+      "maxmemory_mb": 0,
+      "eviction_policy": "lru"
+    }
 
-MemFlux allows you to treat keys as JSON documents and manipulate them with a simple path syntax.
+    # Connect to the database (loads it in-process)
+    conn = memflux.connect(config=DB_CONFIG, lib=LIB_PATH)
 
-```redis
-# Set a full JSON object for a user
-> JSON.SET user:1 '{"name": "Alice", "age": 30, "city": "SF", "active": true}'
-+OK
+    with conn.cursor() as cur:
+        cur.execute("SQL CREATE TABLE products (id INT, name TEXT, price REAL)")
+        cur.execute("SQL INSERT INTO products VALUES (?, ?, ?)", (1, "Laptop", 1200.50))
+        
+        cur.execute("SQL SELECT name, price FROM products WHERE price > ?", (1000,))
+        product = cur.fetchone()
+        print(product) # Output: {'name': 'Laptop', 'price': 1200.5}
 
-# Get the full document
-> JSON.GET user:1
-$59
-{"active":true,"age":30,"city":"SF","name":"Alice"}
-
-# Get a specific field from the document
-> JSON.GET user:1.name
-$7
-"Alice"
-
-# Set/update a specific field
-> JSON.SET user:1.age '31'
-+OK
-
-# Get the updated document
-> JSON.GET user:1
-$60
-{"active":true,"age":31,"city":"SF","name":"Alice"}
-```
-
-#### 3. SQL Query Engine
-
-This is the most powerful feature of MemFlux. You can run SQL queries directly against your key-value data. The engine treats key prefixes (like `user:`) as tables.
-
-**DDL: Creating a Virtual Schema**
-
-While MemFlux is schemaless by default, you can enforce types and structure with `CREATE TABLE`. This enables type validation on `INSERT`/`UPDATE` and type-aware sorting.
-
-```sql
-> SQL CREATE TABLE user (id INTEGER, name TEXT, age INTEGER, city TEXT, active BOOLEAN)
-+OK
-```
-
-**DML: Inserting and Modifying Data**
-
-```sql
--- Insert a new user. Values are automatically cast to the schema types.
-> SQL INSERT INTO user (id, name, age, city, active) VALUES ('2', 'Bob', '25', 'NY', 'true')
-:1
-
--- Update data using a WHERE clause
-> SQL UPDATE user SET city = 'New York' WHERE name = 'Bob'
-:1
-```
-
-**DQL: Selecting and Joining Data**
-
-```sql
--- Select specific columns from the 'user' table
-> SQL SELECT name, age FROM user WHERE city = 'SF' ORDER BY age DESC
-*1
-$23
-{"name":"Alice","age":31}
-
--- Let's add another table for orders
-> JSON.SET orders:1 '{"order_id": 101, "user_id": "1", "item": "Laptop"}'
-+OK
-> JSON.SET orders:2 '{"order_id": 102, "user_id": "2", "item": "Mouse"}'
-+OK
-
--- Perform a JOIN between users and orders
-> SQL SELECT user.name, orders.item FROM user JOIN orders ON user.id = orders.user_id
-*2
-$32
-{"user.name":"Alice","orders.item":"Laptop"}
-$29
-{"user.name":"Bob","orders.item":"Mouse"}
-```
+    conn.close()
+    ```
+For a more detailed guide, see the **[Python Library Guide](./docs/python_library.md)**.
 
 ## How It Works (A Basic Overview)
 
 > **Note:** This is a simplified explanation of an alpha-stage project. The implementation details are subject to change.
 
-1.  **Core Storage:** At its heart, MemFlux uses a `DashMap`, a highly concurrent hash map, to store all data in memory. This allows for fast, thread-safe access to keys.
+1.  **Core Library (`src/lib.rs`):** The core database logic is encapsulated in a Rust library. This library manages the in-memory storage (`DashMap`), persistence, indexing, and the SQL query engine. It exposes a high-level `MemFluxDB` struct.
 
-2.  **Protocol Layer:** A Tokio-based TCP server listens for connections. It parses the incoming byte stream according to the Redis Serialization Protocol (RESP), converting client requests into an internal `Command` struct.
+2.  **Server Binary (`src/main.rs`):** The `memflux-server` binary is a lightweight wrapper around the core library. It handles TCP connections, TLS, and uses the RESP protocol to parse client requests, which it passes to the `MemFluxDB` instance.
 
-3.  **Command Dispatch:** Based on the command name (`SET`, `JSON.SET`, `SQL`, etc.), the request is dispatched to the appropriate handler.
-    *   **Simple Commands** (`GET`, `LPUSH`, etc.) directly manipulate the in-memory `DashMap`.
-    *   **SQL Commands** are sent to the Query Engine.
+3.  **FFI Layer (`src/ffi.rs`):** A C-compatible Foreign Function Interface exposes the core library's functionality, allowing it to be loaded and used directly by other languages (like Python's `ctypes` module) for in-process execution.
 
 4.  **Persistence Engine:** To prevent data loss, every write operation is first serialized and written to a **Write-Ahead Log (WAL)** file (`memflux.wal`) on disk.
     *   The client receives an "OK" confirmation only after the write has been committed to the WAL.

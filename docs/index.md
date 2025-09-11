@@ -45,7 +45,7 @@ By default, the server listens on `127.0.0.1:8360`.
 
 ### Interacting with MemFlux
 
-You can interact with MemFlux using any RESP-compliant client or the provided Python test client.
+You can interact with MemFlux using any RESP-compliant client or the provided Python test client. The test client can connect to the server or load the database as an in-process library via FFI.
 
 **Interactive CLI:**
 
@@ -75,13 +75,16 @@ The `test.py` script can be used as an interactive client for sending commands.
 
 The `test.py` script is also the entry point for running unit tests and benchmarks.
 
-*   **Run all unit tests:**
+*   **Run all unit tests (against live server):**
     ```sh
+    # Make sure server is running in another terminal
     python3 test.py unit all
     ```
-*   **Run a specific test suite (e.g., SQL tests):**
+*   **Run all unit tests (using FFI):**
     ```sh
-    python3 test.py unit sql
+    # No server needed. Build the library first.
+    cargo build
+    python3 test.py --ffi ./target/debug/libmemflux.so unit all
     ```
 *   **Run a benchmark:**
     ```sh
@@ -89,7 +92,7 @@ The `test.py` script is also the entry point for running unit tests and benchmar
     python3 test.py bench 10000 SET foo bar
 
     # Benchmark operations/second for 10 seconds
-    python3 test.py bench-ops 10 LPUSH mylist item
+    python3 test.py bench-ops 100 10 LPUSH mylist item
     ```
 
 ## Documentation Structure
@@ -100,6 +103,7 @@ This documentation is organized into the following sections:
 *   **[Commands](./commands.md):** Detailed reference for all non-SQL, Redis-style commands.
 *   **[Data Types](./types.md):** An overview of the core data types and the SQL type system.
 *   **[SQL Reference](./sql.md):** An introduction to the SQL engine and links to detailed sections.
+*   **[Python Library Guide](./python_library.md):** A guide for using MemFlux as an embedded library in Python.
 *   **[Persistence](./persistence.md):** An explanation of how data durability is achieved through WAL and snapshots.
 *   **[Indexing](./indexing.md):** Guide to creating and using indexes for JSON data.
 *   **[Memory Management](./memory.md):** How to configure memory limits and the eviction policy.

@@ -6,9 +6,11 @@ While the main documentation provides a user-focused overview, these documents d
 
 ## Core Systems
 
-*   **[Server Startup Sequence](./startup.md):** A step-by-step guide to the server's initialization process, from loading the configuration to accepting client connections.
+*   **[Server & Library Initialization](./startup.md):** A step-by-step guide to the initialization process, both for the server and when used as a library.
 
 *   **[The SQL Query Engine](./query_engine.md):** A detailed breakdown of the query pipeline, from parsing a raw SQL string to executing a physical plan and streaming results.
+
+*   **[The FFI Layer](./ffi.md):** An overview of how the core Rust library is exposed via a C-compatible Foreign Function Interface.
 
 *   **[Memory Management & Eviction](./memory_management.md):** An in-depth look at how memory is tracked and how the different eviction policies (LRU, LFU, ARC) are implemented.
 

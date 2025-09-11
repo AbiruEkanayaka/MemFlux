@@ -42,6 +42,40 @@ pub struct Config {
     pub key_file: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FFIConfig {
+    pub wal_file: String,
+    #[serde(default = "default_wal_overflow_file")]
+    pub wal_overflow_file: String,
+    pub snapshot_file: String,
+    pub snapshot_temp_file: String,
+    pub wal_size_threshold_mb: u64,
+    #[serde(default = "default_maxmemory_mb")]
+    pub maxmemory_mb: u64,
+    #[serde(default)]
+    pub eviction_policy: EvictionPolicy,
+}
+
+impl From<FFIConfig> for Config {
+    fn from(ffi_config: FFIConfig) -> Self {
+        Config {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            requirepass: "".to_string(),
+            wal_file: ffi_config.wal_file,
+            wal_overflow_file: ffi_config.wal_overflow_file,
+            snapshot_file: ffi_config.snapshot_file,
+            snapshot_temp_file: ffi_config.snapshot_temp_file,
+            wal_size_threshold_mb: ffi_config.wal_size_threshold_mb,
+            maxmemory_mb: ffi_config.maxmemory_mb,
+            eviction_policy: ffi_config.eviction_policy,
+            encrypt: false,
+            cert_file: "".to_string(),
+            key_file: "".to_string(),
+        }
+    }
+}
+
 fn default_maxmemory_mb() -> u64 {
     0
 }

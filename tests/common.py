@@ -3,6 +3,26 @@ import sys
 import time
 import json
 import ssl
+import os
+import shlex
+
+# Add libs/python to path to import memflux
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'libs', 'python')))
+try:
+    import libs.python.memflux as memflux
+    _FFIResponseType = memflux._FFIResponseType
+    FFI_ENABLED = True
+except ImportError:
+    FFI_ENABLED = False
+    # Define dummy classes if import fails, so the script doesn't crash immediately
+    class _FFIResponseType:
+        OK = 0
+        SIMPLE_STRING = 1
+        BYTES = 2
+        MULTI_BYTES = 3
+        INTEGER = 4
+        NIL = 5
+        ERROR = 6
 
 
 # --- Test Runner ---
@@ -45,14 +65,44 @@ class TestResult:
 test_result = TestResult()
 
 
-def create_connection(retry=False):
+def create_connection(retry=False, ffi_path=None):
+    if ffi_path:
+        if not FFI_ENABLED:
+            print("[ERROR] FFI mode requested, but 'memflux' library could not be imported.")
+            sys.exit(1)
+        if not retry: print(f"Connecting via FFI: {ffi_path}")
+        config = {}
+        try:
+            with open('config.json', 'r') as f:
+                config = json.load(f)
+        except FileNotFoundError:
+            if not retry: print("config.json not found, using default FFI config.")
+            config = {
+                "wal_file": "memflux.wal",
+                "wal_overflow_file": "memflux.wal.overflow",
+                "snapshot_file": "memflux.snapshot",
+                "snapshot_temp_file": "memflux.snapshot.tmp",
+                "wal_size_threshold_mb": 128,
+                "maxmemory_mb": 0,
+                "eviction_policy": "lru"
+            }
+        
+        try:
+            ffi_conn = memflux.connect(config, ffi_path)
+            if not retry: print("Connected via FFI.")
+            return ffi_conn, None
+        except (memflux.InterfaceError, memflux.DatabaseError) as e:
+            if not retry: 
+                print(f"Failed to connect via FFI: {e}")
+                sys.exit(1)
+            return None, None
+
     host = "127.0.0.1"
     port = 8360
     sock = None
 
     config = {}
     try:
-        # Assuming config.json is in the root of the project, where test.py is run from.
         with open('config.json', 'r') as f:
             config = json.load(f)
     except FileNotFoundError:
@@ -101,32 +151,26 @@ def create_connection(retry=False):
 
 
 def read_resp_response(reader):
-    """
-    Reads a full RESP response from the given file-like reader object.
-    """
     first_byte = reader.read(1)
     if not first_byte:
-        # Connection closed by server
         print("[ERROR] Connection closed by server during read.")
         sys.exit(1)
 
     line = reader.readline()
 
-    if first_byte in (b'+', b'-', b':'): # Simple String, Error, Integer
+    if first_byte in (b'+', b'-', b':'):
         return first_byte + line
-    elif first_byte == b'$': # Bulk String
+    elif first_byte == b'$':
         length = int(line.strip())
         if length == -1:
             return b'$-1\r\n'
-        # Read the data itself + the trailing \r\n
         data = reader.read(length + 2)
         return b'$' + line + data
-    elif first_byte == b'*': # Array
+    elif first_byte == b'*':
         count = int(line.strip())
         if count == -1:
             return b'*-1\r\n'
         
-        # Reconstruct the raw string by reading each part of the array
         full_response_parts = [b'*' + line]
         for _ in range(count):
             element_first_byte = reader.read(1)
@@ -144,62 +188,124 @@ def read_resp_response(reader):
         raise ValueError(f"Unknown RESP type byte: {first_byte}")
 
 
-def send_resp_command(sock, reader, parts):
-    resp = f"*{len(parts)}\r\n"
-    for p in parts:
-        p_bytes = p.encode('utf-8')
-        resp += f"${len(p_bytes)}\r\n"
-        resp += p
-        resp += "\r\n"
-    t0 = time.perf_counter()
-    try:
-        sock.sendall(resp.encode('utf-8'))
-    except BrokenPipeError:
-        print("[ERROR] Connection closed by server (Broken pipe). The server may have crashed or exited.")
-        sys.exit(1)
-    t1 = time.perf_counter()
-    
-    # Read the full response using the proper RESP parser
-    try:
-        response_bytes = read_resp_response(reader)
-    except Exception as e:
-        print(f"[ERROR] Failed to read/parse RESP response: {e}")
-        sys.exit(1)
+def format_ffi_response_as_resp(response_type, result_list):
+    if response_type is None:
+        return b''
+
+    if response_type == _FFIResponseType.OK:
+        return b"+OK\r\n"
+    elif response_type == _FFIResponseType.SIMPLE_STRING:
+        val = result_list[0] if result_list else ""
+        return f"+{val}\r\n".encode('utf-8')
+    elif response_type == _FFIResponseType.INTEGER:
+        val = result_list[0] if result_list else 0
+        return f":{val}\r\n".encode('utf-8')
+    elif response_type == _FFIResponseType.NIL:
+        return b"$-1\r\n"
+    elif response_type == _FFIResponseType.BYTES:
+        if not result_list:
+            return b"$0\r\n\r\n"
+        val = result_list[0]
+        if isinstance(val, bytes):
+            val_bytes = val
+        else:
+            val_bytes = json.dumps(val, separators=(',', ':')).encode('utf-8')
+        return f"${len(val_bytes)}\r\n".encode('utf-8') + val_bytes + b"\r\n"
+    elif response_type == _FFIResponseType.MULTI_BYTES:
+        response = f"*{len(result_list)}\r\n".encode('utf-8')
+        for item in result_list:
+            if isinstance(item, bytes):
+                item_bytes = item
+            else:
+                item_bytes = json.dumps(item, separators=(',', ':')).encode('utf-8')
+            response += f"${len(item_bytes)}\r\n".encode('utf-8')
+            response += item_bytes
+            response += b"\r\n"
+        return response
+    else:
+        return b"-ERR Unhandled FFI response type\r\n"
+
+
+def send_resp_command(conn, reader, parts):
+    if reader is not None: # Socket mode
+        sock = conn
+        resp = f"*{len(parts)}\r\n"
+        for p in parts:
+            p_bytes = p.encode('utf-8')
+            resp += f"${len(p_bytes)}\r\n"
+            resp += p
+            resp += "\r\n"
+        t0 = time.perf_counter()
+        try:
+            sock.sendall(resp.encode('utf-8'))
+        except BrokenPipeError:
+            print("[ERROR] Connection closed by server (Broken pipe). The server may have crashed or exited.")
+            sys.exit(1)
+        t1 = time.perf_counter()
         
-    t2 = time.perf_counter()
-    send_time = (t1 - t0) * 1000
-    latency = (t2 - t1) * 1000
-    total = (t2 - t0) * 1000
-    return response_bytes.decode('utf-8', errors='replace'), send_time, latency, total
+        try:
+            response_bytes = read_resp_response(reader)
+        except Exception as e:
+            print(f"[ERROR] Failed to read/parse RESP response: {e}")
+            sys.exit(1)
+            
+        t2 = time.perf_counter()
+        send_time = (t1 - t0) * 1000
+        latency = (t2 - t1) * 1000
+        total = (t2 - t0) * 1000
+        return response_bytes.decode('utf-8', errors='replace'), send_time, latency, total
+    else: # FFI mode
+        ffi_conn = conn
+        if parts[0].upper() == 'SQL':
+            command_str = " ".join(parts)
+        else:
+            command_str = shlex.join(parts)
+        
+        t0 = time.perf_counter()
+        try:
+            cursor = ffi_conn.cursor()
+            cursor.execute(command_str)
+            t1 = time.perf_counter()
+            
+            response_type = cursor._last_result_type
+            result_list = cursor._last_result
+            
+            response_bytes = format_ffi_response_as_resp(response_type, result_list)
+            
+            t2 = time.perf_counter()
+            exec_time = (t1 - t0) * 1000
+            total_time = (t2 - t0) * 1000
+            
+            return response_bytes.decode('utf-8', errors='replace'), exec_time, 0, total_time
+
+        except memflux.DatabaseError as e:
+            t1 = time.perf_counter()
+            response_str = f"-ERR {e}\r\n"
+            t2 = time.perf_counter()
+            exec_time = (t1 - t0) * 1000
+            total_time = (t2 - t0) * 1000
+            return response_str, exec_time, 0, total_time
 
 def assert_eq(actual, expected, desc):
-    # Use the global test_result instance
     if actual == expected:
         test_result.record_pass(desc)
     else:
         test_result.record_fail(actual, expected, desc)
 
 def extract_json_from_bulk(resp):
-    """Extract JSON payload from RESP bulk string ($len\r\n...json...)"""
     if resp.startswith(b"$"):
         try:
-            # Find the first \r\n to get the length part, then the actual data.
-            # Use splitlines(keepends=True) to retain \r\n for accurate parsing.
             parts = resp.split(b'\r\n', 1)
             if len(parts) < 2:
                 raise ValueError("Incomplete RESP bulk string format")
             
-            length_str = parts[0][1:] # Remove the $
+            length_str = parts[0][1:]
             length = int(length_str)
             
             if length == -1:
-                return None # Represents a null bulk string
+                return None
             
-            # The actual data is the second part
             json_str_raw = parts[1]
-            # Remove the trailing \r\n if present, assuming the data itself does not contain it
-            # For `read_resp_response`, the data includes the trailing \r\n
-            # so we need to ensure it's removed before JSON parsing.
             if json_str_raw.endswith(b'\r\n'):
                 json_str_raw = json_str_raw[:-2]
 

@@ -8,6 +8,7 @@ memflux.crt
 memflux.key
 memflux.wal.overflow
 */__pycache__
+*.pyc
 
 # Random files used in dev
 a.py

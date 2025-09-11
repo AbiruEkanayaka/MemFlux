@@ -97,3 +97,32 @@ TRUNCATE TABLE table_name;
 ```sql
 TRUNCATE TABLE users;
 ```
+
+## `CREATE INDEX`
+
+Creates an index on a table to speed up queries. This is the SQL-standard way to create an index and is functionally equivalent to the `IDX.CREATE` command.
+
+### Syntax
+```sql
+CREATE [UNIQUE] INDEX index_name ON table_name (column_name);
+```
+
+### Parameters
+- `UNIQUE`: An optional keyword that enforces a uniqueness constraint on the column(s) being indexed. An `INSERT` or `UPDATE` that creates a duplicate value in a unique index will fail.
+- `index_name`: A name for the new index.
+- `table_name`: The table containing the column to index.
+- `column_name`: The column (JSON field) to create the index on. Expression-based indexes are also supported.
+
+### Behavior
+- When an index is created, it is automatically **backfilled** with all existing data from the table.
+- Once created, the index is automatically maintained by MemFlux on all `INSERT`, `UPDATE`, and `DELETE` operations.
+- The query planner will automatically use the index to accelerate `WHERE` clauses that filter on the indexed column.
+
+### Example
+```sql
+-- Create a standard index on the email column
+CREATE INDEX idx_users_email ON users (email);
+
+-- Create a unique index on the username column
+CREATE UNIQUE INDEX uq_users_username ON users (username);
+```
