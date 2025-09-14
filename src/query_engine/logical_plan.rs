@@ -1159,50 +1159,18 @@ pub fn ast_to_logical_plan(
                 }
             }
 
-            if !statement.order_by.is_empty() {
-                plan = LogicalPlan::Sort {
-                    input: Box::new(plan),
-                    sort_expressions: statement
-                        .order_by
-                        .into_iter()
-                        .map(|o| {
-                            simple_expr_to_expression(o.expression, schema_cache, view_cache, function_registry)
-                                .map(|e| (e, o.asc))
-                        })
-                        .collect::<Result<_>>()?,
-                };
-            }
-
-            plan = LogicalPlan::Projection {
-                input: Box::new(plan),
-                expressions: select_expressions.clone(),
-            };
-
-            if !statement.distinct_on.is_empty() {
-                let distinct_expressions: Vec<Expression> = statement
-                    .distinct_on
-                    .into_iter()
-                    .map(|e| simple_expr_to_expression(e, schema_cache, view_cache, function_registry))
-                    .collect::<Result<_>>()?;
-                plan = LogicalPlan::DistinctOn {
-                    input: Box::new(plan),
-                    expressions: distinct_expressions,
-                };
-            }
-
-            if statement.limit.is_some() || statement.offset.is_some() {
-                plan = LogicalPlan::Limit {
-                    input: Box::new(plan),
-                    limit: statement.limit,
-                    offset: statement.offset,
-                };
-            }
-
             if let Some(set_operator_clause) = set_operator_clause {
+                // With a set operator, we project each side, then union, then sort/limit.
+                plan = LogicalPlan::Projection {
+                    input: Box::new(plan),
+                    expressions: select_expressions.clone(),
+                };
+
                 let right_plan = ast_to_logical_plan(
                     AstStatement::Select(*set_operator_clause.select),
                     schema_cache, view_cache, function_registry,
                 )?;
+
                 plan = match set_operator_clause.operator {
                     SetOperatorType::Union => {
                         if set_operator_clause.all {
@@ -1212,13 +1180,88 @@ pub fn ast_to_logical_plan(
                             let union_all_plan = LogicalPlan::UnionAll { left: Box::new(plan), right: Box::new(right_plan) };
                             LogicalPlan::DistinctOn {
                                 input: Box::new(union_all_plan),
-                                expressions: select_expressions.clone().iter().map(|(expr, _)| expr.clone()).collect(),
+                                expressions: select_expressions.iter().map(|(expr, _)| expr.clone()).collect(),
                             }
                         }
                     },
                     SetOperatorType::Intersect => LogicalPlan::Intersect { left: Box::new(plan), right: Box::new(right_plan) },
                     SetOperatorType::Except => LogicalPlan::Except { left: Box::new(plan), right: Box::new(right_plan) },
                 };
+
+                // Now apply Sort, DistinctOn, and Limit to the combined plan.
+                if !statement.order_by.is_empty() {
+                    plan = LogicalPlan::Sort {
+                        input: Box::new(plan),
+                        sort_expressions: statement
+                            .order_by
+                            .into_iter()
+                            .map(|o| {
+                                simple_expr_to_expression(o.expression, schema_cache, view_cache, function_registry)
+                                    .map(|e| (e, o.asc))
+                            })
+                            .collect::<Result<_>>()?,
+                    };
+                }
+
+                if !statement.distinct_on.is_empty() {
+                    let distinct_expressions: Vec<Expression> = statement
+                        .distinct_on
+                        .into_iter()
+                        .map(|e| simple_expr_to_expression(e, schema_cache, view_cache, function_registry))
+                        .collect::<Result<_>>()?;
+                    plan = LogicalPlan::DistinctOn {
+                        input: Box::new(plan),
+                        expressions: distinct_expressions,
+                    };
+                }
+
+                if statement.limit.is_some() || statement.offset.is_some() {
+                    plan = LogicalPlan::Limit {
+                        input: Box::new(plan),
+                        limit: statement.limit,
+                        offset: statement.offset,
+                    };
+                }
+            } else {
+                // No set operator, original logic: Sort -> Project -> Limit
+                if !statement.order_by.is_empty() {
+                    plan = LogicalPlan::Sort {
+                        input: Box::new(plan),
+                        sort_expressions: statement
+                            .order_by
+                            .into_iter()
+                            .map(|o| {
+                                simple_expr_to_expression(o.expression, schema_cache, view_cache, function_registry)
+                                    .map(|e| (e, o.asc))
+                            })
+                            .collect::<Result<_>>()?,
+                    };
+                }
+
+                plan = LogicalPlan::Projection {
+                    input: Box::new(plan),
+                    expressions: select_expressions.clone(),
+                };
+
+                if !statement.distinct_on.is_empty() {
+                    let distinct_expressions: Vec<Expression> = statement
+                        .distinct_on
+                        .into_iter()
+                        .map(|e| simple_expr_to_expression(e, schema_cache, view_cache, function_registry))
+                        .collect::<Result<_>>()?;
+                    plan = LogicalPlan::DistinctOn {
+                        input: Box::new(plan),
+                        expressions: distinct_expressions,
+                    };
+                }
+
+                if statement.limit.is_some() || statement.offset.is_some() {
+                    plan = LogicalPlan::Limit {
+                        input: Box::new(plan),
+                        limit: statement.limit,
+                        offset: statement.offset,
+                    };
+                }
             }
 
             Ok(plan)

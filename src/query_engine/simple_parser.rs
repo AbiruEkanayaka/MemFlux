@@ -1307,6 +1307,10 @@ impl Parser {
     }
 
     pub fn parse_select(&mut self) -> Result<SelectStatement> {
+        self.parse_select_internal(false)
+    }
+
+    fn parse_select_internal(&mut self, is_set_operand: bool) -> Result<SelectStatement> {
         self.expect("SELECT")?;
         let mut distinct_on = Vec::new();
         if self.current().map_or(false, |t| t.eq_ignore_ascii_case("DISTINCT")) {
@@ -1437,6 +1441,10 @@ impl Parser {
             self.advance();
         }
 
+        if is_set_operand && (!order_by.is_empty() || limit.is_some() || offset.is_some()) {
+            return Err(anyhow!("ORDER BY, LIMIT, or OFFSET clause is not allowed on a query that is an operand of a set operator. Use parentheses to make it a subquery, e.g., (SELECT ... ORDER BY ...) UNION ALL SELECT ..."));
+        }
+
         let set_operator = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("UNION"))
             || self.current().map_or(false, |t| t.eq_ignore_ascii_case("INTERSECT"))
             || self.current().map_or(false, |t| t.eq_ignore_ascii_case("EXCEPT"))
@@ -1460,7 +1468,7 @@ impl Parser {
             Some(Box::new(SetOperatorClause {
                 operator,
                 all,
-                select: Box::new(self.parse_select()?),
+                select: Box::new(self.parse_select_internal(true)?),
             }))
         } else {
             None
