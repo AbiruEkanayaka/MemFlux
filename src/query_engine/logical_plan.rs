@@ -986,7 +986,7 @@ pub fn ast_to_logical_plan(
                         schemas_in_scope.insert(alias.clone().unwrap_or_else(|| name.clone()), schema.clone());
                     }
                 }
-                TableReference::Subquery(_, alias) => {
+                TableReference::Subquery(_, _alias) => {
                     // Subquery validation is complex; we'd need to infer its output schema.
                     // For now, we skip validation for columns coming from a subquery.
                 }
@@ -1173,14 +1173,6 @@ pub fn ast_to_logical_plan(
                 };
             }
 
-            if statement.limit.is_some() || statement.offset.is_some() {
-                plan = LogicalPlan::Limit {
-                    input: Box::new(plan),
-                    limit: statement.limit,
-                    offset: statement.offset,
-                };
-            }
-
             plan = LogicalPlan::Projection {
                 input: Box::new(plan),
                 expressions: select_expressions.clone(),
@@ -1195,6 +1187,14 @@ pub fn ast_to_logical_plan(
                 plan = LogicalPlan::DistinctOn {
                     input: Box::new(plan),
                     expressions: distinct_expressions,
+                };
+            }
+
+            if statement.limit.is_some() || statement.offset.is_some() {
+                plan = LogicalPlan::Limit {
+                    input: Box::new(plan),
+                    limit: statement.limit,
+                    offset: statement.offset,
                 };
             }
 

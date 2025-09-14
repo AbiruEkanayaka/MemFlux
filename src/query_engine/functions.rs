@@ -27,8 +27,18 @@ pub fn register_string_functions(registry: &mut crate::types::FunctionRegistry) 
 
 fn compare_values(op: &str, left: &Value, right: &Value) -> Result<bool> {
     match op {
-        "=" => Ok(left == right),
-        "!=" => Ok(left != right),
+        "=" | "!=" => {
+            let eq = match (left, right) {
+                (Value::Number(l), Value::Number(r)) => (l.as_f64().unwrap_or(f64::NAN) - r.as_f64().unwrap_or(f64::NAN)).abs() < f64::EPSILON,
+                (Value::Number(l), Value::String(rs)) => rs.parse::<f64>().ok().map(|r| (l.as_f64().unwrap_or(f64::NAN) - r).abs() < f64::EPSILON).unwrap_or(left == right),
+                (Value::String(ls), Value::Number(r)) => ls.parse::<f64>().ok().map(|l| (l - r.as_f64().unwrap_or(f64::NAN)).abs() < f64::EPSILON).unwrap_or(left == right),
+                (Value::String(ls), Value::String(rs)) => {
+                    if ls == rs { true } else if let (Ok(lf), Ok(rf)) = (ls.parse::<f64>(), rs.parse::<f64>()) { (lf - rf).abs() < f64::EPSILON } else { false }
+                }
+                _ => left == right,
+            };
+            Ok(if op == "=" { eq } else { !eq })
+        }
         ">" | "<" | ">=" | "<=" => {
             let l_num = left.as_f64();
             let r_num = right.as_f64();
@@ -70,39 +80,37 @@ fn handle_any_all(op: &str, quantifier: &str, args: Vec<Value>) -> Result<Value>
 
     for sub_val_wrapper in subquery_result {
         // Extract the actual value from the subquery result
-        let sub_val = if let Some(obj) = sub_val_wrapper.as_object() {
+        let extracted = if let Some(obj) = sub_val_wrapper.as_object() {
             // If wrapped in object, extract the first value
             if obj.len() == 1 {
                 if let Some(inner) = obj.values().next() {
                     // Check if it's double-wrapped
                     if let Some(inner_obj) = inner.as_object() {
                         if inner_obj.len() == 1 {
-                            inner_obj.values().next().unwrap_or(&serde_json::Value::Null)
+                            inner_obj.values().next().cloned().unwrap_or(Value::Null)
                         } else {
-                            inner
+                            inner.clone()
                         }
                     } else {
-                        inner
+                        inner.clone()
                     }
                 } else {
-                    &serde_json::Value::Null
+                    Value::Null
                 }
             } else {
-                // Multiple fields - unclear which to use
-                any_null_outcome = true;
-                continue;
+                return Err(anyhow!("Subquery for {} {} must return exactly one column", op, quantifier));
             }
         } else {
             // Direct value
-            sub_val_wrapper
+            sub_val_wrapper.clone()
         };
 
-        if sub_val.is_null() || left_val.is_null() {
+        if extracted.is_null() || left_val.is_null() {
             any_null_outcome = true;
             continue;
         }
 
-        let comparison_result = compare_values(op, left_val, sub_val)?;
+        let comparison_result = compare_values(op, left_val, &extracted)?;
         if comparison_result {
             any_true_comparison = true;
         } else {

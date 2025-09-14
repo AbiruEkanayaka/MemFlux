@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::ast::{AlterTableAction, ColumnDef, CreateIndexStatement, SelectStatement, TableConstraint};
-use super::logical_plan::{self, *};
+use super::logical_plan::{*};
 use crate::indexing::IndexManager;
 
 #[derive(Debug)]
