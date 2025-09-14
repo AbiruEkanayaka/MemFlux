@@ -69,18 +69,32 @@ fn handle_any_all(op: &str, quantifier: &str, args: Vec<Value>) -> Result<Value>
     let mut any_null_outcome = false;
 
     for sub_val_wrapper in subquery_result {
-        let sub_val = match sub_val_wrapper.as_object().and_then(|obj| obj.values().next()) {
-            Some(table_obj) => {
-                if table_obj.is_object() && table_obj.as_object().unwrap().len() == 1 {
-                    table_obj.as_object().unwrap().values().next().unwrap_or(&serde_json::Value::Null)
+        // Extract the actual value from the subquery result
+        let sub_val = if let Some(obj) = sub_val_wrapper.as_object() {
+            // If wrapped in object, extract the first value
+            if obj.len() == 1 {
+                if let Some(inner) = obj.values().next() {
+                    // Check if it's double-wrapped
+                    if let Some(inner_obj) = inner.as_object() {
+                        if inner_obj.len() == 1 {
+                            inner_obj.values().next().unwrap_or(&serde_json::Value::Null)
+                        } else {
+                            inner
+                        }
+                    } else {
+                        inner
+                    }
                 } else {
-                    table_obj
+                    &serde_json::Value::Null
                 }
-            },
-            None => {
+            } else {
+                // Multiple fields - unclear which to use
                 any_null_outcome = true;
                 continue;
             }
+        } else {
+            // Direct value
+            sub_val_wrapper
         };
 
         if sub_val.is_null() || left_val.is_null() {

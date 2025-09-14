@@ -378,10 +378,14 @@ impl Parser {
     
                             if ["COUNT", "SUM", "AVG", "MIN", "MAX"].contains(&func_name.as_str()) {
                                 // Handle DISTINCT modifier for COUNT
-                                let distinct = if func_name == "COUNT"
-                                    && self.current().map_or(false, |t| t.eq_ignore_ascii_case("DISTINCT"))
+                                let distinct = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("DISTINCT"))
                                 {
                                     self.advance();
+                                    // Note: Currently only COUNT DISTINCT is fully supported in execution
+                                    if func_name != "COUNT" {
+                                        // Consider whether to support or reject DISTINCT for other aggregates
+                                        return Err(anyhow!("DISTINCT is currently only supported with COUNT"));
+                                    }
                                     true
                                 } else {
                                     false
