@@ -13,20 +13,6 @@
 >
 > This is not ready for any form of production use. It is a learning and experimentation project. **Contributions are very much welcomed!**
 
-## Table of Contents
-*   [What is MemFlux?](#what-is-memflux)
-*   [Full Documentation](#full-documentation)
-*   [How to Use It](#how-to-use-it)
-    *   [Running the Server](#running-the-server)
-    *   [Connecting to the Server](#connecting-to-the-server)
-    *   [Command Examples](#command-examples)
-*   [How It Works (A Basic Overview)](#how-it-works-a-basic-overview)
-*   [Development Guide](#development-guide)
-    *   [Prerequisites](#prerequisites)
-    *   [Building](#building)
-    *   [Running Tests](#running-tests)
-*   [Conclusion & Future](#conclusion--future)
-
 ## What is MemFlux?
 
 MemFlux is an experimental, high-performance, in-memory, multi-model database engine built in Rust. It aims to blend the speed and simplicity of key-value stores like Redis with the power and flexibility of SQL databases.
