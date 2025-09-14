@@ -23,6 +23,7 @@ from tests.test_wrongtype_errors import test_wrongtype_errors
 from tests.test_data_types_and_constraints import test_data_types_and_constraints
 from tests.test_ddl_enhancements import test_ddl_enhancements
 from tests.test_dml_enhancements import test_dml_enhancements
+from tests.test_dql_enhancements import test_dql_enhancements
 
 
 # Add prompt_toolkit for better interactive input
@@ -82,6 +83,8 @@ def unit_test(conn, reader, mode, ffi_path=None):
         test_ddl_enhancements(conn, reader)
     if mode in ("dml_enhancements", "all"):
         test_dml_enhancements(conn, reader)
+    if mode in ("dql_enhancements", "all"):
+        test_dql_enhancements(conn, reader)
     
     return conn, reader
 

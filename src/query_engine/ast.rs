@@ -1,7 +1,7 @@
 
 use serde::{Serialize, Deserialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub enum SimpleValue {
     String(String),
     Number(String),
@@ -9,7 +9,13 @@ pub enum SimpleValue {
     Null,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
+pub enum TableReference {
+    Table { name: String, alias: Option<String> },
+    Subquery(Box<SelectStatement>, String), // Subquery and its alias
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub enum SimpleExpression {
     Column(String),
     Literal(SimpleValue),
@@ -37,50 +43,61 @@ pub enum SimpleExpression {
         data_type: String,
     },
     Subquery(Box<SelectStatement>),
+    List(Vec<SimpleExpression>),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub struct CaseExpression {
     pub when_then_pairs: Vec<(SimpleExpression, SimpleExpression)>,
     pub else_expression: Option<Box<SimpleExpression>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub struct OrderByExpression {
     pub expression: SimpleExpression,
     pub asc: bool, // true for ASC, false for DESC
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub struct JoinClause {
     pub join_type: String,
-    pub table: String,
+    pub table: TableReference,
     pub on_condition: SimpleExpression,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct UnionClause {
-    pub all: bool, // true for UNION ALL
+#[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
+pub enum SetOperatorType {
+    Union,
+    Intersect,
+    Except,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
+pub struct SetOperatorClause {
+    pub operator: SetOperatorType,
+    pub all: bool,
     pub select: Box<SelectStatement>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub struct SelectColumn {
     pub expr: SimpleExpression,
     pub alias: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub struct SelectStatement {
     pub columns: Vec<SelectColumn>,
-    pub from_table: String,
+    pub distinct_on: Vec<SimpleExpression>,
+    pub from: TableReference,
     pub joins: Vec<JoinClause>,
     pub where_clause: Option<SimpleExpression>,
     pub group_by: Vec<SimpleExpression>,
+    pub having_clause: Option<SimpleExpression>,
     pub order_by: Vec<OrderByExpression>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
-    pub union: Option<Box<UnionClause>>,
+    pub set_operator: Option<Box<SetOperatorClause>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

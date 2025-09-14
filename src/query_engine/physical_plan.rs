@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::ast::{AlterTableAction, ColumnDef, CreateIndexStatement, SelectStatement, TableConstraint};
-use super::logical_plan::{*, OnConflictAction};
+use super::logical_plan::{*};
 use crate::indexing::IndexManager;
 
 #[derive(Debug)]
@@ -13,6 +13,10 @@ pub enum PhysicalPlan {
     IndexScan {
         index_name: String,
         key: Value,
+    },
+    SubqueryScan {
+        alias: String,
+        input: Box<PhysicalPlan>,
     },
     Filter {
         input: Box<PhysicalPlan>,
@@ -84,16 +88,27 @@ pub enum PhysicalPlan {
         set: Vec<(String, Expression)>,
         returning: Vec<(Expression, Option<String>)>,
     },
-    Union {
+    UnionAll {
         left: Box<PhysicalPlan>,
         right: Box<PhysicalPlan>,
-        all: bool,
+    },
+    Intersect {
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+    },
+    Except {
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
     },
     CreateIndex {
         statement: CreateIndexStatement,
     },
     Values {
         values: Vec<Vec<Expression>>,
+    },
+    DistinctOn {
+        input: Box<PhysicalPlan>,
+        expressions: Vec<Expression>,
     },
 }
 
@@ -260,13 +275,28 @@ pub fn logical_to_physical_plan(
         LogicalPlan::AlterTable { table_name, action } => {
             Ok(PhysicalPlan::AlterTable { table_name, action })
         }
-        LogicalPlan::Union { left, right, all } => Ok(PhysicalPlan::Union {
+        LogicalPlan::UnionAll { left, right } => Ok(PhysicalPlan::UnionAll {
             left: Box::new(logical_to_physical_plan(*left, index_manager)?),
             right: Box::new(logical_to_physical_plan(*right, index_manager)?),
-            all,
+        }),
+        LogicalPlan::Intersect { left, right } => Ok(PhysicalPlan::Intersect {
+            left: Box::new(logical_to_physical_plan(*left, index_manager)?),
+            right: Box::new(logical_to_physical_plan(*right, index_manager)?),
+        }),
+        LogicalPlan::Except { left, right } => Ok(PhysicalPlan::Except {
+            left: Box::new(logical_to_physical_plan(*left, index_manager)?),
+            right: Box::new(logical_to_physical_plan(*right, index_manager)?),
         }),
         LogicalPlan::CreateIndex { statement } => Ok(PhysicalPlan::CreateIndex { statement }),
         LogicalPlan::Values { values } => Ok(PhysicalPlan::Values { values }),
+        LogicalPlan::SubqueryScan { alias, input } => Ok(PhysicalPlan::SubqueryScan {
+            alias,
+            input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+        }),
+        LogicalPlan::DistinctOn { input, expressions } => Ok(PhysicalPlan::DistinctOn {
+            input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+            expressions,
+        }),
     }
 }
 
