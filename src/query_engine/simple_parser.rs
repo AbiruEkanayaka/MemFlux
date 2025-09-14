@@ -398,6 +398,10 @@ impl Parser {
                                     self.parse_expression()?
                                 };
                                 self.expect(")")?;
+
+                                if distinct && arg_expr == SimpleExpression::Column("*".to_string()) {
+                                    return Err(anyhow!("COUNT(DISTINCT *) is not allowed"));
+                                }
     
                                 // For now, convert back to string for backward compatibility
                                 // Consider updating AggregateFunction to accept SimpleExpression

@@ -1160,32 +1160,80 @@ pub fn ast_to_logical_plan(
             }
 
             if let Some(set_operator_clause) = set_operator_clause {
-                // With a set operator, we project each side, then union, then sort/limit.
+                // Arity validation
+                let op_str = match set_operator_clause.operator {
+                    SetOperatorType::Union => "UNION",
+                    SetOperatorType::Intersect => "INTERSECT",
+                    SetOperatorType::Except => "EXCEPT",
+                };
+                if select_expressions.len() != set_operator_clause.select.columns.len() {
+                    return Err(anyhow!(
+                        "SELECTs to the left and right of {} have different number of columns",
+                        op_str
+                    ));
+                }
+
+                // With a set operator, we project the left side first.
                 plan = LogicalPlan::Projection {
                     input: Box::new(plan),
                     expressions: select_expressions.clone(),
                 };
 
-                let right_plan = ast_to_logical_plan(
+                // Get the output column names from the left-hand side projection.
+                let left_output_names: Vec<String> = select_expressions
+                    .iter()
+                    .map(|(expr, alias)| alias.clone().unwrap_or_else(|| expr.to_string()))
+                    .collect();
+
+                // Build the right-hand side plan.
+                let right_plan_unprojected = ast_to_logical_plan(
                     AstStatement::Select(*set_operator_clause.select),
                     schema_cache, view_cache, function_registry,
                 )?;
 
+                // The right plan will have a projection on top. We need to deconstruct it
+                // and rebuild it with the left side's aliases.
+                let (right_input, right_expressions) =
+                    if let LogicalPlan::Projection { input, expressions } = right_plan_unprojected {
+                        (input, expressions)
+                    } else {
+                        // This should not be reached if the right side is a valid SELECT query
+                        return Err(anyhow!("Right side of set operator did not produce a projection plan"));
+                    };
+
+                // Create a new projection for the right side, using its original expressions
+                // but with the aliases from the left side.
+                let right_reprojection_exprs: Vec<(Expression, Option<String>)> = right_expressions
+                    .into_iter()
+                    .map(|(expr, _)| expr) // take the expression, discard old alias
+                    .zip(left_output_names.iter())
+                    .map(|(expr, alias)| (expr, Some(alias.clone())))
+                    .collect();
+
+                let right_plan_reprojected = LogicalPlan::Projection {
+                    input: right_input,
+                    expressions: right_reprojection_exprs,
+                };
+
                 plan = match set_operator_clause.operator {
                     SetOperatorType::Union => {
                         if set_operator_clause.all {
-                            LogicalPlan::UnionAll { left: Box::new(plan), right: Box::new(right_plan) }
+                            LogicalPlan::UnionAll { left: Box::new(plan), right: Box::new(right_plan_reprojected) }
                         } else {
                             // UNION (DISTINCT) is UnionAll followed by DistinctOn
-                            let union_all_plan = LogicalPlan::UnionAll { left: Box::new(plan), right: Box::new(right_plan) };
+                            let union_all_plan = LogicalPlan::UnionAll { left: Box::new(plan), right: Box::new(right_plan_reprojected) };
+                            let distinct_expressions = left_output_names
+                                .into_iter()
+                                .map(Expression::Column)
+                                .collect();
                             LogicalPlan::DistinctOn {
                                 input: Box::new(union_all_plan),
-                                expressions: select_expressions.iter().map(|(expr, _)| expr.clone()).collect(),
+                                expressions: distinct_expressions,
                             }
                         }
                     },
-                    SetOperatorType::Intersect => LogicalPlan::Intersect { left: Box::new(plan), right: Box::new(right_plan) },
-                    SetOperatorType::Except => LogicalPlan::Except { left: Box::new(plan), right: Box::new(right_plan) },
+                    SetOperatorType::Intersect => LogicalPlan::Intersect { left: Box::new(plan), right: Box::new(right_plan_reprojected) },
+                    SetOperatorType::Except => LogicalPlan::Except { left: Box::new(plan), right: Box::new(right_plan_reprojected) },
                 };
 
                 // Now apply Sort, DistinctOn, and Limit to the combined plan.
