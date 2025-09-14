@@ -4,7 +4,8 @@ use super::ast::{AlterTableAction, AstStatement, CaseExpression, ColumnDef, Crea
     CreateSchemaStatement, CreateTableStatement, CreateViewStatement, DeleteStatement,
     DropTableStatement, DropViewStatement, ForeignKeyClause, InsertStatement, JoinClause,
     OrderByExpression, SelectColumn, SelectStatement, SimpleExpression, SimpleValue,
-    TableConstraint, TruncateTableStatement, UnionClause, UpdateStatement, AlterTableStatement, InsertSource, OnConflict};
+    TableConstraint, TruncateTableStatement, UpdateStatement, AlterTableStatement, InsertSource, OnConflict,
+    SetOperatorClause, SetOperatorType};
 
 // Very simple tokenizer
 fn tokenize(sql: &str) -> Vec<String> {
@@ -212,21 +213,94 @@ impl Parser {
     fn parse_comparison_expression(&mut self) -> Result<SimpleExpression> {
         let left = self.parse_primary_expression()?;
 
+        if self.current().map_or(false, |t| t.eq_ignore_ascii_case("IS")) {
+            self.advance(); // consume IS
+            let is_not = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("NOT")) {
+                self.advance(); // consume NOT
+                true
+            } else {
+                false
+            };
+            self.expect("NULL")?;
+            return Ok(SimpleExpression::FunctionCall {
+                func: if is_not { "IS_NOT_NULL" } else { "IS_NULL" }.to_string(),
+                args: vec![left],
+            });
+        }
+
+        if self.current().map_or(false, |t| t.eq_ignore_ascii_case("BETWEEN")) {
+            self.advance(); // consume BETWEEN
+            let low = self.parse_primary_expression()?;
+            self.expect("AND")?;
+            let high = self.parse_primary_expression()?;
+            return Ok(SimpleExpression::LogicalOp {
+                left: Box::new(SimpleExpression::BinaryOp {
+                    left: Box::new(left.clone()),
+                    op: ">=".to_string(),
+                    right: Box::new(low),
+                }),
+                op: "AND".to_string(),
+                right: Box::new(SimpleExpression::BinaryOp {
+                    left: Box::new(left),
+                    op: "<=".to_string(),
+                    right: Box::new(high),
+                }),
+            });
+        }
+
+        if self.current().map_or(false, |t| t.eq_ignore_ascii_case("IN")) {
+            self.advance(); // consume IN
+            self.expect("(")?;
+            let right = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("SELECT")) {
+                let subquery = self.parse_select()?;
+                SimpleExpression::Subquery(Box::new(subquery))
+            } else {
+                // Parse a comma-separated list of values
+                let mut values = Vec::new();
+                loop {
+                    values.push(self.parse_expression()?);
+                    if self.current() == Some(",") {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                SimpleExpression::List(values)
+            };
+            self.expect(")")?;
+            return Ok(SimpleExpression::BinaryOp {
+                left: Box::new(left),
+                op: "IN".to_string(),
+                right: Box::new(right),
+            });
+        }
+
         if let Some(op) = self.current() {
-            if ["=", "!=", ">", "<", ">=", "<=", "LIKE", "ILIKE", "IN"]
+            if ["=", "!=", ">", "<", ">=", "<=", "LIKE", "ILIKE"]
                 .iter()
-                .any(|k| k.eq_ignore_ascii_case(op)) {
+                .any(|k| k.eq_ignore_ascii_case(op))
+            {
                 let op_str = op.to_uppercase();
                 self.advance();
 
+                if self.current().map_or(false, |t| t.eq_ignore_ascii_case("ANY"))
+                    || self.current().map_or(false, |t| t.eq_ignore_ascii_case("ALL"))
+                {
+                    let quantifier = self.current().unwrap().to_uppercase();
+                    self.advance(); // consume ANY/ALL
+                    self.expect("(")?;
+                    let subquery = self.parse_select()?;
+                    self.expect(")")?;
+                    return Ok(SimpleExpression::FunctionCall {
+                        func: format!("{}_{}", op_str, quantifier),
+                        args: vec![left.clone(), SimpleExpression::Subquery(Box::new(subquery))],
+                    });
+                }
+
                 let right = if self.current() == Some("(") {
                     self.advance(); // consume "("
-                    let expr = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("SELECT")) {
-                        let subquery = self.parse_select()?;
-                        SimpleExpression::Subquery(Box::new(subquery))
-                    } else {
-                        self.parse_expression()? 
-                    };
+                    let subquery = self.parse_select()?;
+                    let expr = SimpleExpression::Subquery(Box::new(subquery));
                     self.expect(")")?;
                     expr
                 } else {
@@ -243,97 +317,116 @@ impl Parser {
         Ok(left)
     }
 
-    fn parse_primary_expression(&mut self) -> Result<SimpleExpression> {
-        match self.current() {
-            Some(token) => {
-                if token.eq_ignore_ascii_case("CASE") {
-                    return self.parse_case_expression();
+        fn parse_primary_expression(&mut self) -> Result<SimpleExpression> {
+            match self.current() {
+                Some("(") => {
+                    self.advance(); // consume (
+                    let expr = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("SELECT")) {
+                        let subquery = self.parse_select()?;
+                        SimpleExpression::Subquery(Box::new(subquery))
+                    } else {
+                        self.parse_expression()?
+                    };
+                    self.expect(")")?;
+                    Ok(expr)
                 }
-                if token.starts_with('\'') && token.ends_with('\'') {
-                    let value = token[1..token.len() - 1].to_string();
-                    self.advance();
-                    Ok(SimpleExpression::Literal(SimpleValue::String(value)))
-                } else if token.parse::<f64>().is_ok() {
-                    let value = token.to_string();
-                    self.advance();
-                    Ok(SimpleExpression::Literal(SimpleValue::Number(value)))
-                } else if token.eq_ignore_ascii_case("true")
-                    || token.eq_ignore_ascii_case("false")
-                {
-                    let value = token.eq_ignore_ascii_case("true");
-                    self.advance();
-                    Ok(SimpleExpression::Literal(SimpleValue::Boolean(value)))
-                } else if token.eq_ignore_ascii_case("null") {
-                    self.advance();
-                    Ok(SimpleExpression::Literal(SimpleValue::Null))
-                } else {
-                    let identifier = token.to_string();
-                    if self.tokens.get(self.pos + 1) == Some(&"(".to_string()) {
-                        self.advance(); // consume identifier
-                        self.advance(); // consume "("
-
-                        if identifier.eq_ignore_ascii_case("CAST") {
-                            let expr_to_cast = self.parse_expression()?;
-                            self.expect("AS")?;
-                            let data_type = self.parse_data_type()?;
-                            self.expect(")")?;
-                            return Ok(SimpleExpression::Cast { expr: Box::new(expr_to_cast), data_type });
-                        }
-
-                        let func_name = identifier.to_uppercase();
-
-                        if ["COUNT", "SUM", "AVG", "MIN", "MAX"].contains(&func_name.as_str()) {
-                            // Handle DISTINCT modifier for COUNT
-                            let distinct = if func_name == "COUNT"
-                                && self.current().map_or(false, |t| t.eq_ignore_ascii_case("DISTINCT"))
-                            {
-                                self.advance();
-                                true
-                            } else {
-                                false
-                            };
-
-                            let arg_expr = if self.current() == Some("*") {
-                                self.advance();
-                                SimpleExpression::Column("*".to_string())
-                            } else {
-                                self.parse_expression()?
-                            };
-                            self.expect(")")?;
-
-                            // For now, convert back to string for backward compatibility
-                            // Consider updating AggregateFunction to accept SimpleExpression
-                            let arg = match arg_expr {
-                                SimpleExpression::Column(col) => {
-                                    if distinct {
-                                        format!("DISTINCT {}", col)
-                                    } else {
-                                        col
-                                    }
-                                },
-                                _ => return Err(anyhow!("Complex expressions in aggregate functions not yet supported")),
-                            };
-
-                            return Ok(SimpleExpression::AggregateFunction { func: func_name, arg });
-                        }
-
-                        let args = self.parse_argument_list()?;
+                Some(token) => {
+                    if token.eq_ignore_ascii_case("CASE") {
+                        return self.parse_case_expression();
+                    }
+                    if token.starts_with('\'') && token.ends_with('\'') {
+                        let value = token[1..token.len() - 1].to_string();
+                        self.advance();
+                        return Ok(SimpleExpression::Literal(SimpleValue::String(value)));
+                    } else if token.parse::<f64>().is_ok() {
+                        let value = token.to_string();
+                        self.advance();
+                        return Ok(SimpleExpression::Literal(SimpleValue::Number(value)));
+                    } else if token.eq_ignore_ascii_case("true")
+                        || token.eq_ignore_ascii_case("false")
+                    {
+                        let value = token.eq_ignore_ascii_case("true");
+                        self.advance();
+                        return Ok(SimpleExpression::Literal(SimpleValue::Boolean(value)));
+                    } else if token.eq_ignore_ascii_case("EXISTS") {
+                        self.advance(); // consume EXISTS
+                        self.expect("(")?;
+                        let subquery = self.parse_select()?;
                         self.expect(")")?;
                         return Ok(SimpleExpression::FunctionCall {
-                            func: func_name,
-                            args,
+                            func: "EXISTS".to_string(),
+                            args: vec![SimpleExpression::Subquery(Box::new(subquery))],
                         });
+                    } else if token.eq_ignore_ascii_case("null") {
+                        self.advance();
+                        return Ok(SimpleExpression::Literal(SimpleValue::Null));
+                    } else {
+                        let identifier = token.to_string();
+                        if self.tokens.get(self.pos + 1) == Some(&"(".to_string()) {
+                            self.advance(); // consume identifier
+                            self.advance(); // consume "("
+    
+                            if identifier.eq_ignore_ascii_case("CAST") {
+                                let expr_to_cast = self.parse_expression()?;
+                                self.expect("AS")?;
+                                let data_type = self.parse_data_type()?;
+                                self.expect(")")?;
+                                return Ok(SimpleExpression::Cast { expr: Box::new(expr_to_cast), data_type });
+                            }
+    
+                            let func_name = identifier.to_uppercase();
+    
+                            if ["COUNT", "SUM", "AVG", "MIN", "MAX"].contains(&func_name.as_str()) {
+                                // Handle DISTINCT modifier for COUNT
+                                let distinct = if func_name == "COUNT"
+                                    && self.current().map_or(false, |t| t.eq_ignore_ascii_case("DISTINCT"))
+                                {
+                                    self.advance();
+                                    true
+                                } else {
+                                    false
+                                };
+    
+                                let arg_expr = if self.current() == Some("*") {
+                                    self.advance();
+                                    SimpleExpression::Column("*".to_string())
+                                } else {
+                                    self.parse_expression()?
+                                };
+                                self.expect(")")?;
+    
+                                // For now, convert back to string for backward compatibility
+                                // Consider updating AggregateFunction to accept SimpleExpression
+                                let arg = match arg_expr {
+                                    SimpleExpression::Column(col) => {
+                                        if distinct {
+                                            format!("DISTINCT {}", col)
+                                        } else {
+                                            col
+                                        }
+                                    },
+                                    _ => return Err(anyhow!("Complex expressions in aggregate functions not yet supported")),
+                                };
+    
+                                return Ok(SimpleExpression::AggregateFunction { func: func_name, arg });
+                            }
+    
+                            let args = self.parse_argument_list()?;
+                            self.expect(")")?;
+                            return Ok(SimpleExpression::FunctionCall {
+                                func: func_name,
+                                args,
+                            });
+                        }
+    
+                        // It's a column name, potentially qualified
+                        let col_name = self.parse_qualified_name()?;
+                        return Ok(SimpleExpression::Column(col_name));
                     }
-
-                    // It's a column name, potentially qualified
-                    let col_name = self.parse_qualified_name()?;
-                    Ok(SimpleExpression::Column(col_name))
                 }
+                None => return Err(anyhow!("Unexpected end of input in expression")),
             }
-            None => Err(anyhow!("Unexpected end of input in expression")),
         }
-    }
-
     fn parse_argument_list(&mut self) -> Result<Vec<SimpleExpression>> {
         let mut args = Vec::new();
         if self.current() == Some(")") {
@@ -1179,12 +1272,52 @@ impl Parser {
         })
     }
 
+        fn parse_table_reference(&mut self) -> Result<super::ast::TableReference> {
+        if self.current() == Some("(") {
+            self.advance(); // consume (
+            let subquery = self.parse_select()?;
+            self.expect(")")?;
+
+            let alias = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("AS")) {
+                self.advance(); // consume optional AS
+                self.parse_identifier()?
+            } else {
+                // In many SQL dialects, an alias for a subquery in FROM is mandatory.
+                self.parse_identifier().map_err(|_| anyhow!("Subquery in FROM clause must have an alias"))?
+            };
+
+            Ok(super::ast::TableReference::Subquery(Box::new(subquery), alias))
+        } else {
+            let table_name = self.parse_qualified_name()?;
+            let mut alias = None;
+            if self.current().map_or(false, |t| t.eq_ignore_ascii_case("AS")) {
+                self.advance(); // consume AS
+                alias = Some(self.parse_identifier()?);
+            } else if let Some(token) = self.current() {
+                if !["WHERE", "GROUP", "ORDER", "LIMIT", "OFFSET", "JOIN", "LEFT", "RIGHT", "INNER", "FULL", "CROSS", "UNION", "INTERSECT", "EXCEPT", ")", ";", "ON"].iter().any(|k| k.eq_ignore_ascii_case(token)) {
+                    alias = Some(self.parse_identifier()?);
+                }
+            }
+            Ok(super::ast::TableReference::Table { name: table_name, alias })
+        }
+    }
+
     pub fn parse_select(&mut self) -> Result<SelectStatement> {
         self.expect("SELECT")?;
+        let mut distinct_on = Vec::new();
+        if self.current().map_or(false, |t| t.eq_ignore_ascii_case("DISTINCT")) {
+            self.advance();
+            if self.current().map_or(false, |t| t.eq_ignore_ascii_case("ON")) {
+                self.advance();
+                self.expect("(")?;
+                distinct_on = self.parse_expression_list()?;
+                self.expect(")")?;
+            }
+        }
         let columns = self.parse_column_list()?;
 
         self.expect("FROM")?;
-        let from_table = self.parse_qualified_name()?;
+        let from = self.parse_table_reference()?;
 
         let mut joins = Vec::new();
         loop {
@@ -1225,11 +1358,11 @@ impl Parser {
                 break;
             }
 
-            let table = self.parse_qualified_name()?;
+            let table = self.parse_table_reference()?;
 
             let on_condition = if on_expected {
                 self.expect("ON")?;
-                self.parse_expression()? 
+                self.parse_expression()?
             } else {
                 SimpleExpression::Literal(SimpleValue::Boolean(true))
             };
@@ -1251,15 +1384,22 @@ impl Parser {
         let group_by = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("GROUP")) {
             self.advance();
             self.expect("BY")?;
-            self.parse_expression_list()? 
+            self.parse_expression_list()?
         } else {
             Vec::new()
+        };
+
+        let having_clause = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("HAVING")) {
+            self.advance();
+            Some(self.parse_expression()?)
+        } else {
+            None
         };
 
         let order_by = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("ORDER")) {
             self.advance();
             self.expect("BY")?;
-            self.parse_order_by_list()? 
+            self.parse_order_by_list()?
         } else {
             Vec::new()
         };
@@ -1293,15 +1433,28 @@ impl Parser {
             self.advance();
         }
 
-        let union = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("UNION")) {
-            self.advance(); // consume UNION
+        let set_operator = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("UNION"))
+            || self.current().map_or(false, |t| t.eq_ignore_ascii_case("INTERSECT"))
+            || self.current().map_or(false, |t| t.eq_ignore_ascii_case("EXCEPT"))
+        {
+            let op_str = self.current().unwrap().to_uppercase();
+            self.advance(); // consume UNION/INTERSECT/EXCEPT
+
+            let operator = match op_str.as_str() {
+                "UNION" => SetOperatorType::Union,
+                "INTERSECT" => SetOperatorType::Intersect,
+                "EXCEPT" => SetOperatorType::Except,
+                _ => unreachable!(),
+            };
+
             let all = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("ALL")) {
                 self.advance();
                 true
             } else {
                 false
             };
-            Some(Box::new(UnionClause {
+            Some(Box::new(SetOperatorClause {
+                operator,
                 all,
                 select: Box::new(self.parse_select()?),
             }))
@@ -1311,14 +1464,16 @@ impl Parser {
 
         Ok(SelectStatement {
             columns,
-            from_table,
+            distinct_on,
+            from,
             joins,
             where_clause,
             group_by,
+            having_clause,
             order_by,
             limit,
             offset,
-            union,
+            set_operator,
         })
     }
 }

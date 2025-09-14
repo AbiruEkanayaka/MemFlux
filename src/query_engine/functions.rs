@@ -8,6 +8,154 @@ pub fn register_string_functions(registry: &mut crate::types::FunctionRegistry) 
     registry.register("LENGTH", Box::new(length));
     registry.register("TRIM", Box::new(trim));
     registry.register("SUBSTRING", Box::new(substring));
+    registry.register("IS_NULL", Box::new(is_null));
+    registry.register("IS_NOT_NULL", Box::new(is_not_null));
+    registry.register("EXISTS", Box::new(exists));
+    registry.register("=_ANY", Box::new(eq_any));
+    registry.register("!=_ANY", Box::new(ne_any));
+    registry.register(">_ANY", Box::new(gt_any));
+    registry.register("<_ANY", Box::new(lt_any));
+    registry.register(">=_ANY", Box::new(ge_any));
+    registry.register("<=_ANY", Box::new(le_any));
+    registry.register("=_ALL", Box::new(eq_all));
+    registry.register("!=_ALL", Box::new(ne_all));
+    registry.register(">_ALL", Box::new(gt_all));
+    registry.register("<_ALL", Box::new(lt_all));
+    registry.register(">=_ALL", Box::new(ge_all));
+    registry.register("<=_ALL", Box::new(le_all));
+}
+
+fn compare_values(op: &str, left: &Value, right: &Value) -> Result<bool> {
+    match op {
+        "=" => Ok(left == right),
+        "!=" => Ok(left != right),
+        ">" | "<" | ">=" | "<=" => {
+            let l_num = left.as_f64();
+            let r_num = right.as_f64();
+
+            if let (Some(l), Some(r)) = (l_num, r_num) {
+                match op {
+                    ">" => Ok(l > r),
+                    "<" => Ok(l < r),
+                    ">=" => Ok(l >= r),
+                    "<=" => Ok(l <= r),
+                    _ => unreachable!(), // Should not happen due to outer match
+                }
+            } else {
+                // If either is not a number, numeric comparison is false
+                Ok(false)
+            }
+        }
+        _ => Err(anyhow!("Unsupported comparison operator: {}", op)),
+    }
+}
+
+fn handle_any_all(op: &str, quantifier: &str, args: Vec<Value>) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(anyhow!("{} {} expects 2 arguments", op, quantifier));
+    }
+    let left_val = &args[0];
+    let subquery_result = match &args[1] {
+        Value::Array(arr) => arr,
+        _ => return Err(anyhow!("Second argument to {} {} must be an array (subquery result)", op, quantifier)),
+    };
+
+    if subquery_result.is_empty() {
+        return Ok(json!(quantifier == "ALL")); // ALL on empty set is true, ANY on empty set is false
+    }
+
+    let mut any_true_comparison = false;
+    let mut any_false_comparison = false;
+    let mut any_null_outcome = false;
+
+    for sub_val_wrapper in subquery_result {
+        let sub_val = match sub_val_wrapper.as_object().and_then(|obj| obj.values().next()) {
+            Some(table_obj) => {
+                if table_obj.is_object() && table_obj.as_object().unwrap().len() == 1 {
+                    table_obj.as_object().unwrap().values().next().unwrap_or(&serde_json::Value::Null)
+                } else {
+                    table_obj
+                }
+            },
+            None => {
+                any_null_outcome = true;
+                continue;
+            }
+        };
+
+        if sub_val.is_null() || left_val.is_null() {
+            any_null_outcome = true;
+            continue;
+        }
+
+        let comparison_result = compare_values(op, left_val, sub_val)?;
+        if comparison_result {
+            any_true_comparison = true;
+        } else {
+            any_false_comparison = true;
+        }
+    }
+
+    match quantifier {
+        "ANY" => {
+            if any_true_comparison {
+                Ok(json!(true))
+            } else if any_null_outcome {
+                Ok(Value::Null)
+            } else {
+                Ok(json!(false))
+            }
+        }
+        "ALL" => {
+            if any_false_comparison {
+                Ok(json!(false))
+            } else if any_null_outcome {
+                Ok(Value::Null)
+            } else {
+                Ok(json!(true))
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn eq_any(args: Vec<Value>) -> Result<Value> { handle_any_all("=", "ANY", args) }
+fn ne_any(args: Vec<Value>) -> Result<Value> { handle_any_all("!=", "ANY", args) }
+fn gt_any(args: Vec<Value>) -> Result<Value> { handle_any_all(">", "ANY", args) }
+fn lt_any(args: Vec<Value>) -> Result<Value> { handle_any_all("<", "ANY", args) }
+fn ge_any(args: Vec<Value>) -> Result<Value> { handle_any_all(">=", "ANY", args) }
+fn le_any(args: Vec<Value>) -> Result<Value> { handle_any_all("<=", "ANY", args) }
+
+fn eq_all(args: Vec<Value>) -> Result<Value> { handle_any_all("=", "ALL", args) }
+fn ne_all(args: Vec<Value>) -> Result<Value> { handle_any_all("!=", "ALL", args) }
+fn gt_all(args: Vec<Value>) -> Result<Value> { handle_any_all(">", "ALL", args) }
+fn lt_all(args: Vec<Value>) -> Result<Value> { handle_any_all("<", "ALL", args) }
+fn ge_all(args: Vec<Value>) -> Result<Value> { handle_any_all(">=", "ALL", args) }
+fn le_all(args: Vec<Value>) -> Result<Value> { handle_any_all("<=", "ALL", args) }
+
+// This function will be evaluated in `Expression::FunctionCall`
+fn exists(args: Vec<Value>) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(anyhow!("EXISTS expects 1 argument (a subquery result)"));
+    }
+    match &args[0] {
+        Value::Array(arr) => Ok(json!(!arr.is_empty())),
+        _ => Err(anyhow!("EXISTS expects an array result from subquery")), // Should not happen if subquery evaluation is correct
+    }
+}
+
+fn is_null(args: Vec<Value>) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(anyhow!("IS_NULL expects 1 argument"));
+    }
+    Ok(json!(args[0].is_null()))
+}
+
+fn is_not_null(args: Vec<Value>) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(anyhow!("IS_NOT_NULL expects 1 argument"));
+    }
+    Ok(json!(!args[0].is_null()))
 }
 
 fn lower(args: Vec<Value>) -> Result<Value> {

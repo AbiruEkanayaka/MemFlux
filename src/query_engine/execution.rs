@@ -194,7 +194,7 @@ pub fn execute<'a>(
                     if let Some(r) = ctx.db.get(&key) {
                         let mut value = match r.value() {
                             DbValue::Json(v) => v.clone(),
-                            DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_else(|_| json!({})),
+                            DbValue::JsonB(b) => serde_json::from_slice(b)?,
                             _ => json!({}),
                         };
                         if let Some(obj) = value.as_object_mut() {
@@ -303,7 +303,11 @@ pub fn execute<'a>(
                         let name = match alias {
                             Some(name) => name.clone(),
                             None => match expr {
-                                Expression::Column(name) => name.clone(),
+                                Expression::Column(name) => {
+                                    // Keep the full qualified name in the output if no alias is given.
+                                    // This is what the tests expect.
+                                    name.clone()
+                                },
                                 Expression::AggregateFunction { func, arg } => {
                                     if let Expression::Column(arg_name) = &**arg {
                                         format!("{}({})", func, arg_name)
@@ -1339,38 +1343,6 @@ pub fn execute<'a>(
 
                 yield json!({"status": "Schema created"});
             }
-            PhysicalPlan::Union { left, right, all } => {
-                if all {
-                    // UNION ALL
-                    let mut left_stream = execute(*left, ctx.clone(), outer_row);
-                    while let Some(row) = left_stream.next().await {
-                        yield row?;
-                    }
-                    let mut right_stream = execute(*right, ctx.clone(), outer_row);
-                    while let Some(row) = right_stream.next().await {
-                        yield row?;
-                    }
-                } else {
-                    // UNION (DISTINCT)
-                    let mut seen = std::collections::HashSet::new();
-                    let mut left_stream = execute(*left, ctx.clone(), outer_row);
-                    while let Some(row_result) = left_stream.next().await {
-                        let row = row_result?;
-                        let row_str = row.to_string();
-                        if seen.insert(row_str) {
-                            yield row;
-                        }
-                    }
-                    let mut right_stream = execute(*right, ctx.clone(), outer_row);
-                    while let Some(row_result) = right_stream.next().await {
-                        let row = row_result?;
-                        let row_str = row.to_string();
-                        if seen.insert(row_str) {
-                            yield row;
-                        }
-                    }
-                }
-            }
             PhysicalPlan::Values { values } => {
                 for row_values in values {
                     let mut row = json!({});
@@ -1380,6 +1352,59 @@ pub fn execute<'a>(
                         row[format!("column_{}", i)] = value;
                     }
                     yield row;
+                }
+            }
+            PhysicalPlan::DistinctOn { input, expressions } => {
+                let mut seen_keys = std::collections::HashSet::new();
+                let mut stream = execute(*input, ctx.clone(), outer_row);
+                while let Some(row_result) = stream.next().await {
+                    let row = row_result?;
+                    let mut key_parts = Vec::new();
+                    for expr in &expressions {
+                        key_parts.push(expr.evaluate_with_context(&row, outer_row, ctx.clone()).await?);
+                    }
+                    let key = serde_json::to_string(&key_parts)?;
+                    if seen_keys.insert(key) {
+                        yield row;
+                    }
+                }
+            }
+            PhysicalPlan::UnionAll { left, right } => {
+                let mut left_stream = execute(*left, ctx.clone(), outer_row);
+                while let Some(row) = left_stream.next().await {
+                    yield row?;
+                }
+                let mut right_stream = execute(*right, ctx.clone(), outer_row);
+                while let Some(row) = right_stream.next().await {
+                    yield row?;
+                }
+            }
+            PhysicalPlan::Intersect { left, right } => {
+                let left_rows: std::collections::HashSet<String> = execute(*left, ctx.clone(), outer_row)
+                    .map_ok(|row| row.to_string())
+                    .try_collect()
+                    .await?;
+                let right_rows: std::collections::HashSet<String> = execute(*right, ctx.clone(), outer_row)
+                    .map_ok(|row| row.to_string())
+                    .try_collect()
+                    .await?;
+
+                for row_str in left_rows.intersection(&right_rows) {
+                    yield serde_json::from_str(row_str)?;
+                }
+            }
+            PhysicalPlan::Except { left, right } => {
+                let left_rows: std::collections::HashSet<String> = execute(*left, ctx.clone(), outer_row)
+                    .map_ok(|row| row.to_string())
+                    .try_collect()
+                    .await?;
+                let right_rows: std::collections::HashSet<String> = execute(*right, ctx.clone(), outer_row)
+                    .map_ok(|row| row.to_string())
+                    .try_collect()
+                    .await?;
+
+                for row_str in left_rows.difference(&right_rows) {
+                    yield serde_json::from_str(row_str)?;
                 }
             }
         PhysicalPlan::CreateIndex { statement } => {
@@ -1437,8 +1462,31 @@ pub fn execute<'a>(
                 }
 
                 yield json!({ "status": format!("Index '{}' created and backfilled {} items.", statement.index_name, backfilled_count) });
+            },
+            PhysicalPlan::SubqueryScan { alias, input } => {
+                let mut stream = execute(*input, ctx.clone(), outer_row);
+                while let Some(row_result) = stream.next().await {
+                    let row = row_result?;
+                    let mut new_row = json!({});
+
+                    // If the input row is a single-key object (like from a table scan),
+                    // unwrap it and re-wrap it with the alias.
+                    if let Some(obj) = row.as_object() {
+                        if obj.keys().len() == 1 {
+                            if let Some(val) = obj.values().next() {
+                                new_row[alias.clone()] = val.clone();
+                                yield new_row;
+                                continue;
+                            }
+                        }
+                    }
+                    
+                    // Otherwise, for complex subqueries (e.g. from a projection), wrap the whole row.
+                    new_row[alias.clone()] = row;
+                    yield new_row;
+                }
             }
-        }
+            }
     })
 }
 

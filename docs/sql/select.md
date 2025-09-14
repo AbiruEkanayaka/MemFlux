@@ -4,21 +4,30 @@ The `SELECT` statement is the primary way to query data in MemFlux. It allows fo
 
 ### Syntax
 ```sql
-SELECT [column1, column2, ...] | *
-FROM table_name
+SELECT [DISTINCT [ON (expression, ...)]] [column1, column2, ...] | *
+FROM table_name | (subquery) [AS alias]
 [JOIN other_table ON condition]
 [WHERE filter_condition]
 [GROUP BY column1, ...]
+[HAVING having_condition]
 [ORDER BY column1 [ASC | DESC], ...]
 [LIMIT count]
 [OFFSET start]
-[UNION | UNION ALL SELECT ...]
+[UNION | UNION ALL | INTERSECT | EXCEPT SELECT ...]
 ```
 
 ## Clauses
 
-### `FROM table_name`
-Specifies the primary table for the query. This corresponds to a key prefix (e.g., `FROM users` queries keys starting with `users:`).
+### `FROM` Clause
+Specifies the primary data source for the query.
+- **Table:** A table name, which corresponds to a key prefix (e.g., `FROM users` queries keys starting with `users:`).
+- **Subquery:** A nested `SELECT` statement in parentheses. A subquery in the `FROM` clause must have an alias.
+
+**Example:**
+```sql
+-- Query from a derived table
+SELECT avg_age FROM (SELECT AVG(age) as avg_age FROM users) AS stats;
+```
 
 ### `SELECT` Clause
 Specifies the columns (fields) to be returned.
@@ -26,18 +35,32 @@ Specifies the columns (fields) to be returned.
 - `SELECT column1, column2`: Returns only the specified fields.
 - **Aliases:** You can rename columns in the output using `AS`: `SELECT name AS user_name, age FROM users`.
 - **Expressions:** You can use functions and expressions: `SELECT name, age * 2 AS doubled_age FROM users`.
-
-### `WHERE` Clause
-Filters the rows based on a condition.
-- **Operators:** `=`, `!=`, `>`, `<`, `>=`, `<=`.
-- **Pattern Matching:** `LIKE` (case-sensitive) and `ILIKE` (case-insensitive). The wildcards are `%` (matches any number of characters) and `_` (matches a single character). To match a literal wildcard character (like `%` or `_`), you can escape it with a backslash (e.g., `\%` matches a literal `%`). To match a literal backslash, use two backslashes (`\\`).
-- **Logical Operators:** `AND`, `OR`.
-- **Subqueries:** `IN (SELECT ...)` and `= (SELECT ...)` are supported.
+- **Scalar Subqueries:** A subquery that returns a single row and a single column can be used as a value in the `SELECT` list.
+- **`DISTINCT`:** Returns only unique rows.
+- **`DISTINCT ON (expression, ...)`:** A PostgreSQL-compatible feature that returns the first row for each unique combination of the specified expressions. The "first" row is determined by the `ORDER BY` clause.
 
 **Example:**
 ```sql
-SELECT name, age FROM users WHERE city = 'SF' AND age > 25;
+-- Get the youngest user from each city
+SELECT DISTINCT ON (city) name, city, age
+FROM users
+ORDER BY city, age ASC;
 ```
+
+### `WHERE` Clause
+Filters rows based on a condition before any grouping.
+
+| Operator | Description | Example |
+|---|---|---|
+| `=`, `!=`, `>`, `<`, `>=`, `<=` | Standard comparison operators. | `age > 30` |
+| `AND`, `OR` | Logical operators to combine conditions. | `age > 30 AND city = 'SF'` |
+| `LIKE`, `ILIKE` | Case-sensitive (`LIKE`) and case-insensitive (`ILIKE`) pattern matching. `%` matches any string, `_` matches any single character. | `name LIKE 'A%'` |
+| `BETWEEN` | Checks if a value is within a range (inclusive). | `age BETWEEN 20 AND 30` |
+| `IS NULL`, `IS NOT NULL` | Checks if a value is or is not `NULL`. | `email IS NOT NULL` |
+| `IN` | Checks if a value is in a list of literals or a subquery. | `city IN ('SF', 'NYC')` or `id IN (SELECT user_id FROM active_sessions)` |
+| `EXISTS` | Returns `true` if a subquery returns any rows. | `EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id)` |
+| `= ANY(...)`, `> ALL(...)` | Compares a value to the results of a subquery. `ANY` returns `true` if the comparison is true for at least one subquery value. `ALL` returns `true` if the comparison is true for all subquery values. | `age > ANY(SELECT age FROM admins)` |
+
 
 ### `JOIN` Clause
 Combines rows from two or more tables based on a related column.
@@ -55,7 +78,7 @@ JOIN orders ON users.id = orders.user_id;
 ```
 
 ### `GROUP BY` Clause
-Groups rows that have the same values in specified columns into summary rows. It is often used with aggregate functions.
+Groups rows that have the same values in specified columns into summary rows. It is almost always used with aggregate functions.
 
 **Example:**
 ```sql
@@ -71,11 +94,22 @@ GROUP BY city;
 - `MIN(column)`: Finds the minimum value in a column.
 - `MAX(column)`: Finds the maximum value in a column.
 
+### `HAVING` Clause
+Filters the results of a `GROUP BY` clause. It is like a `WHERE` clause, but it operates on the results of aggregate functions.
+
+**Example:**
+```sql
+-- Find cities with more than 10 users
+SELECT city, COUNT(*)
+FROM users
+GROUP BY city
+HAVING COUNT(*) > 10;
+```
+
 ### `ORDER BY` Clause
 Sorts the result set in ascending or descending order.
 - `ASC`: Ascending order (default).
 - `DESC`: Descending order.
-- **Type-Aware Sorting:** If a virtual schema is present, sorting will be performed based on the column's data type (e.g., `20` comes after `5` for an `INTEGER` column, even if they are stored as strings).
 - **NULLs:** `NULL` values are always sorted first, regardless of `ASC` or `DESC` direction.
 
 **Example:**
@@ -84,7 +118,7 @@ SELECT name, age FROM users ORDER BY age DESC, name ASC;
 ```
 
 ### `LIMIT` and `OFFSET` Clauses
-Constrains the number of rows returned.
+Constrains the number of rows returned, typically for pagination.
 - `LIMIT count`: Returns a maximum of `count` rows.
 - `OFFSET start`: Skips the first `start` rows before beginning to return rows.
 
@@ -94,16 +128,20 @@ Constrains the number of rows returned.
 SELECT name FROM users ORDER BY name LIMIT 10 OFFSET 20;
 ```
 
-### `UNION` and `UNION ALL`
+### Set Operators (`UNION`, `INTERSECT`, `EXCEPT`)
 Combines the result sets of two or more `SELECT` statements.
-- `UNION`: Removes duplicate rows from the combined result set.
-- `UNION ALL`: Includes all rows, including duplicates.
+
+- **`UNION`**: Combines results and removes duplicate rows.
+- **`UNION ALL`**: Combines results and includes all rows, including duplicates.
+- **`INTERSECT`**: Returns only the rows that appear in both result sets.
+- **`EXCEPT`**: Returns rows from the first result set that do not appear in the second.
 
 **Example:**
 ```sql
-SELECT name FROM table1
-UNION ALL
-SELECT name FROM table2;
+-- All users who are either in SF or have placed an order
+SELECT name FROM users WHERE city = 'SF'
+UNION
+SELECT name FROM users JOIN orders ON users.id = orders.user_id;
 ```
 
 ### `CASE` Expressions
