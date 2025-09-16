@@ -25,5 +25,5 @@ For detailed information on specific SQL commands and features, please refer to 
 
 *   **[Data Definition Language (DDL)](./sql/ddl.md):** Learn how to define and manage your data structures with `CREATE TABLE`, `DROP TABLE`, and `ALTER TABLE`.
 *   **[Data Manipulation Language (DML)](./sql/dml.md):** Learn how to create, modify, and delete data with `INSERT`, `UPDATE`, and `DELETE`.
-*   **[The `SELECT` Statement](./sql/select.md):** A comprehensive guide to querying data, including `JOIN`s, `WHERE` clauses, `GROUP BY`, `ORDER BY`, and more.
+*   **[The `SELECT` Statement](./sql/select.md):** A comprehensive guide to querying data, including `JOIN`s, `WHERE` clauses, `GROUP BY`, `ORDER BY`, Common Table Expressions (CTEs), and more.
 *   **[Built-in Functions](./sql/functions.md):** A reference for all available scalar functions for data manipulation and transformation.

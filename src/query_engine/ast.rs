@@ -80,6 +80,19 @@ pub struct SetOperatorClause {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
+pub struct Cte {
+    pub alias: String,
+    pub column_names: Vec<String>,
+    pub query: SelectStatement,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
+pub struct WithClause {
+    pub recursive: bool,
+    pub ctes: Vec<Cte>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub struct SelectColumn {
     pub expr: SimpleExpression,
     pub alias: Option<String>,
@@ -87,6 +100,7 @@ pub struct SelectColumn {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub struct SelectStatement {
+    pub with: Option<WithClause>,
     pub columns: Vec<SelectColumn>,
     pub distinct_on: Vec<SimpleExpression>,
     pub from: TableReference,

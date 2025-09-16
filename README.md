@@ -27,6 +27,7 @@ Database is designed with a dual-purpose architecture: it can be run as a **stan
     *   **Lists & Sets:** Redis-compatible list and set operations.
 *   **Integrated SQL Query Engine:** A powerful, built-from-scratch query engine that operates directly on your in-memory data. Supports:
     *   Complex `SELECT` queries with `JOIN`s, `GROUP BY`, aggregates (`COUNT`, `SUM`, `AVG`), `ORDER BY`, `LIMIT`, subqueries, and `CASE` statements.
+    *   Common Table Expressions (CTEs) using the `WITH` clause, including `WITH RECURSIVE` for hierarchical or graph-based queries.
     *   Data Manipulation Language (DML): `INSERT`, `UPDATE`, `DELETE`.
     *   Data Definition Language (DDL): `CREATE/DROP/ALTER TABLE`, `CREATE/DROP VIEW`, and `CREATE SCHEMA` for managing virtual schemas and namespaces.
     *   Rich Data Types: `INTEGER`, `TEXT`, `TIMESTAMPTZ`, `NUMERIC`, `UUID`, `BYTEA`, arrays (`INTEGER[]`), and more.

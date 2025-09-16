@@ -71,7 +71,33 @@ def test_sql_comparison_operators(sock, reader):
     
     print("[PASS] Operator tests complete")
 
-    # --- 3. Cleanup ---
-    print("\n-- Phase 3: Cleanup --")
+    # --- 3. Arithmetic Operator Tests ---
+    print("\n-- Phase 3: Testing Arithmetic Operators --")
+    
+    # In SELECT clause
+    results = send_and_parse(["SQL", "SELECT", "value", "+", "5", "as", "v", "FROM", "op_test", "WHERE", "name", "=", "'A'"], "SELECT with +")
+    assert_eq(results[0]['v'], 15.0, "SELECT with + operator")
+
+    results = send_and_parse(["SQL", "SELECT", "value", "-", "5", "as", "v", "FROM", "op_test", "WHERE", "name", "=", "'B'"], "SELECT with -")
+    assert_eq(results[0]['v'], 15.0, "SELECT with - operator")
+
+    results = send_and_parse(["SQL", "SELECT", "value", "*", "2", "as", "v", "FROM", "op_test", "WHERE", "name", "=", "'C'"], "SELECT with *")
+    assert_eq(results[0]['v'], 40.0, "SELECT with * operator")
+
+    results = send_and_parse(["SQL", "SELECT", "value", "/", "2", "as", "v", "FROM", "op_test", "WHERE", "name", "=", "'D'"], "SELECT with /")
+    assert_eq(results[0]['v'], 15.0, "SELECT with / operator")
+
+    # In WHERE clause
+    results = send_and_parse(["SQL", "SELECT", "name", "FROM", "op_test", "WHERE", "value", "*", "2", ">", "30"], "WHERE with arithmetic")
+    assert_eq(get_column_as_set(results, 'name'), {"B", "C", "D"}, "Names for WHERE with arithmetic")
+
+    # In ORDER BY clause
+    results = send_and_parse(["SQL", "SELECT", "name", "FROM", "op_test", "ORDER", "BY", "value", "*", "-1", "DESC", ",", "name", "ASC"], "ORDER BY with arithmetic")
+    assert_eq([r['name'] for r in results], ["A", "B", "C", "D"], "Names for ORDER BY with arithmetic")
+    
+    print("[PASS] Arithmetic operator tests complete")
+
+    # --- 4. Cleanup ---
+    print("\n-- Phase 4: Cleanup --")
     send(["DELETE", "op_test:1", "op_test:2", "op_test:3", "op_test:4"])
     print("[PASS] Cleanup complete")

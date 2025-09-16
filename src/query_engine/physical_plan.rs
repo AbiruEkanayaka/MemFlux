@@ -5,7 +5,7 @@ use super::ast::{AlterTableAction, ColumnDef, CreateIndexStatement, SelectStatem
 use super::logical_plan::{*};
 use crate::indexing::IndexManager;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum PhysicalPlan {
     TableScan {
         prefix: String,
@@ -17,6 +17,17 @@ pub enum PhysicalPlan {
     SubqueryScan {
         alias: String,
         input: Box<PhysicalPlan>,
+    },
+    RecursiveCteScan {
+        alias: String,
+        column_aliases: Vec<String>,
+        non_recursive: Box<PhysicalPlan>,
+        recursive: Box<PhysicalPlan>,
+        union_all: bool,
+    },
+    WorkingTableScan {
+        cte_name: String,
+        alias: String,
     },
     Filter {
         input: Box<PhysicalPlan>,
@@ -297,6 +308,14 @@ pub fn logical_to_physical_plan(
             input: Box::new(logical_to_physical_plan(*input, index_manager)?),
             expressions,
         }),
+        LogicalPlan::RecursiveCteScan { alias, column_aliases, non_recursive, recursive, union_all } => Ok(PhysicalPlan::RecursiveCteScan {
+            alias,
+            column_aliases,
+            non_recursive: Box::new(logical_to_physical_plan(*non_recursive, index_manager)?),
+            recursive: Box::new(logical_to_physical_plan(*recursive, index_manager)?),
+            union_all,
+        }),
+        LogicalPlan::WorkingTableScan { cte_name, alias } => Ok(PhysicalPlan::WorkingTableScan { cte_name, alias }),
     }
 }
 
@@ -313,12 +332,3 @@ fn extract_col_eq_literal(predicate: &Expression) -> Option<(String, Value)> {
     }
     None
 }
-
-
-
-
-
-
-
-
-

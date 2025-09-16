@@ -5,7 +5,7 @@ use super::ast::{AlterTableAction, AstStatement, CaseExpression, ColumnDef, Crea
     DropTableStatement, DropViewStatement, ForeignKeyClause, InsertStatement, JoinClause,
     OrderByExpression, SelectColumn, SelectStatement, SimpleExpression, SimpleValue,
     TableConstraint, TruncateTableStatement, UpdateStatement, AlterTableStatement, InsertSource, OnConflict,
-    SetOperatorClause, SetOperatorType};
+    SetOperatorClause, SetOperatorType, Cte, WithClause};
 
 // Very simple tokenizer
 fn tokenize(sql: &str) -> Vec<String> {
@@ -40,7 +40,7 @@ fn tokenize(sql: &str) -> Vec<String> {
                     current_token.clear();
                 }
             }
-            '=' | ',' | '(' | ')' | '>' | '<' | '!' | '[' | ']'=> {
+            '=' | ',' | '(' | ')' | '>' | '<' | '!' | '[' | ']' | '+' | '-' | '*' | '/' => {
                 if !current_token.is_empty() {
                     tokens.push(current_token.clone());
                     current_token.clear();
@@ -210,8 +210,52 @@ impl Parser {
         Ok(left)
     }
 
+    fn parse_additive_expression(&mut self) -> Result<SimpleExpression> {
+        let mut left = self.parse_multiplicative_expression()?;
+        while self.current() == Some("+") || self.current() == Some("-") {
+            let op = self.current().unwrap().to_string();
+            self.advance();
+            let right = self.parse_multiplicative_expression()?;
+            left = SimpleExpression::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_unary_expression(&mut self) -> Result<SimpleExpression> {
+        if self.current() == Some("-") {
+            self.advance(); // consume "-"
+            let expr = self.parse_unary_expression()?;
+            // Represent as 0 - expr
+            return Ok(SimpleExpression::BinaryOp {
+                left: Box::new(SimpleExpression::Literal(SimpleValue::Number("0".to_string()))),
+                op: "-".to_string(),
+                right: Box::new(expr),
+            });
+        }
+        self.parse_primary_expression()
+    }
+
+    fn parse_multiplicative_expression(&mut self) -> Result<SimpleExpression> {
+        let mut left = self.parse_unary_expression()?;
+        while self.current() == Some("*") || self.current() == Some("/") {
+            let op = self.current().unwrap().to_string();
+            self.advance();
+            let right = self.parse_unary_expression()?;
+            left = SimpleExpression::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
     fn parse_comparison_expression(&mut self) -> Result<SimpleExpression> {
-        let left = self.parse_primary_expression()?;
+        let left = self.parse_additive_expression()?;
 
         if self.current().map_or(false, |t| t.eq_ignore_ascii_case("IS")) {
             self.advance(); // consume IS
@@ -480,7 +524,7 @@ impl Parser {
     fn parse_expression_list(&mut self) -> Result<Vec<SimpleExpression>> {
         let mut exprs = Vec::new();
         loop {
-            exprs.push(self.parse_primary_expression()?);
+            exprs.push(self.parse_expression()?);
             if self.current() == Some(",") {
                 self.advance();
             } else {
@@ -493,7 +537,7 @@ impl Parser {
     fn parse_order_by_list(&mut self) -> Result<Vec<OrderByExpression>> {
         let mut exprs = Vec::new();
         loop {
-            let expr = self.parse_primary_expression()?;
+            let expr = self.parse_expression()?;
             let asc = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("DESC")) {
                 self.advance();
                 false
@@ -576,6 +620,7 @@ impl Parser {
 
     pub fn parse(&mut self) -> Result<AstStatement> {
         match self.current().map(|s| s.to_uppercase()).as_deref() {
+            Some("WITH") => Ok(AstStatement::Select(self.parse_select()?)),
             Some("SELECT") => Ok(AstStatement::Select(self.parse_select()?)),
             Some("INSERT") => Ok(AstStatement::Insert(self.parse_insert()?)),
             Some("DELETE") => Ok(AstStatement::Delete(self.parse_delete()?)),
@@ -1310,8 +1355,49 @@ impl Parser {
         }
     }
 
+    fn parse_cte(&mut self) -> Result<Cte> {
+        let alias = self.parse_identifier()?;
+        let mut column_names = Vec::new();
+        if self.current() == Some("(") {
+            self.advance(); // consume (
+            column_names = self.parse_identifier_list()?;
+            self.expect(")")?;
+        }
+        self.expect("AS")?;
+        self.expect("(")?;
+        let query = self.parse_select()?;
+        self.expect(")")?;
+        Ok(Cte { alias, column_names, query })
+    }
+
     pub fn parse_select(&mut self) -> Result<SelectStatement> {
-        self.parse_select_internal(false)
+        let with = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("WITH")) {
+            self.advance(); // consume WITH
+
+            let recursive = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("RECURSIVE")) {
+                self.advance(); // consume RECURSIVE
+                true
+            } else {
+                false
+            };
+
+            let mut ctes = Vec::new();
+            loop {
+                ctes.push(self.parse_cte()?);
+                if self.current() == Some(",") {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            Some(WithClause { recursive, ctes })
+        } else {
+            None
+        };
+
+        let mut select_statement = self.parse_select_internal(false)?;
+        select_statement.with = with;
+        Ok(select_statement)
     }
 
     fn parse_select_internal(&mut self, is_set_operand: bool) -> Result<SelectStatement> {
@@ -1479,6 +1565,7 @@ impl Parser {
         };
 
         Ok(SelectStatement {
+            with: None,
             columns,
             distinct_on,
             from,
