@@ -109,6 +109,12 @@ CREATE TABLE orders (
 );
 ```
 
+## Common Table Expressions (CTEs)
+
+Common Table Expressions (CTEs), defined using the `WITH` clause, allow you to create temporary, named result sets that you can reference within a single `SELECT`, `INSERT`, `UPDATE`, or `DELETE` statement. They help in making complex queries more readable and manageable, and support recursive queries.
+
+For detailed syntax and examples, refer to the [SQL `SELECT` Statement documentation](./sql/select.md#with-clause-common-table-expressions).
+
 ## Enhanced `ALTER TABLE` Commands
 
 The `ALTER TABLE` command is significantly more powerful than previously documented.

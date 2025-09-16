@@ -15,7 +15,7 @@ Persistence is built-in, with a Write-Ahead Log (WAL) for durability and automat
 *   **Powerful SQL Engine:** A custom-built SQL query engine allows for complex queries on JSON data, including:
     *   DDL: `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE` to define virtual schemas.
     *   DML: `INSERT`, `UPDATE`, `DELETE` statements.
-    *   Advanced `SELECT`: `JOIN`s, aggregates (`COUNT`, `SUM`, `AVG`), `GROUP BY`, `ORDER BY`, `LIMIT`, subqueries, and `CASE` expressions.
+    *   Advanced `SELECT`: `JOIN`s, aggregates (`COUNT`, `SUM`, `AVG`), `GROUP BY`, `ORDER BY`, `LIMIT`, subqueries, `CASE` expressions, and Common Table Expressions (CTEs) with `WITH` and `WITH RECURSIVE`.
 *   **JSON Indexing:** Create indexes on specific JSON fields to accelerate query performance.
 *   **Durable Persistence:** Uses a Write-Ahead Log (WAL) for command logging and automatic background snapshotting to ensure data safety and fast restarts.
 *   **Built-in Functions:** A library of SQL functions for string manipulation, numeric operations, and date/time processing.

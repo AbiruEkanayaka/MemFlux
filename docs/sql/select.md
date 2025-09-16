@@ -4,6 +4,7 @@ The `SELECT` statement is the primary way to query data in MemFlux. It allows fo
 
 ### Syntax
 ```sql
+[WITH [RECURSIVE] cte_name AS (subquery), ...]
 SELECT [DISTINCT [ON (expression, ...)]] [column1, column2, ...] | *
 FROM table_name | (subquery) [AS alias]
 [JOIN other_table ON condition]
@@ -17,6 +18,34 @@ FROM table_name | (subquery) [AS alias]
 ```
 
 ## Clauses
+
+### `WITH` Clause (Common Table Expressions)
+The `WITH` clause allows you to define one or more temporary, named result sets, known as Common Table Expressions (CTEs), that can be referenced within the main `SELECT` statement. This is useful for breaking down complex queries into simpler, more readable logical steps.
+
+**Non-Recursive CTE:**
+```sql
+WITH regional_sales AS (
+    SELECT region, SUM(amount) AS total_sales
+    FROM orders
+    GROUP BY region
+)
+SELECT region, total_sales
+FROM regional_sales
+WHERE total_sales > 1000;
+```
+
+**Recursive CTE:**
+A recursive CTE is defined with `WITH RECURSIVE` and must have a structure that includes a non-recursive "base" member, a `UNION` or `UNION ALL`, and a recursive member that references the CTE's own name. It is useful for querying hierarchical or graph-like data.
+
+```sql
+-- Example: Generate a series of numbers from 1 to 5
+WITH RECURSIVE counter(n) AS (
+  SELECT 1
+  UNION ALL
+  SELECT n + 1 FROM counter WHERE n < 5
+)
+SELECT n FROM counter;
+```
 
 ### `FROM` Clause
 Specifies the primary data source for the query.
@@ -34,7 +63,7 @@ Specifies the columns (fields) to be returned.
 - `SELECT *`: Returns all fields from the JSON object.
 - `SELECT column1, column2`: Returns only the specified fields.
 - **Aliases:** You can rename columns in the output using `AS`: `SELECT name AS user_name, age FROM users`.
-- **Expressions:** You can use functions and expressions: `SELECT name, age * 2 AS doubled_age FROM users`.
+- **Expressions:** You can use functions and expressions, including arithmetic (`+`, `-`, `*`, `/`): `SELECT name, age * 2 AS doubled_age FROM users`.
 - **Scalar Subqueries:** A subquery that returns a single row and a single column can be used as a value in the `SELECT` list.
 - **`DISTINCT`:** Returns only unique rows.
 - **`DISTINCT ON (expression, ...)`:** A PostgreSQL-compatible feature that returns the first row for each unique combination of the specified expressions. The "first" row is determined by the `ORDER BY` clause.
