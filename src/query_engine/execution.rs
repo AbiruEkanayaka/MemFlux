@@ -144,7 +144,7 @@ async fn project_row<'a>(
     expressions: &'a Vec<(Expression, Option<String>)>, 
     ctx: Arc<AppContext>,
     outer_row: Option<&'a Row>,
-    working_tables: Option<&'a HashMap<String, Vec<Row>>>,
+    _working_tables: Option<&'a HashMap<String, Vec<Row>>>,
 ) -> Result<Row> {
     let mut new_row = json!({});
     let mut is_star = false;
@@ -246,7 +246,7 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::Filter { input, predicate } => {
-                let mut stream = execute(*input, ctx.clone(), outer_row, working_tables);
+                let mut stream = execute(*input, ctx.clone(), outer_row, _working_tables);
                 while let Some(row_result) = stream.next().await {
                     let row = row_result?;
                     if predicate.evaluate_with_context(&row, outer_row, ctx.clone()).await?.as_bool().unwrap_or(false) {
@@ -258,7 +258,7 @@ pub fn execute<'a>(
                 input,
                 expressions,
             } => {
-                let mut stream = execute(*input, ctx.clone(), outer_row, working_tables);
+                let mut stream = execute(*input, ctx.clone(), outer_row, _working_tables);
                 while let Some(row_result) = stream.next().await {
                     let row = row_result?;
                     let mut new_row = json!({});
@@ -325,8 +325,8 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::Join { left, right, condition, join_type } => {
-                let left_rows: Vec<Row> = execute(*left, ctx.clone(), outer_row, working_tables).try_collect().await?;
-                let right_rows: Vec<Row> = execute(*right, ctx.clone(), outer_row, working_tables).try_collect().await?;
+                let left_rows: Vec<Row> = execute(*left, ctx.clone(), outer_row, _working_tables).try_collect().await?;
+                let right_rows: Vec<Row> = execute(*right, ctx.clone(), outer_row, _working_tables).try_collect().await?;
 
                 if join_type == JoinType::Cross {
                     for l_row in &left_rows {
@@ -375,7 +375,7 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::HashAggregate { input, group_expressions, agg_expressions } => {
-                let all_rows: Vec<Row> = execute(*input, ctx.clone(), outer_row, working_tables).try_collect().await?;
+                let all_rows: Vec<Row> = execute(*input, ctx.clone(), outer_row, _working_tables).try_collect().await?;
                 let mut groups: HashMap<String, (Row, Vec<Row>)> = HashMap::new();
 
                 if group_expressions.is_empty() {
@@ -430,7 +430,7 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::Sort { input, sort_expressions } => {
-                let rows: Vec<Row> = execute(*input, ctx.clone(), outer_row, working_tables).try_collect().await?;
+                let rows: Vec<Row> = execute(*input, ctx.clone(), outer_row, _working_tables).try_collect().await?;
                 let mut sort_data = Vec::new();
                 for row in rows.into_iter() {
                     let mut keys = Vec::new();
@@ -461,7 +461,7 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::Limit { input, limit, offset } => {
-                let stream = execute(*input, ctx.clone(), outer_row, working_tables).skip(offset.unwrap_or(0));
+                let stream = execute(*input, ctx.clone(), outer_row, _working_tables).skip(offset.unwrap_or(0));
                 let stream = if let Some(limit) = limit {
                     if limit == 0 { stream.take(0) } else { stream.take(limit) }
                 } else {
@@ -651,7 +651,7 @@ pub fn execute<'a>(
                 let mut returned_rows = Vec::new();
 
                 // Step 1: Execute the source plan and collect all rows to prevent deadlocks.
-                let source_rows: Vec<Row> = execute(*source, ctx.clone(), outer_row, working_tables).try_collect().await?;
+                let source_rows: Vec<Row> = execute(*source, ctx.clone(), outer_row, _working_tables).try_collect().await?;
 
                 // Step 2: Iterate over the collected rows to perform inserts.
                 for source_row in source_rows {
@@ -878,7 +878,7 @@ pub fn execute<'a>(
 
                 if !returning.is_empty() {
                     for returned_row in returned_rows {
-                        let proj_row = project_row(&returned_row, &returning, ctx.clone(), outer_row, working_tables).await?;
+                        let proj_row = project_row(&returned_row, &returning, ctx.clone(), outer_row, _working_tables).await?;
                         yield proj_row;
                     }
                 } else {
@@ -886,7 +886,7 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::Delete { table_name, from, returning } => {
-                let stream = execute(*from, ctx.clone(), outer_row, working_tables);
+                let stream = execute(*from, ctx.clone(), outer_row, _working_tables);
                 let rows_to_delete: Vec<Row> = stream.try_collect().await?;
 
                 // First, apply all ON DELETE actions. If any of these fail, we abort before any actual deletion.
@@ -928,7 +928,7 @@ pub fn execute<'a>(
                         // The row from the plan is nested, e.g. {"users": {"id":1, ...}}
                         // We need to un-nest it for projection.
                         if let Some(inner_row) = returned_row.get(&table_name) {
-                            let proj_row = project_row(inner_row, &returning, ctx.clone(), outer_row, working_tables).await?;
+                            let proj_row = project_row(inner_row, &returning, ctx.clone(), outer_row, _working_tables).await?;
                             yield proj_row;
                         }
                     }
@@ -938,7 +938,7 @@ pub fn execute<'a>(
             }
             PhysicalPlan::Update { table_name, from, set, returning } => {
                 let schema = ctx.schema_cache.get(&table_name);
-                let stream = execute(*from, ctx.clone(), outer_row, working_tables);
+                let stream = execute(*from, ctx.clone(), outer_row, _working_tables);
                 let rows_to_update: Vec<Row> = stream.try_collect().await?;
 
                 let mut updated_count = 0;
@@ -1032,7 +1032,7 @@ pub fn execute<'a>(
 
                 if !returning.is_empty() {
                     for returned_row in returned_rows {
-                        let proj_row = project_row(&returned_row, &returning, ctx.clone(), outer_row, working_tables).await?;
+                        let proj_row = project_row(&returned_row, &returning, ctx.clone(), outer_row, _working_tables).await?;
                         yield proj_row;
                     }
                 } else {
@@ -1358,7 +1358,7 @@ pub fn execute<'a>(
             }
             PhysicalPlan::DistinctOn { input, expressions } => {
                 let mut seen_keys = std::collections::HashSet::new();
-                let mut stream = execute(*input, ctx.clone(), outer_row, working_tables);
+                let mut stream = execute(*input, ctx.clone(), outer_row, _working_tables);
                 while let Some(row_result) = stream.next().await {
                     let row = row_result?;
                     let mut key_parts = Vec::new();
@@ -1372,21 +1372,21 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::UnionAll { left, right } => {
-                let mut left_stream = execute(*left, ctx.clone(), outer_row, working_tables);
+                let mut left_stream = execute(*left, ctx.clone(), outer_row, _working_tables);
                 while let Some(row) = left_stream.next().await {
                     yield row?;
                 }
-                let mut right_stream = execute(*right, ctx.clone(), outer_row, working_tables);
+                let mut right_stream = execute(*right, ctx.clone(), outer_row, _working_tables);
                 while let Some(row) = right_stream.next().await {
                     yield row?;
                 }
             }
             PhysicalPlan::Intersect { left, right } => {
-                let left_rows: std::collections::HashSet<String> = execute(*left, ctx.clone(), outer_row, working_tables)
+                let left_rows: std::collections::HashSet<String> = execute(*left, ctx.clone(), outer_row, _working_tables)
                     .map_ok(|row| row.to_string())
                     .try_collect()
                     .await?;
-                let right_rows: std::collections::HashSet<String> = execute(*right, ctx.clone(), outer_row, working_tables)
+                let right_rows: std::collections::HashSet<String> = execute(*right, ctx.clone(), outer_row, _working_tables)
                     .map_ok(|row| row.to_string())
                     .try_collect()
                     .await?;
@@ -1396,11 +1396,11 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::Except { left, right } => {
-                let left_rows: std::collections::HashSet<String> = execute(*left, ctx.clone(), outer_row, working_tables)
+                let left_rows: std::collections::HashSet<String> = execute(*left, ctx.clone(), outer_row, _working_tables)
                     .map_ok(|row| row.to_string())
                     .try_collect()
                     .await?;
-                let right_rows: std::collections::HashSet<String> = execute(*right, ctx.clone(), outer_row, working_tables)
+                let right_rows: std::collections::HashSet<String> = execute(*right, ctx.clone(), outer_row, _working_tables)
                     .map_ok(|row| row.to_string())
                     .try_collect()
                     .await?;
@@ -1467,7 +1467,7 @@ pub fn execute<'a>(
                 yield json!({ "status": format!("Index '{}' created and backfilled {} items.", statement.index_name, backfilled_count) });
             },
             PhysicalPlan::SubqueryScan { alias, input } => {
-                let mut stream = execute(*input, ctx.clone(), outer_row, working_tables);
+                let mut stream = execute(*input, ctx.clone(), outer_row, _working_tables);
                 while let Some(row_result) = stream.next().await {
                     let row = row_result?;
                     let mut new_row = json!({});
@@ -1490,7 +1490,7 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::WorkingTableScan { cte_name, alias } => {
-                if let Some(tables) = working_tables {
+                if let Some(tables) = _working_tables {
                     if let Some(rows) = tables.get(&cte_name) {
                         for row in rows.clone() {
                             let mut new_row = json!({});
@@ -1555,7 +1555,7 @@ pub fn execute<'a>(
                     }
                 };
 
-                let non_recursive_rows_unaliased: Vec<Row> = execute(*non_recursive, ctx.clone(), outer_row, working_tables).try_collect().await?;
+                let non_recursive_rows_unaliased: Vec<Row> = execute(*non_recursive, ctx.clone(), outer_row, _working_tables).try_collect().await?;
                 let mut non_recursive_rows = Vec::new();
                 for row in non_recursive_rows_unaliased {
                     non_recursive_rows.push(rename_row_columns(row, &column_aliases, &non_recursive_cols)?);
