@@ -24,6 +24,7 @@ from tests.test_data_types_and_constraints import test_data_types_and_constraint
 from tests.test_ddl_enhancements import test_ddl_enhancements
 from tests.test_dml_enhancements import test_dml_enhancements
 from tests.test_dql_enhancements import test_dql_enhancements
+from tests.test_cte import test_cte
 
 
 # Add prompt_toolkit for better interactive input
@@ -85,6 +86,8 @@ def unit_test(conn, reader, mode, ffi_path=None):
         test_dml_enhancements(conn, reader)
     if mode in ("dql_enhancements", "all"):
         test_dql_enhancements(conn, reader)
+    if mode in ("cte", "all"):
+        test_cte(conn, reader)
     
     return conn, reader
 
@@ -168,7 +171,7 @@ if __name__ == "__main__":
                         print(f"Send: {send:.2f}ms, Latency: {lat:.2f}ms, Total: {tot:.2f}ms")
             elif parsed_args.command == "unit":
                 if not parsed_args.args:
-                    print("Usage: python test.py unit {json,byte,lists,sets,sql,snapshot,types,schema,aliases,case,like,functions,union,advanced,operators,indexing,recovery,wrongtype,constraints,ddl_enhancements,dml_enhancements,all}")
+                    print("Usage: python test.py unit {json,byte,lists,sets,sql,snapshot,types,schema,aliases,case,like,functions,union,advanced,operators,indexing,recovery,wrongtype,constraints,ddl_enhancements,dml_enhancements,dql_enhancements,cte,all}")
                     sys.exit(1)
                 mode = parsed_args.args[0]
                 conn, reader = unit_test(conn, reader, mode.lower(), ffi_path=parsed_args.ffi_path)

@@ -169,7 +169,7 @@ impl MemFluxDB {
 
             match physical_plan_result {
                 Ok(physical_plan) => {
-                    let mut stream = execute(physical_plan, self.app_context.clone(), None);
+                    let mut stream = execute(physical_plan, self.app_context.clone(), None, None);
                     while let Some(row_result) = stream.next().await {
                         yield row_result?;
                     }

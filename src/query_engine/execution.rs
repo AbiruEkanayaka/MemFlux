@@ -135,15 +135,16 @@ fn compare_typed_values(
             .unwrap_or(Ordering::Equal),
         (Value::String(s_a), Value::String(s_b)) => s_a.cmp(s_b),
         (Value::Bool(b_a), Value::Bool(b_b)) => b_a.cmp(b_b),
-        _ => Ordering::Equal,
+        _ => val_a.to_string().cmp(&val_b.to_string()),
     }
 }
 
 async fn project_row<'a>(
     row: &'a Row,
-    expressions: &'a Vec<(Expression, Option<String>)>,
+    expressions: &'a Vec<(Expression, Option<String>)>, 
     ctx: Arc<AppContext>,
     outer_row: Option<&'a Row>,
+    working_tables: Option<&'a HashMap<String, Vec<Row>>>,
 ) -> Result<Row> {
     let mut new_row = json!({});
     let mut is_star = false;
@@ -179,9 +180,9 @@ pub fn execute<'a>(
     plan: PhysicalPlan,
     ctx: Arc<AppContext>,
     outer_row: Option<&'a Row>,
+    _working_tables: Option<&'a HashMap<String, Vec<Row>>>,
 ) -> Pin<Box<dyn Stream<Item = Result<Row>> + Send + 'a>> {
-    Box::pin(try_stream! {
-        match plan {
+    Box::pin(try_stream! {        match plan {
             PhysicalPlan::TableScan { prefix } => {
                 let table_name = prefix.strip_suffix(':').unwrap_or(&prefix).to_string();
                 let mut keys = Vec::new();
@@ -245,7 +246,7 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::Filter { input, predicate } => {
-                let mut stream = execute(*input, ctx.clone(), outer_row);
+                let mut stream = execute(*input, ctx.clone(), outer_row, working_tables);
                 while let Some(row_result) = stream.next().await {
                     let row = row_result?;
                     if predicate.evaluate_with_context(&row, outer_row, ctx.clone()).await?.as_bool().unwrap_or(false) {
@@ -257,7 +258,7 @@ pub fn execute<'a>(
                 input,
                 expressions,
             } => {
-                let mut stream = execute(*input, ctx.clone(), outer_row);
+                let mut stream = execute(*input, ctx.clone(), outer_row, working_tables);
                 while let Some(row_result) = stream.next().await {
                     let row = row_result?;
                     let mut new_row = json!({});
@@ -324,8 +325,8 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::Join { left, right, condition, join_type } => {
-                let left_rows: Vec<Row> = execute(*left, ctx.clone(), outer_row).try_collect().await?;
-                let right_rows: Vec<Row> = execute(*right, ctx.clone(), outer_row).try_collect().await?;
+                let left_rows: Vec<Row> = execute(*left, ctx.clone(), outer_row, working_tables).try_collect().await?;
+                let right_rows: Vec<Row> = execute(*right, ctx.clone(), outer_row, working_tables).try_collect().await?;
 
                 if join_type == JoinType::Cross {
                     for l_row in &left_rows {
@@ -374,7 +375,7 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::HashAggregate { input, group_expressions, agg_expressions } => {
-                let all_rows: Vec<Row> = execute(*input, ctx.clone(), outer_row).try_collect().await?;
+                let all_rows: Vec<Row> = execute(*input, ctx.clone(), outer_row, working_tables).try_collect().await?;
                 let mut groups: HashMap<String, (Row, Vec<Row>)> = HashMap::new();
 
                 if group_expressions.is_empty() {
@@ -429,7 +430,7 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::Sort { input, sort_expressions } => {
-                let rows: Vec<Row> = execute(*input, ctx.clone(), outer_row).try_collect().await?;
+                let rows: Vec<Row> = execute(*input, ctx.clone(), outer_row, working_tables).try_collect().await?;
                 let mut sort_data = Vec::new();
                 for row in rows.into_iter() {
                     let mut keys = Vec::new();
@@ -460,7 +461,7 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::Limit { input, limit, offset } => {
-                let stream = execute(*input, ctx.clone(), outer_row).skip(offset.unwrap_or(0));
+                let stream = execute(*input, ctx.clone(), outer_row, working_tables).skip(offset.unwrap_or(0));
                 let stream = if let Some(limit) = limit {
                     if limit == 0 { stream.take(0) } else { stream.take(limit) }
                 } else {
@@ -496,7 +497,7 @@ pub fn execute<'a>(
                     column_order.push(c.name.clone());
                     let dt = DataType::from_str(&c.data_type)?;
                     let default = if let Some(d) = c.default {
-                        Some(super::logical_plan::simple_expr_to_expression(d, &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry)?)
+                        Some(super::logical_plan::simple_expr_to_expression(d, &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry, None)?)
                     } else {
                         None
                     };
@@ -529,7 +530,7 @@ pub fn execute<'a>(
                             if check_expression.is_some() {
                                 Err(anyhow!("Multiple CHECK constraints defined for table '{}'", table_name))?;
                             }
-                            check_expression = Some(super::logical_plan::simple_expr_to_expression(expression.clone(), &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry)?);
+                            check_expression = Some(super::logical_plan::simple_expr_to_expression(expression.clone(), &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry, None)?);
                         }
                         TableConstraint::Unique { name: constraint_name_option, columns } => {
                             // Create unique indexes for unique constraints
@@ -650,7 +651,7 @@ pub fn execute<'a>(
                 let mut returned_rows = Vec::new();
 
                 // Step 1: Execute the source plan and collect all rows to prevent deadlocks.
-                let source_rows: Vec<Row> = execute(*source, ctx.clone(), outer_row).try_collect().await?;
+                let source_rows: Vec<Row> = execute(*source, ctx.clone(), outer_row, working_tables).try_collect().await?;
 
                 // Step 2: Iterate over the collected rows to perform inserts.
                 for source_row in source_rows {
@@ -711,7 +712,7 @@ pub fn execute<'a>(
                         for constraint in &s.constraints {
                             if let TableConstraint::Check { name: _, expression } = constraint {
                                 let check_row = json!({ table_name.clone(): row_data.clone() });
-                                if !super::logical_plan::simple_expr_to_expression(expression.clone(), &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry)?.evaluate_with_context(&check_row, None, ctx.clone()).await?.as_bool().unwrap_or(false) {
+                                if !super::logical_plan::simple_expr_to_expression(expression.clone(), &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry, None)?.evaluate_with_context(&check_row, None, ctx.clone()).await?.as_bool().unwrap_or(false) {
                                     Err(anyhow!("CHECK constraint failed for table '{}'", table_name))?;
                                 }
                             }
@@ -828,7 +829,7 @@ pub fn execute<'a>(
                                         for constraint in &s.constraints {
                                             if let TableConstraint::Check { name: _, expression } = constraint {
                                                 let check_row = json!({ table_name.clone(): new_val.clone() });
-                                                if !super::logical_plan::simple_expr_to_expression(expression.clone(), &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry)?.evaluate_with_context(&check_row, None, ctx.clone()).await?.as_bool().unwrap_or(false)
+                                                if !super::logical_plan::simple_expr_to_expression(expression.clone(), &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry, None)?.evaluate_with_context(&check_row, None, ctx.clone()).await?.as_bool().unwrap_or(false)
                                                 {
                                                     Err(anyhow!("CHECK constraint failed for table '{}'", table_name))?;
                                                 }
@@ -877,7 +878,7 @@ pub fn execute<'a>(
 
                 if !returning.is_empty() {
                     for returned_row in returned_rows {
-                        let proj_row = project_row(&returned_row, &returning, ctx.clone(), outer_row).await?;
+                        let proj_row = project_row(&returned_row, &returning, ctx.clone(), outer_row, working_tables).await?;
                         yield proj_row;
                     }
                 } else {
@@ -885,7 +886,7 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::Delete { table_name, from, returning } => {
-                let stream = execute(*from, ctx.clone(), outer_row);
+                let stream = execute(*from, ctx.clone(), outer_row, working_tables);
                 let rows_to_delete: Vec<Row> = stream.try_collect().await?;
 
                 // First, apply all ON DELETE actions. If any of these fail, we abort before any actual deletion.
@@ -927,7 +928,7 @@ pub fn execute<'a>(
                         // The row from the plan is nested, e.g. {"users": {"id":1, ...}}
                         // We need to un-nest it for projection.
                         if let Some(inner_row) = returned_row.get(&table_name) {
-                            let proj_row = project_row(inner_row, &returning, ctx.clone(), outer_row).await?;
+                            let proj_row = project_row(inner_row, &returning, ctx.clone(), outer_row, working_tables).await?;
                             yield proj_row;
                         }
                     }
@@ -937,7 +938,7 @@ pub fn execute<'a>(
             }
             PhysicalPlan::Update { table_name, from, set, returning } => {
                 let schema = ctx.schema_cache.get(&table_name);
-                let stream = execute(*from, ctx.clone(), outer_row);
+                let stream = execute(*from, ctx.clone(), outer_row, working_tables);
                 let rows_to_update: Vec<Row> = stream.try_collect().await?;
 
                 let mut updated_count = 0;
@@ -1000,7 +1001,7 @@ pub fn execute<'a>(
                         for constraint in &schema.constraints {
                             if let TableConstraint::Check { name: _, expression } = constraint {
                                 let check_row = json!({ table_name.clone(): new_val.clone() });
-                                if !super::logical_plan::simple_expr_to_expression(expression.clone(), &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry)?.evaluate_with_context(&check_row, None, ctx.clone()).await?.as_bool().unwrap_or(false)
+                                if !super::logical_plan::simple_expr_to_expression(expression.clone(), &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry, None)?.evaluate_with_context(&check_row, None, ctx.clone()).await?.as_bool().unwrap_or(false)
                                 {
                                     Err(anyhow!("CHECK constraint failed for table '{}'", table_name))?;
                                 }
@@ -1031,7 +1032,7 @@ pub fn execute<'a>(
 
                 if !returning.is_empty() {
                     for returned_row in returned_rows {
-                        let proj_row = project_row(&returned_row, &returning, ctx.clone(), outer_row).await?;
+                        let proj_row = project_row(&returned_row, &returning, ctx.clone(), outer_row, working_tables).await?;
                         yield proj_row;
                     }
                 } else {
@@ -1053,7 +1054,7 @@ pub fn execute<'a>(
                         }
                         let dt = DataType::from_str(&col_def.data_type)?;
                         let default_expr = if let Some(d) = col_def.default {
-                            Some(super::logical_plan::simple_expr_to_expression(d, &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry)?)
+                            Some(super::logical_plan::simple_expr_to_expression(d, &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry, None)?)
                         } else {
                             None
                         };
@@ -1072,7 +1073,7 @@ pub fn execute<'a>(
                     }
                     AlterTableAction::AlterColumnSetDefault { column_name, default_expr } => {
                         let col = schema.columns.get_mut(&column_name).ok_or_else(|| anyhow!("Column '{}' does not exist", column_name))?;
-                        col.default = Some(super::logical_plan::simple_expr_to_expression(default_expr, &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry)?);
+                        col.default = Some(super::logical_plan::simple_expr_to_expression(default_expr, &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry, None)?);
                     }
                     AlterTableAction::AlterColumnDropDefault { column_name } => {
                         let col = schema.columns.get_mut(&column_name).ok_or_else(|| anyhow!("Column '{}' does not exist", column_name))?;
@@ -1316,6 +1317,7 @@ pub fn execute<'a>(
 
                 let view_def = ViewDefinition {
                     name: view_name.clone(),
+                    columns: Vec::new(),
                     query,
                 };
 
@@ -1356,7 +1358,7 @@ pub fn execute<'a>(
             }
             PhysicalPlan::DistinctOn { input, expressions } => {
                 let mut seen_keys = std::collections::HashSet::new();
-                let mut stream = execute(*input, ctx.clone(), outer_row);
+                let mut stream = execute(*input, ctx.clone(), outer_row, working_tables);
                 while let Some(row_result) = stream.next().await {
                     let row = row_result?;
                     let mut key_parts = Vec::new();
@@ -1370,21 +1372,21 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::UnionAll { left, right } => {
-                let mut left_stream = execute(*left, ctx.clone(), outer_row);
+                let mut left_stream = execute(*left, ctx.clone(), outer_row, working_tables);
                 while let Some(row) = left_stream.next().await {
                     yield row?;
                 }
-                let mut right_stream = execute(*right, ctx.clone(), outer_row);
+                let mut right_stream = execute(*right, ctx.clone(), outer_row, working_tables);
                 while let Some(row) = right_stream.next().await {
                     yield row?;
                 }
             }
             PhysicalPlan::Intersect { left, right } => {
-                let left_rows: std::collections::HashSet<String> = execute(*left, ctx.clone(), outer_row)
+                let left_rows: std::collections::HashSet<String> = execute(*left, ctx.clone(), outer_row, working_tables)
                     .map_ok(|row| row.to_string())
                     .try_collect()
                     .await?;
-                let right_rows: std::collections::HashSet<String> = execute(*right, ctx.clone(), outer_row)
+                let right_rows: std::collections::HashSet<String> = execute(*right, ctx.clone(), outer_row, working_tables)
                     .map_ok(|row| row.to_string())
                     .try_collect()
                     .await?;
@@ -1394,11 +1396,11 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::Except { left, right } => {
-                let left_rows: std::collections::HashSet<String> = execute(*left, ctx.clone(), outer_row)
+                let left_rows: std::collections::HashSet<String> = execute(*left, ctx.clone(), outer_row, working_tables)
                     .map_ok(|row| row.to_string())
                     .try_collect()
                     .await?;
-                let right_rows: std::collections::HashSet<String> = execute(*right, ctx.clone(), outer_row)
+                let right_rows: std::collections::HashSet<String> = execute(*right, ctx.clone(), outer_row, working_tables)
                     .map_ok(|row| row.to_string())
                     .try_collect()
                     .await?;
@@ -1443,6 +1445,7 @@ pub fn execute<'a>(
                                 &ctx.schema_cache,
                                 &ctx.view_cache,
                                 &ctx.function_registry,
+                                None,
                             )?;
                             let evaluated_val = expr.evaluate_with_context(&val, None, ctx.clone()).await?;
                             index_values.push(evaluated_val);
@@ -1464,7 +1467,7 @@ pub fn execute<'a>(
                 yield json!({ "status": format!("Index '{}' created and backfilled {} items.", statement.index_name, backfilled_count) });
             },
             PhysicalPlan::SubqueryScan { alias, input } => {
-                let mut stream = execute(*input, ctx.clone(), outer_row);
+                let mut stream = execute(*input, ctx.clone(), outer_row, working_tables);
                 while let Some(row_result) = stream.next().await {
                     let row = row_result?;
                     let mut new_row = json!({});
@@ -1486,7 +1489,132 @@ pub fn execute<'a>(
                     yield new_row;
                 }
             }
+            PhysicalPlan::WorkingTableScan { cte_name, alias } => {
+                if let Some(tables) = working_tables {
+                    if let Some(rows) = tables.get(&cte_name) {
+                        for row in rows.clone() {
+                            let mut new_row = json!({});
+                            new_row[alias.clone()] = row;
+                            yield new_row;
+                        }
+                    }
+                }
             }
+            PhysicalPlan::RecursiveCteScan { alias, column_aliases, non_recursive, recursive, union_all } => {
+                let get_projection_columns = |plan: &PhysicalPlan| -> Option<Vec<String>> {
+                    let mut current_plan = plan;
+                    // The projection might be under a sort or limit
+                    loop {
+                        match current_plan {
+                            PhysicalPlan::Projection { expressions, .. } => {
+                                return Some(expressions.iter().map(|(expr, alias)| {
+                                    alias.clone().unwrap_or_else(|| expr.to_string())
+                                }).collect());
+                            }
+                            PhysicalPlan::Sort { input, .. } => current_plan = input,
+                            PhysicalPlan::Limit { input, .. } => current_plan = input,
+                            _ => return None,
+                        }
+                    }
+                };
+
+                let non_recursive_cols = get_projection_columns(&*non_recursive);
+                let recursive_cols = get_projection_columns(&*recursive);
+
+                let rename_row_columns = |row: Row, aliases: &[String], original_cols: &Option<Vec<String>>| -> Result<Row> {
+                    let obj = row.as_object().ok_or_else(|| anyhow!("Recursive CTE row is not an object"))?;
+                    
+                    if aliases.is_empty() {
+                        return Ok(Value::Object(obj.clone()));
+                    }
+
+                    if let Some(original_cols) = original_cols {
+                        if !aliases.is_empty() && original_cols.len() != aliases.len() {
+                             return Err(anyhow!("CTE '{}' has {} column aliases but its query returned {} columns", alias, aliases.len(), original_cols.len()));
+                        }
+
+                        let mut new_row_map = serde_json::Map::new();
+                        for (i, alias) in aliases.iter().enumerate() {
+                            let original_col_name = &original_cols[i];
+                            let val = obj.get(original_col_name).cloned().unwrap_or(Value::Null);
+                            new_row_map.insert(alias.clone(), val);
+                        }
+                        Ok(Value::Object(new_row_map))
+                    } else {
+                        // Fallback to the old, order-dependent logic if we couldn't get columns
+                        let values: Vec<_> = obj.values().cloned().collect();
+                        if !aliases.is_empty() && values.len() != aliases.len() {
+                            return Err(anyhow!("CTE '{}' has {} column aliases but its query returned {} columns", alias, aliases.len(), values.len()));
+                        }
+                        let mut new_row_map = serde_json::Map::new();
+                        for (i, val) in values.into_iter().enumerate() {
+                            let key = aliases.get(i).cloned().unwrap_or_else(|| format!("column_{}", i));
+                            new_row_map.insert(key, val);
+                        }
+                        Ok(Value::Object(new_row_map))
+                    }
+                };
+
+                let non_recursive_rows_unaliased: Vec<Row> = execute(*non_recursive, ctx.clone(), outer_row, working_tables).try_collect().await?;
+                let mut non_recursive_rows = Vec::new();
+                for row in non_recursive_rows_unaliased {
+                    non_recursive_rows.push(rename_row_columns(row, &column_aliases, &non_recursive_cols)?);
+                }
+
+                let mut all_rows = non_recursive_rows.clone();
+                let mut working_set = non_recursive_rows;
+                let mut new_rows_hashes = std::collections::HashSet::new();
+
+                if !union_all {
+                    for row in &working_set {
+                        new_rows_hashes.insert(row.to_string());
+                    }
+                }
+
+                loop {
+                    if working_set.is_empty() {
+                        break;
+                    }
+
+                    let mut current_working_tables = HashMap::new();
+                    current_working_tables.insert(alias.clone(), working_set);
+
+                    let recursive_stream = execute(*recursive.clone(), ctx.clone(), outer_row, Some(&current_working_tables));
+                    let next_working_set_unaliased: Vec<Row> = recursive_stream.try_collect().await?;
+
+                    let mut next_working_set = Vec::new();
+                    for row in next_working_set_unaliased {
+                        next_working_set.push(rename_row_columns(row, &column_aliases, &recursive_cols)?);
+                    }
+
+                    working_set = Vec::new();
+                    if next_working_set.is_empty() {
+                        break;
+                    }
+
+                    if union_all {
+                        working_set.extend(next_working_set.clone());
+                        all_rows.extend(next_working_set);
+                    } else {
+                        let mut found_new = false;
+                        for row in next_working_set {
+                            if new_rows_hashes.insert(row.to_string()) {
+                                working_set.push(row.clone());
+                                all_rows.push(row);
+                                found_new = true;
+                            }
+                        }
+                        if !found_new {
+                            break;
+                        }
+                    }
+                }
+
+                for row in all_rows {
+                    yield row;
+                }
+            }
+        }
     })
 }
 
@@ -1600,7 +1728,7 @@ async fn check_foreign_key_constraints(
                     let physical_plan =
                         super::physical_plan::logical_to_physical_plan(limit_plan, &ctx.index_manager)?;
 
-                    let results: Vec<Value> = execute(physical_plan, ctx.clone(), None).try_collect().await?;
+                    let results: Vec<Value> = execute(physical_plan, ctx.clone(), None, None).try_collect().await?;
 
                     if results.is_empty() {
                         return Err(anyhow!(
@@ -1667,7 +1795,7 @@ async fn apply_on_delete_actions(
                         let physical_plan =
                             super::physical_plan::logical_to_physical_plan(filter_plan, &ctx.index_manager)?;
 
-                        let results: Vec<Value> = execute(physical_plan, ctx.clone(), None).try_collect().await?;
+                        let results: Vec<Value> = execute(physical_plan, ctx.clone(), None, None).try_collect().await?;
 
                         if !results.is_empty() {
                             let on_delete_action = fk.on_delete.as_deref().unwrap_or("NO ACTION").to_uppercase();
@@ -1832,7 +1960,7 @@ async fn apply_on_update_actions(
                         let physical_plan =
                             super::physical_plan::logical_to_physical_plan(filter_plan, &ctx.index_manager)?;
 
-                        let results: Vec<Value> = execute(physical_plan, ctx.clone(), None).try_collect().await?;
+                        let results: Vec<Value> = execute(physical_plan, ctx.clone(), None, None).try_collect().await?;
 
                         if !results.is_empty() {
                             let on_update_action = fk.on_update.as_deref().unwrap_or("NO ACTION").to_uppercase();
@@ -1959,14 +2087,3 @@ async fn apply_on_update_actions(
     }
     Ok(())
 }
-
-
-
-
-
-
-
-
-
-
-

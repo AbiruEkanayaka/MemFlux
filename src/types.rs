@@ -103,6 +103,8 @@ pub struct SnapshotEntry {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ViewDefinition {
     pub name: String,
+    #[serde(default)]
+    pub columns: Vec<String>,
     pub query: SelectStatement,
 }
 
