@@ -5,7 +5,7 @@ use futures::{Stream, StreamExt};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock};
 
 // Core modules of the database engine
 pub mod arc;
@@ -33,7 +33,7 @@ pub struct MemFluxDB {
     pub app_context: Arc<AppContext>,
     // The handle to the persistence engine's background task.
     // Kept to ensure the task is not dropped prematurely.
-    _persistence_handle: JoinHandle<()>, 
+    _persistence_handle: Option<JoinHandle<()>>, 
 }
 
 impl MemFluxDB {
@@ -41,20 +41,39 @@ impl MemFluxDB {
     /// This is the core constructor used by both the server and the FFI layer.
     pub async fn open_with_config(config: Config) -> Result<Self> {
         let config = Arc::new(config);
-        let db = load_db_from_disk(
-            &config.snapshot_file,
-            &config.wal_file,
-            &config.wal_overflow_file,
-        )
-        .await?;
-        println!("Database loaded with {} top-level keys.", db.len());
 
-        let (persistence_engine, logger) = PersistenceEngine::new(&config, db.clone());
-        let persistence_handle = tokio::spawn(async move {
-            if let Err(e) = persistence_engine.run().await {
-                eprintln!("Fatal error in persistence engine: {}", e);
-            }
-        });
+        let db = if config.persistence {
+            load_db_from_disk(
+                &config.snapshot_file,
+                &config.wal_file,
+                &config.wal_overflow_file,
+            )
+            .await?
+        } else {
+            println!("Persistence is disabled. Starting with an in-memory database.");
+            Arc::new(DashMap::new())
+        };
+        if config.persistence {
+            println!("Database loaded with {} top-level keys.", db.len());
+        }
+
+        let (logger, persistence_handle) = if config.persistence {
+            let (persistence_engine, logger) = PersistenceEngine::new(&config, db.clone());
+            let handle = tokio::spawn(async move {
+                if let Err(e) = persistence_engine.run().await {
+                    eprintln!("Fatal error in persistence engine: {}", e);
+                }
+            });
+            (logger, Some(handle))
+        } else {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::types::LogRequest>(1024);
+            tokio::spawn(async move {
+                while let Some(req) = rx.recv().await {
+                    let _ = req.ack.send(Ok(()));
+                }
+            });
+            (tx, None)
+        };
 
         let schema_cache = Arc::new(DashMap::new());
         if let Err(e) = load_schemas_from_db(&db, &schema_cache).await {
@@ -76,9 +95,8 @@ impl MemFluxDB {
         ));
         if memory_manager.is_enabled() {
             println!(
-                "Maxmemory policy is enabled ({}MB) with '{:?}' eviction policy.",
-                config.maxmemory_mb,
-                config.eviction_policy
+                "Maxmemory policy is enabled ({}MB) with \'{:?}\' eviction policy.",
+                config.maxmemory_mb, config.eviction_policy
             );
         }
         println!("Calculating initial memory usage...");

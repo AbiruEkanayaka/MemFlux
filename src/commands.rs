@@ -1450,9 +1450,12 @@ async fn handle_flushdb(command: Command, ctx: &AppContext) -> Response {
     Response::Ok
 }
 
-async fn handle_save(command: Command, _ctx: &AppContext) -> Response {
+async fn handle_save(command: Command, ctx: &AppContext) -> Response {
     if command.args.len() != 1 {
         return Response::Error("SAVE takes no arguments".to_string());
+    }
+    if !ctx.config.persistence {
+        return Response::Error("SAVE is not supported when persistence is disabled".to_string());
     }
     // This is a placeholder. A proper implementation would require access
     // to the persistence engine to force a snapshot.
@@ -1741,23 +1744,25 @@ async fn handle_commit(command: Command, ctx: &AppContext) -> Response {
         }
     }
 
-    // Apply buffered log entries to the persistence engine
-    for entry in tx.log_entries {
-        let (ack_tx, ack_rx) = oneshot::channel();
-        if ctx.logger
-            .send(LogRequest {
-                entry: entry,
-                ack: ack_tx,
-            })
-            .await
-            .is_err()
-        {
-            return Response::Error("Persistence engine is down, commit failed".to_string());
-        }
-        match ack_rx.await {
-            Ok(Ok(())) => {},
-            Ok(Err(e)) => return Response::Error(format!("WAL write error during commit: {}", e)),
-            Err(_) => return Response::Error("Persistence engine dropped ACK channel during commit".to_string()),
+    if ctx.config.persistence {
+        // Apply buffered log entries to the persistence engine
+        for entry in tx.log_entries {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            if ctx.logger
+                .send(LogRequest {
+                    entry: entry,
+                    ack: ack_tx,
+                })
+                .await
+                .is_err()
+            {
+                return Response::Error("Persistence engine is down, commit failed".to_string());
+            }
+            match ack_rx.await {
+                Ok(Ok(())) => {},
+                Ok(Err(e)) => return Response::Error(format!("WAL write error during commit: {}", e)),
+                Err(_) => return Response::Error("Persistence engine dropped ACK channel during commit".to_string()),
+            }
         }
     }
 

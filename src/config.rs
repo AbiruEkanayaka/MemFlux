@@ -24,6 +24,8 @@ pub struct Config {
     pub host: String,
     pub port: u16,
     pub requirepass: String,
+    #[serde(default = "default_true")]
+    pub persistence: bool,
     pub wal_file: String,
     #[serde(default = "default_wal_overflow_file")]
     pub wal_overflow_file: String,
@@ -44,6 +46,8 @@ pub struct Config {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FFIConfig {
+    #[serde(default = "default_true")]
+    pub persistence: bool,
     pub wal_file: String,
     #[serde(default = "default_wal_overflow_file")]
     pub wal_overflow_file: String,
@@ -62,6 +66,7 @@ impl From<FFIConfig> for Config {
             host: "127.0.0.1".to_string(),
             port: 0,
             requirepass: "".to_string(),
+            persistence: ffi_config.persistence,
             wal_file: ffi_config.wal_file,
             wal_overflow_file: ffi_config.wal_overflow_file,
             snapshot_file: ffi_config.snapshot_file,
@@ -91,6 +96,10 @@ fn default_wal_overflow_file() -> String {
     "memflux.wal.overflow".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 
 impl Default for Config {
     fn default() -> Self {
@@ -98,6 +107,7 @@ impl Default for Config {
             host: "127.0.0.1".to_string(),
             port: 8360,
             requirepass: "".to_string(),
+            persistence: true,
             wal_file: "memflux.wal".to_string(),
             wal_overflow_file: "memflux.wal.overflow".to_string(),
             snapshot_file: "memflux.snapshot".to_string(),

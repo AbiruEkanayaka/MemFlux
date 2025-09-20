@@ -1650,23 +1650,25 @@ pub fn execute<'a>(
                     }
                 }
 
-                // Apply buffered log entries to the persistence engine
-                for entry in tx.log_entries {
-                    let (ack_tx, ack_rx) = oneshot::channel();
-                    if ctx.logger
-                        .send(LogRequest {
-                            entry: entry,
-                            ack: ack_tx,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        Err(anyhow!("Persistence engine is down, commit failed"))?;
-                    }
-                    match ack_rx.await {
-                        Ok(Ok(())) => {},
-                        Ok(Err(e)) => Err(anyhow!("WAL write error during commit: {}", e))?,
-                        Err(_) => Err(anyhow!("Persistence engine dropped ACK channel during commit"))?,
+                if ctx.config.persistence {
+                    // Apply buffered log entries to the persistence engine
+                    for entry in tx.log_entries {
+                        let (ack_tx, ack_rx) = oneshot::channel();
+                        if ctx.logger
+                            .send(LogRequest {
+                                entry: entry,
+                                ack: ack_tx,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            Err(anyhow!("Persistence engine is down, commit failed"))?;
+                        }
+                        match ack_rx.await {
+                            Ok(Ok(())) => {},
+                            Ok(Err(e)) => Err(anyhow!("WAL write error during commit: {}", e))?,
+                            Err(_) => Err(anyhow!("Persistence engine dropped ACK channel during commit"))?,
+                        }
                     }
                 }
 

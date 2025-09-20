@@ -413,47 +413,51 @@ impl MemoryManager {
                         _ => None,
                     });
 
-                // Log the deletion for persistence
-                let log_entry = LogEntry::Delete { key: key.clone() };
-                let (ack_tx, ack_rx) = oneshot::channel();
-                if ctx.logger
-                    .send(LogRequest {
-                        entry: log_entry,
-                        ack: ack_tx,
-                    })
-                    .await
-                    .is_err()
-                {
-                    // If persistence is down, we probably shouldn't evict.
-                    // Put the key back and return an error.
-                    self.restore_evicted_key(key, old_freq).await;
-                    return Err(anyhow!("Persistence engine is down, cannot evict"));
-                }
-                match ack_rx.await {
-                    Ok(Ok(())) => {
-                        // WAL write successful, now evict from memory
-                        if let Some(entry) = ctx.db.remove(&key) {
-                            let size = estimate_db_value_size(&entry.1).await;
-                            self.decrease_memory(size + key.len() as u64);
-
-                            if let Some(ref old_val) = old_value_for_index {
-                                ctx.index_manager
-                                    .remove_key_from_indexes(&key, old_val)
-                                    .await;
-                            }
-                            println!("Evicted key to free memory: {}", key);
+                if ctx.config.persistence {
+                    // Log the deletion for persistence
+                    let log_entry = LogEntry::Delete { key: key.clone() };
+                    let (ack_tx, ack_rx) = oneshot::channel();
+                    if ctx.logger
+                        .send(LogRequest {
+                            entry: log_entry,
+                            ack: ack_tx,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        // If persistence is down, we probably shouldn't evict.
+                        // Put the key back and return an error.
+                        self.restore_evicted_key(key, old_freq).await;
+                        return Err(anyhow!("Persistence engine is down, cannot evict"));
+                    }
+                    match ack_rx.await {
+                        Ok(Ok(())) => {
+                            // WAL write successful, continue to evict from memory
+                        }
+                        Ok(Err(e)) => {
+                            self.restore_evicted_key(key, old_freq).await;
+                            return Err(anyhow!("WAL write error during eviction: {}", e));
+                        }
+                        Err(_) => {
+                            self.restore_evicted_key(key, old_freq).await;
+                            return Err(anyhow!(
+                                "Persistence engine dropped ACK channel during eviction"
+                            ));
                         }
                     }
-                    Ok(Err(e)) => {
-                        self.restore_evicted_key(key, old_freq).await;
-                        return Err(anyhow!("WAL write error during eviction: {}", e));
+                }
+
+                // WAL write successful or persistence disabled, now evict from memory
+                if let Some(entry) = ctx.db.remove(&key) {
+                    let size = estimate_db_value_size(&entry.1).await;
+                    self.decrease_memory(size + key.len() as u64);
+
+                    if let Some(ref old_val) = old_value_for_index {
+                        ctx.index_manager
+                            .remove_key_from_indexes(&key, old_val)
+                            .await;
                     }
-                    Err(_) => {
-                        self.restore_evicted_key(key, old_freq).await;
-                        return Err(anyhow!(
-                            "Persistence engine dropped ACK channel during eviction"
-                        ));
-                    }
+                    println!("Evicted key to free memory: {}", key);
                 }
             } else {
                 // No more keys to evict
