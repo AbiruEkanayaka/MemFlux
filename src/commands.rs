@@ -4,32 +4,349 @@ use std::collections::{HashSet, VecDeque};
 use std::str;
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
+use uuid::Uuid;
 
 use crate::indexing::Index;
 use crate::memory;
 use crate::types::*;
 
-macro_rules! log_and_wait {
-    ($logger:expr, $entry:expr) => {
-        async {
-            let (ack_tx, ack_rx) = oneshot::channel();
-            if $logger
-                .send(LogRequest {
-                    entry: $entry,
-                    ack: ack_tx,
-                })
-                .await
-                .is_err()
-            {
-                return Response::Error("Persistence engine is down".to_string());
+pub async fn apply_log_entry(entry: &LogEntry, ctx: &AppContext) -> Result<()> {
+    match entry {
+        LogEntry::SetBytes { key, value } => {
+            let mut old_size = 0;
+            if let Some(entry) = ctx.db.get(key) {
+                old_size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
             }
-            match ack_rx.await {
-                Ok(Ok(())) => Response::Ok,
-                Ok(Err(e)) => Response::Error(format!("WAL write error: {}", e)),
-                Err(_) => Response::Error("Persistence engine dropped ACK channel".to_string()),
+
+            if ctx.memory.is_enabled() {
+                let new_size = key.len() as u64 + value.len() as u64;
+                let needed = new_size.saturating_sub(old_size);
+                if let Err(e) = ctx.memory.ensure_memory_for(needed, ctx).await {
+                    bail!(e);
+                }
+            }
+
+            ctx.db.insert(key.clone(), DbValue::Bytes(value.clone()));
+            let new_size = key.len() as u64 + value.len() as u64;
+            ctx.memory.decrease_memory(old_size);
+            ctx.memory.increase_memory(new_size);
+            if ctx.memory.is_enabled() {
+                ctx.memory.track_access(key).await;
             }
         }
-    };
+        LogEntry::SetJsonB { key, value } => {
+            let (old_size, old_val_for_index) = if let Some(entry) = ctx.db.get(key) {
+                let size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
+                let val = match entry.value() {
+                    DbValue::Json(v) => v.clone(),
+                    DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or(json!({})),
+                    _ => json!({}),
+                };
+                (size, val)
+            } else {
+                (0, json!({}))
+            };
+
+            if ctx.memory.is_enabled() {
+                let new_size = key.len() as u64 + value.len() as u64;
+                let needed = new_size.saturating_sub(old_size);
+                if let Err(e) = ctx.memory.ensure_memory_for(needed, ctx).await {
+                    bail!(e);
+                }
+            }
+
+            ctx.db.insert(key.clone(), DbValue::JsonB(value.clone()));
+
+            let new_size = key.len() as u64 + value.len() as u64;
+            ctx.memory.decrease_memory(old_size);
+            ctx.memory.increase_memory(new_size);
+            if ctx.memory.is_enabled() {
+                ctx.memory.track_access(key).await;
+            }
+
+            let new_val: serde_json::Value = serde_json::from_slice(value)?;
+            ctx.index_manager
+                .remove_key_from_indexes(key, &old_val_for_index)
+                .await;
+            ctx.index_manager.add_key_to_indexes(key, &new_val).await;
+        }
+        LogEntry::Delete { key } => {
+            let mut old_size = 0;
+            if let Some(entry) = ctx.db.get(key) {
+                old_size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
+            }
+
+            let old_value: Option<Value> = ctx.db.get(key).and_then(|entry| match entry.value() {
+                DbValue::Json(v) => Some(v.clone()),
+                DbValue::JsonB(b) => serde_json::from_slice(b).ok(),
+                _ => None,
+            });
+
+            if ctx.db.remove(key).is_some() {
+                ctx.memory.decrease_memory(old_size);
+                if ctx.memory.is_enabled() {
+                    ctx.memory.forget_key(key).await;
+                }
+                if let Some(ref old_val) = old_value {
+                    ctx.index_manager
+                        .remove_key_from_indexes(key, old_val)
+                        .await;
+                }
+            }
+        }
+        LogEntry::JsonSet { path, value } => {
+            let mut parts = path.splitn(2, '.');
+            let key = match parts.next() {
+                Some(k) if !k.is_empty() => k.to_string(),
+                _ => bail!("Invalid path for JsonSet: missing key"),
+            };
+            let inner_path = parts.next().unwrap_or("");
+
+            let (old_size, mut current_val, old_val_for_index) = if let Some(entry) = ctx.db.get(&key) {
+                let size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
+                let val = match entry.value() {
+                    DbValue::Json(v) => v.clone(),
+                    DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or(json!({})),
+                    _ => json!({}),
+                };
+                (size, val.clone(), val)
+            } else {
+                (0, json!({}), json!({}))
+            };
+
+            let value: serde_json::Value = serde_json::from_str(value)?;
+
+            let pointer = json_path_to_pointer(inner_path);
+            if pointer.is_empty() {
+                current_val = value;
+            } else if let Some(target) = current_val.pointer_mut(&pointer) {
+                *target = value;
+            } else {
+                let mut current = &mut current_val;
+                for part in inner_path.split('.') {
+                    if part.is_empty() { continue; }
+                    if current.is_object() {
+                        current = current.as_object_mut().unwrap().entry(part).or_insert(json!({}));
+                    }
+                    else {
+                        bail!("Path creation failed: part is not an object");
+                    }
+                }
+                *current = value;
+            }
+
+            let new_value_bytes = serde_json::to_vec(&current_val)?;
+            let new_size = key.len() as u64 + new_value_bytes.len() as u64;
+
+            if ctx.memory.is_enabled() {
+                let needed = new_size.saturating_sub(old_size);
+                if let Err(e) = ctx.memory.ensure_memory_for(needed, ctx).await {
+                    bail!(e);
+                }
+            }
+
+            ctx.db.insert(key.clone(), DbValue::JsonB(new_value_bytes));
+            ctx.memory.decrease_memory(old_size);
+            ctx.memory.increase_memory(new_size);
+            if ctx.memory.is_enabled() {
+                ctx.memory.track_access(&key).await;
+            }
+
+            ctx.index_manager
+                .remove_key_from_indexes(&key, &old_val_for_index)
+                .await;
+            ctx.index_manager.add_key_to_indexes(&key, &current_val).await;
+        }
+        LogEntry::JsonDelete { path } => {
+            let _ = apply_json_delete_to_db(&ctx.db, path);
+        }
+        LogEntry::LPush { key, values } => {
+            let mut old_size = 0;
+            if let Some(entry) = ctx.db.get(key) {
+                old_size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
+            }
+
+            if ctx.memory.is_enabled() {
+                let added_size: u64 = values.iter().map(|v| v.len() as u64).sum();
+                let needed = if old_size == 0 {
+                    key.len() as u64 + added_size
+                } else {
+                    added_size
+                };
+                if let Err(e) = ctx.memory.ensure_memory_for(needed, ctx).await {
+                    bail!(e);
+                }
+            }
+
+            let entry = ctx
+                .db
+                .entry(key.clone())
+                .or_insert_with(|| DbValue::List(RwLock::new(VecDeque::new())));
+            if let DbValue::List(list_lock) = entry.value() {
+                let mut list = list_lock.write().await;
+                for v in values {
+                    list.push_front(v.clone());
+                }
+                let new_size =
+                    key.len() as u64 + list.iter().map(|v| v.len() as u64).sum::<u64>();
+                ctx.memory.decrease_memory(old_size);
+                ctx.memory.increase_memory(new_size);
+                if ctx.memory.is_enabled() {
+                    ctx.memory.track_access(key).await;
+                }
+            }
+        }
+        LogEntry::RPush { key, values } => {
+            let mut old_size = 0;
+            if let Some(entry) = ctx.db.get(key) {
+                old_size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
+            }
+
+            if ctx.memory.is_enabled() {
+                let added_size: u64 = values.iter().map(|v| v.len() as u64).sum();
+                let needed = if old_size == 0 {
+                    key.len() as u64 + added_size
+                } else {
+                    added_size
+                };
+                if let Err(e) = ctx.memory.ensure_memory_for(needed, ctx).await {
+                    bail!(e);
+                }
+            }
+
+            let entry = ctx
+                .db
+                .entry(key.clone())
+                .or_insert_with(|| DbValue::List(RwLock::new(VecDeque::new())));
+            if let DbValue::List(list_lock) = entry.value() {
+                let mut list = list_lock.write().await;
+                for v in values {
+                    list.push_back(v.clone());
+                }
+                let new_size =
+                    key.len() as u64 + list.iter().map(|v| v.len() as u64).sum::<u64>();
+                ctx.memory.decrease_memory(old_size);
+                ctx.memory.increase_memory(new_size);
+                if ctx.memory.is_enabled() {
+                    ctx.memory.track_access(key).await;
+                }
+            }
+        }
+        LogEntry::LPop { key, count } => {
+            if let Some(mut entry) = ctx.db.get_mut(key) {
+                if let DbValue::List(list_lock) = entry.value_mut() {
+                    let mut list = list_lock.write().await;
+                    let mut old_size = 0;
+                    if let Some(entry) = ctx.db.get(key) {
+                        old_size =
+                            key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
+                    }
+
+                    for _ in 0..*count {
+                        if list.pop_front().is_none() {
+                            break;
+                        }
+                    }
+
+                    let new_size =
+                        key.len() as u64 + list.iter().map(|v| v.len() as u64).sum::<u64>();
+                    ctx.memory.decrease_memory(old_size);
+                    ctx.memory.increase_memory(new_size);
+                    if ctx.memory.is_enabled() {
+                        ctx.memory.track_access(key).await;
+                    }
+                }
+            }
+        }
+        LogEntry::RPop { key, count } => {
+            if let Some(mut entry) = ctx.db.get_mut(key) {
+                if let DbValue::List(list_lock) = entry.value_mut() {
+                    let mut list = list_lock.write().await;
+                    let mut old_size = 0;
+                    if let Some(entry) = ctx.db.get(key) {
+                        old_size =
+                            key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
+                    }
+
+                    for _ in 0..*count {
+                        if list.pop_back().is_none() {
+                            break;
+                        }
+                    }
+
+                    let new_size =
+                        key.len() as u64 + list.iter().map(|v| v.len() as u64).sum::<u64>();
+                    ctx.memory.decrease_memory(old_size);
+                    ctx.memory.increase_memory(new_size);
+                    if ctx.memory.is_enabled() {
+                        ctx.memory.track_access(key).await;
+                    }
+                }
+            }
+        }
+        LogEntry::SAdd { key, members } => {
+            let mut old_size = 0;
+            if let Some(entry) = ctx.db.get(key) {
+                old_size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
+            }
+
+            if ctx.memory.is_enabled() {
+                let added_size: u64 = members.iter().map(|v| v.len() as u64).sum();
+                let needed = if old_size == 0 {
+                    key.len() as u64 + added_size
+                } else {
+                    added_size
+                };
+                if let Err(e) = ctx.memory.ensure_memory_for(needed, ctx).await {
+                    bail!(e);
+                }
+            }
+
+            let entry = ctx
+                .db
+                .entry(key.clone())
+                .or_insert_with(|| DbValue::Set(RwLock::new(HashSet::new())));
+            if let DbValue::Set(set_lock) = entry.value() {
+                let mut set = set_lock.write().await;
+                for m in members {
+                    set.insert(m.clone());
+                }
+                let new_size =
+                    key.len() as u64 + set.iter().map(|v| v.len() as u64).sum::<u64>();
+                ctx.memory.decrease_memory(old_size);
+                ctx.memory.increase_memory(new_size);
+                if ctx.memory.is_enabled() {
+                    ctx.memory.track_access(key).await;
+                }
+            }
+        }
+        LogEntry::SRem { key, members } => {
+            if let Some(mut entry) = ctx.db.get_mut(key) {
+                if let DbValue::Set(set_lock) = entry.value_mut() {
+                    let mut set = set_lock.write().await;
+                    let mut old_size = 0;
+                    if let Some(entry) = ctx.db.get(key) {
+                        old_size =
+                            key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
+                    }
+
+                    for m in members {
+                        set.remove(m);
+                    }
+
+                    let new_size =
+                        key.len() as u64 + set.iter().map(|v| v.len() as u64).sum::<u64>();
+                    ctx.memory.decrease_memory(old_size);
+                    ctx.memory.increase_memory(new_size);
+                    if ctx.memory.is_enabled() {
+                        ctx.memory.track_access(key).await;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 pub async fn process_command(command: Command, ctx: &AppContext) -> Response {
@@ -61,7 +378,29 @@ pub async fn process_command(command: Command, ctx: &AppContext) -> Response {
         "IDX.CREATE" => handle_idx_create(command, ctx).await,
         "IDX.DROP" => handle_idx_drop(command, ctx).await,
         "IDX.LIST" => handle_idx_list(command, ctx).await,
+        "BEGIN" => handle_begin(command, ctx).await,
+        "COMMIT" => handle_commit(command, ctx).await,
+        "ROLLBACK" => handle_rollback(command, ctx).await,
         _ => Response::Error(format!("Unknown command: {}", command.name)),
+    }
+}
+
+async fn log_to_wal(log_entry: LogEntry, ctx: &AppContext) -> Response {
+    let (ack_tx, ack_rx) = oneshot::channel();
+    if ctx.logger
+        .send(LogRequest {
+            entry: log_entry,
+            ack: ack_tx,
+        })
+        .await
+        .is_err()
+    {
+        return Response::Error("Persistence engine is down".to_string());
+    }
+    match ack_rx.await {
+        Ok(Ok(())) => Response::Ok,
+        Ok(Err(e)) => Response::Error(format!("WAL write error: {}", e)),
+        Err(_) => Response::Error("Persistence engine dropped ACK channel".to_string()),
     }
 }
 
@@ -102,6 +441,18 @@ async fn handle_set(command: Command, ctx: &AppContext) -> Response {
     };
     let value = command.args[2].clone();
 
+    let log_entry = LogEntry::SetBytes {
+        key: key.clone(),
+        value: value.clone(),
+    };
+
+    let mut tx = ctx.current_transaction.write().await;
+    if let Some(tx) = tx.as_mut() {
+        tx.log_entries.push(log_entry);
+        return Response::Ok;
+    }
+    drop(tx);
+
     let mut old_size = 0;
     if let Some(entry) = ctx.db.get(&key) {
         old_size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
@@ -115,12 +466,7 @@ async fn handle_set(command: Command, ctx: &AppContext) -> Response {
         }
     }
 
-    let log_entry = LogEntry::SetBytes {
-        key: key.clone(),
-        value: value.clone(),
-    };
-    let ack_response = log_and_wait!(ctx.logger, log_entry).await;
-
+    let ack_response = log_to_wal(log_entry, ctx).await;
     if let Response::Ok = ack_response {
         ctx.db.insert(key.clone(), DbValue::Bytes(value.clone()));
         let new_size = key.len() as u64 + value.len() as u64;
@@ -137,6 +483,18 @@ async fn handle_delete(command: Command, ctx: &AppContext) -> Response {
     if command.args.len() < 2 {
         return Response::Error("DELETE requires at least one argument".to_string());
     }
+
+    let mut tx = ctx.current_transaction.write().await;
+    if let Some(tx) = tx.as_mut() {
+        for key_bytes in &command.args[1..] {
+            if let Ok(key) = String::from_utf8(key_bytes.clone()) {
+                tx.log_entries.push(LogEntry::Delete { key });
+            }
+        }
+        return Response::Ok;
+    }
+    drop(tx);
+
     let mut deleted_count = 0;
     for key_bytes in &command.args[1..] {
         let key = match String::from_utf8(key_bytes.clone()) {
@@ -155,34 +513,21 @@ async fn handle_delete(command: Command, ctx: &AppContext) -> Response {
         });
 
         let log_entry = LogEntry::Delete { key: key.clone() };
-        let (ack_tx, ack_rx) = oneshot::channel();
-        if ctx.logger
-            .send(LogRequest {
-                entry: log_entry,
-                ack: ack_tx,
-            })
-            .await
-            .is_err()
-        {
-            return Response::Error("Persistence engine is down".to_string());
-        }
-        match ack_rx.await {
-            Ok(Ok(())) => {
-                if ctx.db.remove(&key).is_some() {
-                    ctx.memory.decrease_memory(old_size);
-                    if ctx.memory.is_enabled() {
-                        ctx.memory.forget_key(&key).await;
-                    }
-                    if let Some(ref old_val) = old_value {
-                        ctx.index_manager
-                            .remove_key_from_indexes(&key, old_val)
-                            .await;
-                    }
-                    deleted_count += 1;
+        let ack_response = log_to_wal(log_entry, ctx).await;
+
+        if let Response::Ok = ack_response {
+            if ctx.db.remove(&key).is_some() {
+                ctx.memory.decrease_memory(old_size);
+                if ctx.memory.is_enabled() {
+                    ctx.memory.forget_key(&key).await;
                 }
+                if let Some(ref old_val) = old_value {
+                    ctx.index_manager
+                        .remove_key_from_indexes(&key, old_val)
+                        .await;
+                }
+                deleted_count += 1;
             }
-            Ok(Err(e)) => return Response::Error(format!("WAL write error: {}", e)),
-            Err(_) => return Response::Error("Persistence engine dropped ACK channel".to_string()),
         }
     }
     Response::Integer(deleted_count)
@@ -197,28 +542,53 @@ pub fn json_path_to_pointer(path: &str) -> String {
 }
 
 async fn handle_json_set(command: Command, ctx: &AppContext) -> Response {
-    if command.args.len() != 3 {
-        return Response::Error("JSON.SET requires a key/path and a value".to_string());
-    }
-    let path = match String::from_utf8(command.args[1].clone()) {
-        Ok(p) => p,
-        Err(_) => return Response::Error("Invalid path".to_string()),
-    };
-    let value_str = match String::from_utf8(command.args[2].clone()) {
-        Ok(v) => v,
-        Err(_) => return Response::Error("Invalid value".to_string()),
-    };
-    let value: Value = match serde_json::from_str(&value_str) {
-        Ok(v) => v,
-        Err(_) => return Response::Error("Value is not valid JSON".to_string()),
+    let (full_path, value_str) = if command.args.len() == 3 {
+        // This is for `JSON.SET <key or key.path> <value>`
+        (
+            String::from_utf8_lossy(&command.args[1]).to_string(),
+            String::from_utf8_lossy(&command.args[2]).to_string(),
+        )
+    } else if command.args.len() == 4 {
+        // This is for `JSON.SET <key> <path> <value>`
+        let key = String::from_utf8_lossy(&command.args[1]);
+        let path = String::from_utf8_lossy(&command.args[2]);
+        let full_path = if path == "." {
+            key.to_string()
+        } else {
+            format!("{}.{}", key, path)
+        };
+        (
+            full_path,
+            String::from_utf8_lossy(&command.args[3]).to_string(),
+        )
+    } else {
+        return Response::Error(format!("JSON.SET requires 2 or 3 arguments, got {}. Args: {:?}", command.args.len() - 1, command.args.iter().skip(1).map(|a| String::from_utf8_lossy(a).to_string()).collect::<Vec<String>>()));
     };
 
-    let mut parts = path.splitn(2, '.');
+    let mut parts = full_path.splitn(2, '.');
     let key = match parts.next() {
         Some(k) if !k.is_empty() => k.to_string(),
         _ => return Response::Error("Invalid path: missing key".to_string()),
     };
-    let inner_path = parts.next().unwrap_or("");
+    let path = parts.next().unwrap_or("");
+
+    // --- TRANSACTION LOGIC FIRST ---
+    let mut tx = ctx.current_transaction.write().await;
+    if let Some(tx) = tx.as_mut() {
+        let log_entry = LogEntry::JsonSet {
+            path: full_path,
+            value: value_str.clone(),
+        };
+        tx.log_entries.push(log_entry);
+        return Response::Ok;
+    }
+    drop(tx);
+    // --- END TRANSACTION LOGIC ---
+
+    let value: Value = match serde_json::from_str(&value_str) {
+        Ok(v) => v,
+        Err(_) => return Response::Error("Value is not valid JSON".to_string()),
+    };
 
     let (old_size, mut current_val, old_val_for_index) = {
         let old_db_value = ctx.db.get(&key);
@@ -230,25 +600,26 @@ async fn handle_json_set(command: Command, ctx: &AppContext) -> Response {
 
         let current_val = match old_db_value.as_deref() {
             Some(DbValue::Json(v)) => v.clone(),
-            Some(DbValue::JsonB(b)) => serde_json::from_slice(b).unwrap_or(json!({})),
+            Some(DbValue::JsonB(b)) => serde_json::from_slice(&b).unwrap_or(json!({})),
             Some(_) => return Response::Error("WRONGTYPE Operation against a non-JSON value".to_string()),
             None => json!({}),
         };
         (old_size, current_val.clone(), current_val.clone())
     };
 
-    let pointer = json_path_to_pointer(inner_path);
+    let pointer = if path == "." || path.is_empty() { "".to_string() } else { json_path_to_pointer(&path) };
     if pointer.is_empty() {
         current_val = value;
     } else if let Some(target) = current_val.pointer_mut(&pointer) {
         *target = value;
     } else {
         let mut current = &mut current_val;
-        for part in inner_path.split('.') {
+        for part in path.split('.') {
             if part.is_empty() { continue; }
             if current.is_object() {
                 current = current.as_object_mut().unwrap().entry(part).or_insert(json!({}));
-            } else {
+            }
+            else {
                 return Response::Error("Path creation failed: part is not an object".to_string());
             }
         }
@@ -260,6 +631,11 @@ async fn handle_json_set(command: Command, ctx: &AppContext) -> Response {
         Err(_) => return Response::Error("Failed to serialize new JSON value".to_string()),
     };
 
+    let log_entry = LogEntry::SetJsonB {
+        key: key.clone(),
+        value: new_value_bytes.clone(),
+    };
+
     if ctx.memory.is_enabled() {
         let new_size = key.len() as u64 + new_value_bytes.len() as u64;
         let needed = new_size.saturating_sub(old_size);
@@ -268,11 +644,7 @@ async fn handle_json_set(command: Command, ctx: &AppContext) -> Response {
         }
     }
 
-    let log_entry = LogEntry::SetJsonB {
-        key: key.clone(),
-        value: new_value_bytes.clone(),
-    };
-    let ack_response = log_and_wait!(ctx.logger, log_entry).await;
+    let ack_response = log_to_wal(log_entry, ctx).await;
 
     if let Response::Ok = ack_response {
         ctx.db.insert(key.clone(), DbValue::JsonB(new_value_bytes.clone()));
@@ -324,7 +696,7 @@ async fn handle_json_get(command: Command, ctx: &AppContext) -> Response {
                     }
                 }
                 DbValue::JsonB(b) => {
-                    let v: Value = match serde_json::from_slice(b) {
+                    let v: Value = match serde_json::from_slice(&b) {
                         Ok(val) => val,
                         Err(_) => return Response::Error("Could not parse JSONB value".to_string()),
                     };
@@ -360,6 +732,18 @@ async fn handle_json_del(command: Command, ctx: &AppContext) -> Response {
     };
     let inner_path = parts.next().unwrap_or("");
 
+    let mut tx = ctx.current_transaction.write().await;
+    if let Some(tx) = tx.as_mut() {
+        let log_entry = if inner_path.is_empty() || inner_path == "." {
+            LogEntry::Delete { key: key.clone() }
+        } else {
+            LogEntry::JsonDelete { path: path.clone() }
+        };
+        tx.log_entries.push(log_entry);
+        return Response::Ok;
+    }
+    drop(tx);
+
     let (old_size, mut current_val, old_val_for_index) = {
         let old_db_value = match ctx.db.get(&key) {
             Some(val) => val,
@@ -370,7 +754,7 @@ async fn handle_json_del(command: Command, ctx: &AppContext) -> Response {
 
         let current_val = match old_db_value.value() {
             DbValue::Json(v) => v.clone(),
-            DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or(json!({})),
+            DbValue::JsonB(b) => serde_json::from_slice(&b).unwrap_or(json!({})),
             _ => return Response::Error("WRONGTYPE Operation against a non-JSON value".to_string()),
         };
         (old_size, current_val.clone(), current_val.clone())
@@ -378,7 +762,7 @@ async fn handle_json_del(command: Command, ctx: &AppContext) -> Response {
 
     if inner_path.is_empty() || inner_path == "." {
         let log_entry = LogEntry::Delete { key: key.clone() };
-        let ack_response = log_and_wait!(ctx.logger, log_entry).await;
+        let ack_response = log_to_wal(log_entry, ctx).await;
         if let Response::Ok = ack_response {
             ctx.db.remove(&key);
             ctx.memory.decrease_memory(old_size);
@@ -419,7 +803,7 @@ async fn handle_json_del(command: Command, ctx: &AppContext) -> Response {
             key: key.clone(),
             value: new_value_bytes.clone(),
         };
-        let ack_response = log_and_wait!(ctx.logger, log_entry).await;
+        let ack_response = log_to_wal(log_entry, ctx).await;
 
         if let Response::Ok = ack_response {
             ctx.db.insert(key.clone(), DbValue::JsonB(new_value_bytes.clone()));
@@ -452,6 +836,18 @@ async fn handle_lpush(command: Command, ctx: &AppContext) -> Response {
     };
     let values: Vec<Vec<u8>> = command.args[2..].to_vec();
 
+    let log_entry = LogEntry::LPush {
+        key: key.clone(),
+        values: values.clone(),
+    };
+
+    let mut tx = ctx.current_transaction.write().await;
+    if let Some(tx) = tx.as_mut() {
+        tx.log_entries.push(log_entry);
+        return Response::Ok;
+    }
+    drop(tx);
+
     let mut old_size = 0;
     if let Some(entry) = ctx.db.get(&key) {
         old_size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
@@ -469,11 +865,7 @@ async fn handle_lpush(command: Command, ctx: &AppContext) -> Response {
         }
     }
 
-    let log_entry = LogEntry::LPush {
-        key: key.clone(),
-        values: values.clone(),
-    };
-    let ack_response = log_and_wait!(ctx.logger, log_entry).await;
+    let ack_response = log_to_wal(log_entry, ctx).await;
 
     if let Response::Ok = ack_response {
         let entry = ctx
@@ -496,7 +888,8 @@ async fn handle_lpush(command: Command, ctx: &AppContext) -> Response {
         } else {
             Response::Error("WRONGTYPE Operation against a non-list value".to_string())
         }
-    } else {
+    }
+    else {
         ack_response
     }
 }
@@ -510,6 +903,18 @@ async fn handle_rpush(command: Command, ctx: &AppContext) -> Response {
         Err(_) => return Response::Error("Invalid key".to_string()),
     };
     let values: Vec<Vec<u8>> = command.args[2..].to_vec();
+
+    let log_entry = LogEntry::RPush {
+        key: key.clone(),
+        values: values.clone(),
+    };
+
+    let mut tx = ctx.current_transaction.write().await;
+    if let Some(tx) = tx.as_mut() {
+        tx.log_entries.push(log_entry);
+        return Response::Ok;
+    }
+    drop(tx);
 
     let mut old_size = 0;
     if let Some(entry) = ctx.db.get(&key) {
@@ -528,11 +933,7 @@ async fn handle_rpush(command: Command, ctx: &AppContext) -> Response {
         }
     }
 
-    let log_entry = LogEntry::RPush {
-        key: key.clone(),
-        values: values.clone(),
-    };
-    let ack_response = log_and_wait!(ctx.logger, log_entry).await;
+    let ack_response = log_to_wal(log_entry, ctx).await;
 
     if let Response::Ok = ack_response {
         let entry = ctx
@@ -555,7 +956,8 @@ async fn handle_rpush(command: Command, ctx: &AppContext) -> Response {
         } else {
             Response::Error("WRONGTYPE Operation against a non-list value".to_string())
         }
-    } else {
+    }
+    else {
         ack_response
     }
 }
@@ -578,16 +980,24 @@ async fn handle_lpop(command: Command, ctx: &AppContext) -> Response {
         1
     };
 
+    let log_entry = LogEntry::LPop {
+        key: key.clone(),
+        count,
+    };
+
+    let mut tx = ctx.current_transaction.write().await;
+    if let Some(tx) = tx.as_mut() {
+        tx.log_entries.push(log_entry);
+        return Response::Ok;
+    }
+    drop(tx);
+
     let mut old_size = 0;
     if let Some(entry) = ctx.db.get(&key) {
         old_size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
     }
 
-    let log_entry = LogEntry::LPop {
-        key: key.clone(),
-        count,
-    };
-    let ack_response = log_and_wait!(ctx.logger, log_entry).await;
+    let ack_response = log_to_wal(log_entry, ctx).await;
 
     if let Response::Ok = ack_response {
         if let Some(mut entry) = ctx.db.get_mut(&key) {
@@ -623,7 +1033,8 @@ async fn handle_lpop(command: Command, ctx: &AppContext) -> Response {
         } else {
             Response::Nil
         }
-    } else {
+    }
+    else {
         ack_response
     }
 }
@@ -646,16 +1057,24 @@ async fn handle_rpop(command: Command, ctx: &AppContext) -> Response {
         1
     };
 
+    let log_entry = LogEntry::RPop {
+        key: key.clone(),
+        count,
+    };
+
+    let mut tx = ctx.current_transaction.write().await;
+    if let Some(tx) = tx.as_mut() {
+        tx.log_entries.push(log_entry);
+        return Response::Ok;
+    }
+    drop(tx);
+
     let mut old_size = 0;
     if let Some(entry) = ctx.db.get(&key) {
         old_size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
     }
 
-    let log_entry = LogEntry::RPop {
-        key: key.clone(),
-        count,
-    };
-    let ack_response = log_and_wait!(ctx.logger, log_entry).await;
+    let ack_response = log_to_wal(log_entry, ctx).await;
 
     if let Response::Ok = ack_response {
         if let Some(mut entry) = ctx.db.get_mut(&key) {
@@ -691,7 +1110,8 @@ async fn handle_rpop(command: Command, ctx: &AppContext) -> Response {
         } else {
             Response::Nil
         }
-    } else {
+    }
+    else {
         ack_response
     }
 }
@@ -787,6 +1207,18 @@ async fn handle_sadd(command: Command, ctx: &AppContext) -> Response {
     };
     let members: Vec<Vec<u8>> = command.args[2..].to_vec();
 
+    let log_entry = LogEntry::SAdd {
+        key: key.clone(),
+        members: members.clone(),
+    };
+
+    let mut tx = ctx.current_transaction.write().await;
+    if let Some(tx) = tx.as_mut() {
+        tx.log_entries.push(log_entry);
+        return Response::Ok;
+    }
+    drop(tx);
+
     let mut old_size = 0;
     if let Some(entry) = ctx.db.get(&key) {
         old_size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
@@ -804,11 +1236,7 @@ async fn handle_sadd(command: Command, ctx: &AppContext) -> Response {
         }
     }
 
-    let log_entry = LogEntry::SAdd {
-        key: key.clone(),
-        members: members.clone(),
-    };
-    let ack_response = log_and_wait!(ctx.logger, log_entry).await;
+    let ack_response = log_to_wal(log_entry, ctx).await;
 
     if let Response::Ok = ack_response {
         let entry = ctx
@@ -834,7 +1262,8 @@ async fn handle_sadd(command: Command, ctx: &AppContext) -> Response {
         } else {
             Response::Error("WRONGTYPE Operation against a non-set value".to_string())
         }
-    } else {
+    }
+    else {
         ack_response
     }
 }
@@ -849,16 +1278,24 @@ async fn handle_srem(command: Command, ctx: &AppContext) -> Response {
     };
     let members: Vec<Vec<u8>> = command.args[2..].to_vec();
 
+    let log_entry = LogEntry::SRem {
+        key: key.clone(),
+        members: members.clone(),
+    };
+
+    let mut tx = ctx.current_transaction.write().await;
+    if let Some(tx) = tx.as_mut() {
+        tx.log_entries.push(log_entry);
+        return Response::Ok;
+    }
+    drop(tx);
+
     let mut old_size = 0;
     if let Some(entry) = ctx.db.get(&key) {
         old_size = key.len() as u64 + memory::estimate_db_value_size(entry.value()).await;
     }
 
-    let log_entry = LogEntry::SRem {
-        key: key.clone(),
-        members: members.clone(),
-    };
-    let ack_response = log_and_wait!(ctx.logger, log_entry).await;
+    let ack_response = log_to_wal(log_entry, ctx).await;
 
     if let Response::Ok = ack_response {
         if let Some(mut entry) = ctx.db.get_mut(&key) {
@@ -886,7 +1323,8 @@ async fn handle_srem(command: Command, ctx: &AppContext) -> Response {
         } else {
             Response::Integer(0)
         }
-    } else {
+    }
+    else {
         ack_response
     }
 }
@@ -1117,7 +1555,7 @@ pub async fn handle_idx_create(command: Command, ctx: &AppContext) -> Response {
         if entry.key().starts_with(pattern) {
             let val = match entry.value() {
                 DbValue::Json(v) => v.clone(),
-                DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
+                DbValue::JsonB(b) => serde_json::from_slice(&b).unwrap_or_default(),
                 _ => continue,
             };
 
@@ -1174,6 +1612,27 @@ async fn handle_idx_list(command: Command, ctx: &AppContext) -> Response {
     Response::MultiBytes(index_names)
 }
 
+async fn handle_begin(command: Command, ctx: &AppContext) -> Response {
+    if command.args.len() != 1 {
+        return Response::Error("BEGIN takes no arguments".to_string());
+    }
+
+    let mut current_transaction = ctx.current_transaction.write().await;
+    if current_transaction.is_some() {
+        return Response::Error("Transaction already in progress".to_string());
+    }
+
+    let tx_id = Uuid::new_v4();
+    *current_transaction = Some(crate::types::Transaction {
+        id: tx_id,
+        state: crate::types::TransactionState::Active,
+        log_entries: Vec::new(),
+    });
+
+    println!("Transaction {} started.", tx_id);
+    Response::Ok
+}
+
 pub fn apply_json_set_to_db(db: &crate::types::Db, path: &str, value: Value) -> Result<()> {
     let mut parts = path.splitn(2, '.');
     let key = match parts.next() {
@@ -1185,7 +1644,7 @@ pub fn apply_json_set_to_db(db: &crate::types::Db, path: &str, value: Value) -> 
     let mut current_val = db.get(&key).map(|entry| {
         match entry.value() {
             DbValue::Json(v) => v.clone(),
-            DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or(json!({})),
+            DbValue::JsonB(b) => serde_json::from_slice(&b).unwrap_or(json!({})),
             _ => json!({})
         }
     }).unwrap_or(json!({}));
@@ -1201,7 +1660,8 @@ pub fn apply_json_set_to_db(db: &crate::types::Db, path: &str, value: Value) -> 
             if part.is_empty() { continue; }
             if current.is_object() {
                 current = current.as_object_mut().unwrap().entry(part).or_insert(json!({}));
-            } else {
+            }
+            else {
                 bail!("Path creation failed: part is not an object");
             }
         }
@@ -1231,7 +1691,7 @@ pub fn apply_json_delete_to_db(db: &crate::types::Db, path: &str) -> Result<i64>
         if let Some(entry) = db.get(&key) {
             let mut current_val = match entry.value() {
                 DbValue::Json(v) => v.clone(),
-                DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or(json!({})),
+                DbValue::JsonB(b) => serde_json::from_slice(&b).unwrap_or(json!({})),
                 _ => bail!("WRONGTYPE Operation against a non-JSON value"),
             };
 
@@ -1255,5 +1715,66 @@ pub fn apply_json_delete_to_db(db: &crate::types::Db, path: &str) -> Result<i64>
             }
         }
         Ok(0)
+    }
+}
+
+async fn handle_commit(command: Command, ctx: &AppContext) -> Response {
+    if command.args.len() != 1 {
+        return Response::Error("COMMIT takes no arguments".to_string());
+    }
+
+    let mut current_transaction = ctx.current_transaction.write().await;
+    let tx = match current_transaction.take() {
+        Some(t) => t,
+        None => return Response::Error("No transaction in progress".to_string()),
+    };
+
+    println!("Committing transaction {} with {} entries.", tx.id, tx.log_entries.len());
+    for (i, entry) in tx.log_entries.iter().enumerate() {
+        println!("  Entry {}: {:?}", i, entry);
+    }
+
+    for entry in tx.log_entries.iter() {
+        if let Err(e) = apply_log_entry(entry, ctx).await {
+            println!("Error applying log entry: {}", e);
+            return Response::Error(format!("Error applying transaction log: {}", e));
+        }
+    }
+
+    // Apply buffered log entries to the persistence engine
+    for entry in tx.log_entries {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if ctx.logger
+            .send(LogRequest {
+                entry: entry,
+                ack: ack_tx,
+            })
+            .await
+            .is_err()
+        {
+            return Response::Error("Persistence engine is down, commit failed".to_string());
+        }
+        match ack_rx.await {
+            Ok(Ok(())) => {},
+            Ok(Err(e)) => return Response::Error(format!("WAL write error during commit: {}", e)),
+            Err(_) => return Response::Error("Persistence engine dropped ACK channel during commit".to_string()),
+        }
+    }
+
+    println!("Transaction {} committed.", tx.id);
+    Response::Ok
+}
+
+async fn handle_rollback(command: Command, ctx: &AppContext) -> Response {
+    if command.args.len() != 1 {
+        return Response::Error("ROLLBACK takes no arguments".to_string());
+    }
+
+    let mut current_transaction = ctx.current_transaction.write().await;
+    if let Some(tx) = current_transaction.take() {
+        println!("Transaction {} rolled back.", tx.id);
+        Response::Ok
+    } else {
+        Response::Error("No transaction in progress".to_string())
     }
 }

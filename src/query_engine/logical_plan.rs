@@ -721,6 +721,9 @@ pub enum LogicalPlan {
     Except { left: Box<LogicalPlan>, right: Box<LogicalPlan> },
     CreateIndex { statement: CreateIndexStatement },
     Values { values: Vec<Vec<Expression>> },
+    BeginTransaction,
+    CommitTransaction,
+    RollbackTransaction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1660,5 +1663,8 @@ fn ast_to_logical_plan_inner(
             }) 
         },
         AstStatement::CreateIndex(statement) => Ok(LogicalPlan::CreateIndex { statement }),
+        AstStatement::BeginStatement => Ok(LogicalPlan::BeginTransaction),
+        AstStatement::CommitStatement => Ok(LogicalPlan::CommitTransaction),
+        AstStatement::RollbackStatement => Ok(LogicalPlan::RollbackTransaction),
     }
 }

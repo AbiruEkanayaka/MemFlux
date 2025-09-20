@@ -5,6 +5,7 @@ use futures::{Stream, StreamExt};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
+use tokio::sync::RwLock;
 
 // Core modules of the database engine
 pub mod arc;
@@ -115,6 +116,7 @@ impl MemFluxDB {
             function_registry,
             config: config.clone(),
             memory: memory_manager,
+            current_transaction: Arc::new(RwLock::new(None)),
         });
 
         if app_context.memory.is_enabled()

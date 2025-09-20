@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, RwLock};
+use uuid::Uuid;
 
 use crate::config::Config;
 use crate::indexing::IndexManager;
@@ -78,7 +79,7 @@ impl SerializableDbValue {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum LogEntry {
     SetBytes { key: String, value: Vec<u8> },
     SetJsonB { key: String, value: Vec<u8> },
@@ -92,6 +93,9 @@ pub enum LogEntry {
     SAdd { key: String, members: Vec<Vec<u8>> },
     SRem { key: String, members: Vec<Vec<u8>> },
     RenameTable { old_name: String, new_name: String },
+    BeginTransaction { id: Uuid },
+    CommitTransaction { id: Uuid },
+    RollbackTransaction { id: Uuid },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -121,6 +125,19 @@ pub type JsonCache = Arc<DashMap<String, Arc<Vec<u8>>>>;
 pub type SchemaCache = Arc<DashMap<String, Arc<VirtualSchema>>>;
 pub type ViewCache = Arc<DashMap<String, Arc<ViewDefinition>>>;
 pub type ScalarFunction = Box<dyn Fn(Vec<Value>) -> Result<Value> + Send + Sync>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransactionState {
+    Active,
+    Committed,
+    RolledBack,
+}
+
+pub struct Transaction {
+    pub id: Uuid,
+    pub state: TransactionState,
+    pub log_entries: Vec<LogEntry>,
+}
 
 // --- Function Registry ---
 
@@ -157,6 +174,7 @@ pub struct AppContext {
     pub function_registry: Arc<FunctionRegistry>,
     pub config: Arc<Config>,
     pub memory: Arc<MemoryManager>,
+    pub current_transaction: Arc<RwLock<Option<Transaction>>>,
 }
 
 pub struct Command {
@@ -202,6 +220,7 @@ impl Response {
         }
     }
 }
+
 
 
 

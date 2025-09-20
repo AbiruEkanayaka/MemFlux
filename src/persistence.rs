@@ -507,6 +507,7 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                     }
                 }
             }
+            _ => { /* Do nothing for transaction-related log entries during replay */ }
         }
     }
     if count > 0 {
@@ -514,12 +515,3 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
     }
     Ok(())
 }
-
-
-
-
-
-
-
-
-

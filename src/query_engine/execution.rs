@@ -20,8 +20,14 @@ pub const SCHEMALIST_PREFIX: &str = "_internal:schemalist:";
 type Row = Value;
 
 macro_rules! log_and_wait_qe {
-    ($logger:expr, $entry:expr) => {
+    ($logger:expr, $entry:expr, $ctx:expr) => {
         async {
+            let mut current_transaction = $ctx.current_transaction.write().await;
+            if let Some(tx) = current_transaction.as_mut() {
+                tx.log_entries.push($entry);
+                return Ok(());
+            }
+
             let (ack_tx, ack_rx) = oneshot::channel();
             if $logger
                 .send(LogRequest {
@@ -517,7 +523,7 @@ pub fn execute<'a>(
                             primary_key_cols = columns.clone();
                             for pk_col_name in columns.iter() {
                                 if let Some(c) = cols.get_mut(pk_col_name) {
-                                    c.nullable = false; // Primary key columns are implicitly NOT NULL
+                                    c.nullable = false; // Primary key implies NOT NULL
                                 } else {
                                     Err(anyhow!("Column '{}' in PRIMARY KEY not found in table definition", pk_col_name))?;
                                 }
@@ -609,7 +615,7 @@ pub fn execute<'a>(
                 let schema_bytes = serde_json::to_vec(&schema)?;
 
                 let log_entry = LogEntry::SetBytes { key: schema_key.clone(), value: schema_bytes.clone() };
-                log_and_wait_qe!(ctx.logger, log_entry).await?;
+                log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
 
                 ctx.db.insert(schema_key, DbValue::Bytes(schema_bytes));
                 ctx.schema_cache.insert(table_name, Arc::new(schema));
@@ -623,7 +629,7 @@ pub fn execute<'a>(
 
                 // Log the deletion
                 let log_entry = LogEntry::Delete { key: schema_key.clone() };
-                log_and_wait_qe!(ctx.logger, log_entry).await?;
+                log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
 
                 // Execute the deletion
                 ctx.schema_cache.remove(&table_name);
@@ -638,7 +644,7 @@ pub fn execute<'a>(
                 let view_key = format!("{}{}", VIEW_PREFIX, view_name);
 
                 let log_entry = LogEntry::Delete { key: view_key.clone() };
-                log_and_wait_qe!(ctx.logger, log_entry).await?;
+                log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
 
                 ctx.view_cache.remove(&view_name);
                 ctx.db.remove(&view_key);
@@ -841,7 +847,7 @@ pub fn execute<'a>(
 
                                     let new_val_bytes = serde_json::to_vec(&new_val)?;
                                     let log_entry = LogEntry::SetJsonB { key: key.clone(), value: new_val_bytes.clone() };
-                                    log_and_wait_qe!(ctx.logger, log_entry).await?;
+                                    log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
 
                                     ctx.index_manager.remove_key_from_indexes(&key, &old_val).await;
                                     ctx.index_manager.add_key_to_indexes(&key, &new_val).await;
@@ -862,7 +868,7 @@ pub fn execute<'a>(
                     // Standard insert path (no conflict)
                     let value_bytes = serde_json::to_vec(&row_data)?;
                     let log_entry = LogEntry::SetJsonB { key: key.clone(), value: value_bytes.clone() };
-                    log_and_wait_qe!(ctx.logger, log_entry).await?;
+                    log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
 
                     ctx.index_manager
                         .add_key_to_indexes(&key, &row_data)
@@ -881,7 +887,8 @@ pub fn execute<'a>(
                         let proj_row = project_row(&returned_row, &returning, ctx.clone(), outer_row, _working_tables).await?;
                         yield proj_row;
                     }
-                } else {
+                }
+                else {
                     yield json!({"rows_affected": total_rows_affected});
                 }
             }
@@ -917,7 +924,7 @@ pub fn execute<'a>(
                         .await;
 
                     let log_entry = LogEntry::Delete { key: key.clone() };
-                    log_and_wait_qe!(ctx.logger, log_entry).await?;
+                    log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
                     if ctx.db.remove(&key).is_some() {
                         deleted_count += 1;
                     }
@@ -1013,7 +1020,7 @@ pub fn execute<'a>(
 
                     let new_val_bytes = serde_json::to_vec(&new_val)?;
                     let log_entry = LogEntry::SetJsonB { key: key.clone(), value: new_val_bytes.clone() };
-                    log_and_wait_qe!(ctx.logger, log_entry).await?;
+                    log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
 
                     ctx.index_manager
                         .remove_key_from_indexes(&key, old_val_for_index)
@@ -1114,7 +1121,7 @@ pub fn execute<'a>(
                             old_name: table_name.clone(),
                             new_name: new_table_name.clone(),
                         };
-                        log_and_wait_qe!(ctx.logger, log_entry).await?;
+                        log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
 
                         // 3. Perform the rename in memory. This is not perfectly atomic in-memory,
                         // but it is consistent upon WAL replay.
@@ -1182,7 +1189,7 @@ pub fn execute<'a>(
                                     }
                                 }
                                 let new_bytes = serde_json::to_vec(&val)?;
-                                log_and_wait_qe!(ctx.logger, LogEntry::SetJsonB { key: key.clone(), value: new_bytes.clone() }).await?;
+                                log_and_wait_qe!(ctx.logger, LogEntry::SetJsonB { key: key.clone(), value: new_bytes.clone() }, ctx).await?;
                                 *entry.value_mut() = DbValue::JsonB(new_bytes);
                              }
                         }
@@ -1291,7 +1298,7 @@ pub fn execute<'a>(
                                     }
                                 }
                                 let new_bytes = serde_json::to_vec(&val)?;
-                                log_and_wait_qe!(ctx.logger, LogEntry::SetJsonB { key: key.clone(), value: new_bytes.clone() }).await?;
+                                log_and_wait_qe!(ctx.logger, LogEntry::SetJsonB { key: key.clone(), value: new_bytes.clone() }, ctx).await?;
                                 *entry.value_mut() = DbValue::JsonB(new_bytes);
                              }
                         }
@@ -1303,7 +1310,7 @@ pub fn execute<'a>(
 
                 let schema_bytes = serde_json::to_vec(&schema)?;
                 let log_entry = LogEntry::SetBytes { key: schema_key.clone(), value: schema_bytes.clone() };
-                log_and_wait_qe!(ctx.logger, log_entry).await?;
+                log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
 
                 ctx.db.insert(schema_key, DbValue::Bytes(schema_bytes));
                 ctx.schema_cache.insert(table_name, Arc::new(schema));
@@ -1325,7 +1332,7 @@ pub fn execute<'a>(
                 let view_bytes = serde_json::to_vec(&view_def)?;
 
                 let log_entry = LogEntry::SetBytes { key: view_key.clone(), value: view_bytes.clone() };
-                log_and_wait_qe!(ctx.logger, log_entry).await?;
+                log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
 
                 ctx.db.insert(view_key, DbValue::Bytes(view_bytes));
                 ctx.view_cache.insert(view_name, Arc::new(view_def));
@@ -1339,7 +1346,7 @@ pub fn execute<'a>(
                 }
 
                 let log_entry = LogEntry::SetBytes { key: schema_list_key.clone(), value: vec![] };
-                log_and_wait_qe!(ctx.logger, log_entry).await?;
+                log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
 
                 ctx.db.insert(schema_list_key, DbValue::Bytes(vec![]));
 
@@ -1418,7 +1425,7 @@ pub fn execute<'a>(
                 // Store index metadata
                 let index_metadata_bytes = serde_json::to_vec(&statement)?;
                 let log_entry = LogEntry::SetBytes { key: index_metadata_key.clone(), value: index_metadata_bytes.clone() };
-                log_and_wait_qe!(ctx.logger, log_entry).await?;
+                log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
                 ctx.db.insert(index_metadata_key, DbValue::Bytes(index_metadata_bytes));
 
                 // Create the actual index data structure in IndexManager
@@ -1612,6 +1619,67 @@ pub fn execute<'a>(
 
                 for row in all_rows {
                     yield row;
+                }
+            }
+            PhysicalPlan::BeginTransaction => {
+                let mut current_transaction = ctx.current_transaction.write().await;
+                if current_transaction.is_some() {
+                    Err(anyhow!("Transaction already in progress"))?;
+                }
+
+                let tx_id = Uuid::new_v4();
+                *current_transaction = Some(crate::types::Transaction {
+                    id: tx_id,
+                    state: crate::types::TransactionState::Active,
+                    log_entries: Vec::new(),
+                });
+
+                println!("Transaction {} started.", tx_id);
+                yield json!({"status": "Transaction started"});
+            }
+            PhysicalPlan::CommitTransaction => {
+                let mut current_transaction = ctx.current_transaction.write().await;
+                let tx = match current_transaction.take() {
+                    Some(t) => t,
+                    None => Err(anyhow!("No transaction in progress"))?,
+                };
+
+                for entry in &tx.log_entries {
+                    if let Err(e) = crate::commands::apply_log_entry(entry, &ctx).await {
+                        Err(anyhow!("Error applying transaction log: {}", e))?;
+                    }
+                }
+
+                // Apply buffered log entries to the persistence engine
+                for entry in tx.log_entries {
+                    let (ack_tx, ack_rx) = oneshot::channel();
+                    if ctx.logger
+                        .send(LogRequest {
+                            entry: entry,
+                            ack: ack_tx,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        Err(anyhow!("Persistence engine is down, commit failed"))?;
+                    }
+                    match ack_rx.await {
+                        Ok(Ok(())) => {},
+                        Ok(Err(e)) => Err(anyhow!("WAL write error during commit: {}", e))?,
+                        Err(_) => Err(anyhow!("Persistence engine dropped ACK channel during commit"))?,
+                    }
+                }
+
+                println!("Transaction {} committed.", tx.id);
+                yield json!({"status": "Transaction committed"});
+            }
+            PhysicalPlan::RollbackTransaction => {
+                let mut current_transaction = ctx.current_transaction.write().await;
+                if let Some(tx) = current_transaction.take() {
+                    println!("Transaction {} rolled back.", tx.id);
+                    yield json!({"status": "Transaction rolled back"});
+                } else {
+                    Err(anyhow!("No transaction in progress"))?;
                 }
             }
         }
@@ -1810,7 +1878,7 @@ async fn apply_on_delete_actions(
                                             .ok_or_else(|| anyhow!("Could not get child key for CASCADE delete"))?;
 
                                         let log_entry = LogEntry::Delete { key: child_key.clone() };
-                                        log_and_wait_qe!(ctx.logger, log_entry).await?;
+                                        log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
                                         if let Some(entry) = ctx.db.remove(&child_key) {
                                             let size = crate::memory::estimate_db_value_size(&entry.1).await;
                                             ctx.memory.decrease_memory(size + child_key.len() as u64);
@@ -1845,7 +1913,7 @@ async fn apply_on_delete_actions(
 
                                         let new_val_bytes = serde_json::to_vec(&new_child_val)?;
                                         let log_entry = LogEntry::SetJsonB { key: child_key.clone(), value: new_val_bytes.clone() };
-                                        log_and_wait_qe!(ctx.logger, log_entry).await?;
+                                        log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
 
                                         ctx.index_manager.remove_key_from_indexes(&child_key, &old_child_val_for_index).await;
                                         ctx.index_manager.add_key_to_indexes(&child_key, &new_child_val).await;
@@ -1884,7 +1952,7 @@ async fn apply_on_delete_actions(
 
                                         let new_val_bytes = serde_json::to_vec(&new_child_val)?;
                                         let log_entry = LogEntry::SetJsonB { key: child_key.clone(), value: new_val_bytes.clone() };
-                                        log_and_wait_qe!(ctx.logger, log_entry).await?;
+                                        log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
 
                                         ctx.index_manager.remove_key_from_indexes(&child_key, &old_child_val_for_index).await;
                                         ctx.index_manager.add_key_to_indexes(&child_key, &new_child_val).await;
@@ -1991,10 +2059,9 @@ async fn apply_on_update_actions(
                                         for (col_name, new_val) in &new_parent_pk_values {
                                             new_child_val[col_name] = new_val.clone();
                                         }
-
                                         let new_val_bytes = serde_json::to_vec(&new_child_val)?;
                                         let log_entry = LogEntry::SetJsonB { key: child_key.clone(), value: new_val_bytes.clone() };
-                                        log_and_wait_qe!(ctx.logger, log_entry).await?;
+                                        log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
 
                                         ctx.index_manager.remove_key_from_indexes(&child_key, &old_child_val_for_index).await;
                                         ctx.index_manager.add_key_to_indexes(&child_key, &new_child_val).await;
@@ -2024,7 +2091,7 @@ async fn apply_on_update_actions(
 
                                         let new_val_bytes = serde_json::to_vec(&new_child_val)?;
                                         let log_entry = LogEntry::SetJsonB { key: child_key.clone(), value: new_val_bytes.clone() };
-                                        log_and_wait_qe!(ctx.logger, log_entry).await?;
+                                        log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
 
                                         ctx.index_manager.remove_key_from_indexes(&child_key, &old_child_val_for_index).await;
                                         ctx.index_manager.add_key_to_indexes(&child_key, &new_child_val).await;
@@ -2063,7 +2130,7 @@ async fn apply_on_update_actions(
 
                                         let new_val_bytes = serde_json::to_vec(&new_child_val)?;
                                         let log_entry = LogEntry::SetJsonB { key: child_key.clone(), value: new_val_bytes.clone() };
-                                        log_and_wait_qe!(ctx.logger, log_entry).await?;
+                                        log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
 
                                         ctx.index_manager.remove_key_from_indexes(&child_key, &old_child_val_for_index).await;
                                         ctx.index_manager.add_key_to_indexes(&child_key, &new_child_val).await;
