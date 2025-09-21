@@ -5,7 +5,6 @@ use futures::{Stream, StreamExt};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
-use tokio::sync::{RwLock};
 
 // Core modules of the database engine
 pub mod arc;
@@ -17,6 +16,7 @@ pub mod persistence;
 pub mod protocol;
 pub mod query_engine;
 pub mod schema;
+pub mod transaction;
 pub mod types;
 
 // Public exports for the library API
@@ -26,6 +26,7 @@ use crate::memory::MemoryManager;
 use crate::persistence::{load_db_from_disk, PersistenceEngine};
 use crate::query_engine::functions;
 use crate::schema::{load_schemas_from_db, VIEW_PREFIX};
+use crate::transaction::TransactionHandle;
 use crate::types::{AppContext, Db, FunctionRegistry, ViewCache, ViewDefinition};
 
 /// The main database instance, providing the primary API for interaction.
@@ -33,7 +34,7 @@ pub struct MemFluxDB {
     pub app_context: Arc<AppContext>,
     // The handle to the persistence engine's background task.
     // Kept to ensure the task is not dropped prematurely.
-    _persistence_handle: Option<JoinHandle<()>>, 
+    _persistence_handle: Option<JoinHandle<()>>,
 }
 
 impl MemFluxDB {
@@ -134,7 +135,7 @@ impl MemFluxDB {
             function_registry,
             config: config.clone(),
             memory: memory_manager,
-            current_transaction: Arc::new(RwLock::new(None)),
+            commit_lock: Arc::new(tokio::sync::Mutex::new(())),
         });
 
         if app_context.memory.is_enabled()
@@ -172,6 +173,7 @@ impl MemFluxDB {
     pub fn execute_sql_stream<'a>(
         &'a self,
         sql: &'a str,
+        transaction_handle: TransactionHandle,
     ) -> impl Stream<Item = Result<Value>> + Send + 'a {
         use query_engine::{ast_to_logical_plan, execute, logical_to_physical_plan};
 
@@ -189,7 +191,8 @@ impl MemFluxDB {
 
             match physical_plan_result {
                 Ok(physical_plan) => {
-                    let mut stream = execute(physical_plan, self.app_context.clone(), None, None);
+                    // TODO: Pass transaction handle down to the query engine
+                    let mut stream = execute(physical_plan, self.app_context.clone(), None, None, Some(transaction_handle));
                     while let Some(row_result) = stream.next().await {
                         yield row_result?;
                     }
@@ -202,7 +205,11 @@ impl MemFluxDB {
     }
 
     /// Executes a command, either SQL or a direct database command.
-    pub async fn execute_command(&self, command: types::Command) -> types::Response {
+    pub async fn execute_command(
+        &self,
+        command: types::Command,
+        transaction_handle: TransactionHandle,
+    ) -> types::Response {
         if command.name == "SQL" {
             let sql = command.args[1..]
                 .iter()
@@ -219,7 +226,7 @@ impl MemFluxDB {
                 _ => false,
             };
 
-            let mut stream = Box::pin(self.execute_sql_stream(&sql));
+            let mut stream = Box::pin(self.execute_sql_stream(&sql, transaction_handle));
 
             if is_select_like {
                 let mut rows = Vec::new();
@@ -241,22 +248,21 @@ impl MemFluxDB {
                 if let Some(result) = stream.next().await {
                     match result {
                         Ok(value) => {
-                            if let Some(count) = value.get("rows_affected").and_then(|v| v.as_i64()) {
+                            if let Some(count) = value.get("rows_affected").and_then(|v| v.as_i64())
+                            {
                                 types::Response::Integer(count)
                             } else {
                                 types::Response::Ok
                             }
                         }
-                        Err(e) => {
-                            types::Response::Error(format!("Execution Error: {}", e))
-                        }
+                        Err(e) => types::Response::Error(format!("Execution Error: {}", e)),
                     }
                 } else {
                     types::Response::Error("Command executed with no result".to_string())
                 }
             }
         } else {
-            commands::process_command(command, &self.app_context).await
+            commands::process_command(command, &self.app_context, transaction_handle).await
         }
     }
 }

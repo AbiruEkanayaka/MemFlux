@@ -4,10 +4,9 @@ use std::collections::{HashSet, VecDeque};
 use std::str;
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
-use uuid::Uuid;
-
 use crate::indexing::Index;
 use crate::memory;
+use crate::transaction::{Transaction, TransactionHandle};
 use crate::types::*;
 
 pub async fn apply_log_entry(entry: &LogEntry, ctx: &AppContext) -> Result<()> {
@@ -349,28 +348,32 @@ pub async fn apply_log_entry(entry: &LogEntry, ctx: &AppContext) -> Result<()> {
     Ok(())
 }
 
-pub async fn process_command(command: Command, ctx: &AppContext) -> Response {
+pub async fn process_command(
+    command: Command,
+    ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
     match command.name.as_str() {
         "PING" => Response::SimpleString("PONG".to_string()),
         "AUTH" => Response::Error("AUTH can only be used as the first command.".to_string()),
-        "GET" => handle_get(command, ctx).await,
-        "SET" => handle_set(command, ctx).await,
-        "DELETE" => handle_delete(command, ctx).await,
-        "JSON.SET" => handle_json_set(command, ctx).await,
-        "JSON.GET" => handle_json_get(command, ctx).await,
-        "JSON.DEL" => handle_json_del(command, ctx).await,
-        "LPUSH" => handle_lpush(command, ctx).await,
-        "RPUSH" => handle_rpush(command, ctx).await,
-        "LPOP" => handle_lpop(command, ctx).await,
-        "RPOP" => handle_rpop(command, ctx).await,
-        "LLEN" => handle_llen(command, ctx).await,
-        "LRANGE" => handle_lrange(command, ctx).await,
-        "SADD" => handle_sadd(command, ctx).await,
-        "SREM" => handle_srem(command, ctx).await,
-        "SMEMBERS" => handle_smembers(command, ctx).await,
-        "SCARD" => handle_scard(command, ctx).await,
-        "SISMEMBER" => handle_sismember(command, ctx).await,
-        "KEYS" => handle_keys(command, ctx).await,
+        "GET" => handle_get(command, ctx, transaction_handle).await,
+        "SET" => handle_set(command, ctx, transaction_handle).await,
+        "DELETE" => handle_delete(command, ctx, transaction_handle).await,
+        "JSON.SET" => handle_json_set(command, ctx, transaction_handle).await,
+        "JSON.GET" => handle_json_get(command, ctx, transaction_handle).await,
+        "JSON.DEL" => handle_json_del(command, ctx, transaction_handle).await,
+        "LPUSH" => handle_lpush(command, ctx, transaction_handle).await,
+        "RPUSH" => handle_rpush(command, ctx, transaction_handle).await,
+        "LPOP" => handle_lpop(command, ctx, transaction_handle).await,
+        "RPOP" => handle_rpop(command, ctx, transaction_handle).await,
+        "LLEN" => handle_llen(command, ctx, transaction_handle).await,
+        "LRANGE" => handle_lrange(command, ctx, transaction_handle).await,
+        "SADD" => handle_sadd(command, ctx, transaction_handle).await,
+        "SREM" => handle_srem(command, ctx, transaction_handle).await,
+        "SMEMBERS" => handle_smembers(command, ctx, transaction_handle).await,
+        "SCARD" => handle_scard(command, ctx, transaction_handle).await,
+        "SISMEMBER" => handle_sismember(command, ctx, transaction_handle).await,
+        "KEYS" => handle_keys(command, ctx, transaction_handle).await,
         "FLUSHDB" => handle_flushdb(command, ctx).await,
         "SAVE" => handle_save(command, ctx).await,
         "MEMUSAGE" => handle_memory_usage(command, ctx).await,
@@ -378,9 +381,9 @@ pub async fn process_command(command: Command, ctx: &AppContext) -> Response {
         "IDX.CREATE" => handle_idx_create(command, ctx).await,
         "IDX.DROP" => handle_idx_drop(command, ctx).await,
         "IDX.LIST" => handle_idx_list(command, ctx).await,
-        "BEGIN" => handle_begin(command, ctx).await,
-        "COMMIT" => handle_commit(command, ctx).await,
-        "ROLLBACK" => handle_rollback(command, ctx).await,
+        "BEGIN" => handle_begin(command, ctx, transaction_handle).await,
+        "COMMIT" => handle_commit(command, ctx, transaction_handle).await,
+        "ROLLBACK" => handle_rollback(command, ctx, transaction_handle).await,
         _ => Response::Error(format!("Unknown command: {}", command.name)),
     }
 }
@@ -404,7 +407,27 @@ async fn log_to_wal(log_entry: LogEntry, ctx: &AppContext) -> Response {
     }
 }
 
-async fn handle_get(command: Command, ctx: &AppContext) -> Response {
+async fn db_value_to_response(value: &DbValue, key: &str, ctx: &AppContext) -> Response {
+    if ctx.memory.is_enabled() {
+        ctx.memory.track_access(key).await;
+    }
+    match value {
+        DbValue::Bytes(b) => Response::Bytes(b.clone()),
+        DbValue::Json(v) => Response::Bytes(v.to_string().into_bytes()),
+        DbValue::List(_) => Response::Error("WRONGTYPE Operation against a list".to_string()),
+        DbValue::Set(_) => Response::Error("WRONGTYPE Operation against a set".to_string()),
+        DbValue::JsonB(b) => Response::Bytes(b.clone()),
+        DbValue::Array(_) => {
+            Response::Error("WRONGTYPE Operation against an array value".to_string())
+        }
+    }
+}
+
+async fn handle_get(
+    command: Command,
+    ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
     if command.args.len() != 2 {
         return Response::Error("GET requires one argument".to_string());
     }
@@ -413,6 +436,39 @@ async fn handle_get(command: Command, ctx: &AppContext) -> Response {
         Err(_) => return Response::Error("Invalid key".to_string()),
     };
 
+    let tx_guard = transaction_handle.read().await;
+    if let Some(tx) = tx_guard.as_ref() {
+        // 1. Check writes cache (read-your-writes)
+        if let Some(entry) = tx.writes.get(&key) {
+            return match entry.value() {
+                Some(val) => db_value_to_response(val, &key, ctx).await,
+                None => Response::Nil, // Deleted in this transaction
+            };
+        }
+
+        // 2. Check read cache (repeatable reads)
+        if let Some(entry) = tx.read_cache.get(&key) {
+            return match entry.value() {
+                Some(val) => db_value_to_response(val, &key, ctx).await,
+                None => Response::Nil, // Known to not exist at first read
+            };
+        }
+
+        // 3. Read from main DB and populate read cache
+        let db_entry = ctx.db.get(&key);
+        let value_clone = db_entry.as_ref().map(|e| e.value().clone());
+        let response = match &value_clone {
+            Some(val) => db_value_to_response(val, &key, ctx).await,
+            None => Response::Nil,
+        };
+        // Drop the lock on the main DB before inserting into the cache
+        drop(db_entry);
+        tx.read_cache.insert(key, value_clone);
+        return response;
+    }
+    drop(tx_guard);
+
+    // No transaction, proceed as before
     match ctx.db.get(&key) {
         Some(entry) => {
             if ctx.memory.is_enabled() {
@@ -424,14 +480,20 @@ async fn handle_get(command: Command, ctx: &AppContext) -> Response {
                 DbValue::List(_) => Response::Error("WRONGTYPE Operation against a list".to_string()),
                 DbValue::Set(_) => Response::Error("WRONGTYPE Operation against a set".to_string()),
                 DbValue::JsonB(b) => Response::Bytes(b.clone()),
-                DbValue::Array(_) => Response::Error("WRONGTYPE Operation against an array value".to_string()),
+                DbValue::Array(_) => {
+                    Response::Error("WRONGTYPE Operation against an array value".to_string())
+                }
             }
         }
         None => Response::Nil,
     }
 }
 
-async fn handle_set(command: Command, ctx: &AppContext) -> Response {
+async fn handle_set(
+    command: Command,
+    ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
     if command.args.len() != 3 {
         return Response::Error("SET requires two arguments".to_string());
     }
@@ -446,12 +508,14 @@ async fn handle_set(command: Command, ctx: &AppContext) -> Response {
         value: value.clone(),
     };
 
-    let mut tx = ctx.current_transaction.write().await;
-    if let Some(tx) = tx.as_mut() {
+    let mut tx_guard = transaction_handle.write().await;
+    if let Some(tx) = tx_guard.as_mut() {
         tx.log_entries.push(log_entry);
+        tx.writes
+            .insert(key.clone(), Some(DbValue::Bytes(value.clone())));
         return Response::Ok;
     }
-    drop(tx);
+    drop(tx_guard);
 
     let mut old_size = 0;
     if let Some(entry) = ctx.db.get(&key) {
@@ -479,21 +543,28 @@ async fn handle_set(command: Command, ctx: &AppContext) -> Response {
     ack_response
 }
 
-async fn handle_delete(command: Command, ctx: &AppContext) -> Response {
+async fn handle_delete(
+    command: Command,
+    ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
     if command.args.len() < 2 {
         return Response::Error("DELETE requires at least one argument".to_string());
     }
 
-    let mut tx = ctx.current_transaction.write().await;
-    if let Some(tx) = tx.as_mut() {
+    let mut tx_guard = transaction_handle.write().await;
+    if let Some(tx) = tx_guard.as_mut() {
+        let mut deleted_count = 0;
         for key_bytes in &command.args[1..] {
             if let Ok(key) = String::from_utf8(key_bytes.clone()) {
-                tx.log_entries.push(LogEntry::Delete { key });
+                tx.log_entries.push(LogEntry::Delete { key: key.clone() });
+                tx.writes.insert(key, None);
+                deleted_count += 1;
             }
         }
-        return Response::Ok;
+        return Response::Integer(deleted_count);
     }
-    drop(tx);
+    drop(tx_guard);
 
     let mut deleted_count = 0;
     for key_bytes in &command.args[1..] {
@@ -541,7 +612,11 @@ pub fn json_path_to_pointer(path: &str) -> String {
     format!("/{}", p.replace('.', "/"))
 }
 
-async fn handle_json_set(command: Command, ctx: &AppContext) -> Response {
+async fn handle_json_set(
+    command: Command,
+    ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
     let (full_path, value_str) = if command.args.len() == 3 {
         // This is for `JSON.SET <key or key.path> <value>`
         (
@@ -573,16 +648,63 @@ async fn handle_json_set(command: Command, ctx: &AppContext) -> Response {
     let path = parts.next().unwrap_or("");
 
     // --- TRANSACTION LOGIC FIRST ---
-    let mut tx = ctx.current_transaction.write().await;
-    if let Some(tx) = tx.as_mut() {
+    let mut tx_guard = transaction_handle.write().await;
+    if let Some(tx) = tx_guard.as_mut() {
         let log_entry = LogEntry::JsonSet {
-            path: full_path,
-            value: value_str.clone(),
+            path: full_path.clone(),
+            value: value_str.to_string(),
         };
         tx.log_entries.push(log_entry);
+
+        // Apply change to the transaction's write set for read-your-writes
+        let value: Value = match serde_json::from_str(&value_str) {
+            Ok(v) => v,
+            Err(_) => return Response::Error("Value is not valid JSON".to_string()),
+        };
+
+        let current_db_val = tx
+            .writes
+            .get(&key)
+            .and_then(|v| v.value().clone())
+            .or_else(|| tx.read_cache.get(&key).and_then(|v| v.value().clone()))
+            .or_else(|| ctx.db.get(&key).map(|v| v.value().clone()));
+
+        let mut current_val = match current_db_val {
+            Some(DbValue::Json(v)) => v.clone(),
+            Some(DbValue::JsonB(b)) => serde_json::from_slice(&b).unwrap_or(json!({})),
+            _ => json!({}),
+        };
+
+        let pointer = if path == "." || path.is_empty() { "".to_string() } else { json_path_to_pointer(&path) };
+        if pointer.is_empty() {
+            current_val = value;
+        } else if let Some(target) = current_val.pointer_mut(&pointer) {
+            *target = value;
+        } else {
+            let mut current = &mut current_val;
+            for part in path.split('.') {
+                if part.is_empty() { continue; }
+                if current.is_object() {
+                    current = current.as_object_mut().unwrap().entry(part).or_insert(json!({}));
+                }
+                else {
+                    return Response::Error("Path creation failed: part is not an object".to_string());
+                }
+            }
+            *current = value;
+        }
+
+        let new_value_bytes = match serde_json::to_vec(&current_val) {
+            Ok(b) => b,
+            Err(_) => return Response::Error("Failed to serialize new JSON value".to_string()),
+        };
+
+        tx.writes
+            .insert(key, Some(DbValue::JsonB(new_value_bytes)));
+
         return Response::Ok;
     }
-    drop(tx);
+    drop(tx_guard);
     // --- END TRANSACTION LOGIC ---
 
     let value: Value = match serde_json::from_str(&value_str) {
@@ -666,7 +788,11 @@ async fn handle_json_set(command: Command, ctx: &AppContext) -> Response {
     ack_response
 }
 
-async fn handle_json_get(command: Command, ctx: &AppContext) -> Response {
+async fn handle_json_get(
+    command: Command,
+    ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
     if command.args.len() != 2 {
         return Response::Error("JSON.GET requires a key/path".to_string());
     }
@@ -682,41 +808,75 @@ async fn handle_json_get(command: Command, ctx: &AppContext) -> Response {
     };
     let inner_path = parts.next().unwrap_or("");
 
+    let tx_guard = transaction_handle.read().await;
+    if let Some(tx) = tx_guard.as_ref() {
+        // Transactional read
+        let entry_opt = tx.writes.get(key).map(|e| e.value().clone()).or_else(|| {
+            tx.read_cache.get(key).map(|e| e.value().clone()).or_else(|| {
+                let db_entry = ctx.db.get(key);
+                let value_clone = db_entry.as_ref().map(|e| e.value().clone());
+                drop(db_entry);
+                tx.read_cache.insert(key.to_string(), value_clone.clone());
+                Some(value_clone)
+            })
+        });
+
+        return match entry_opt {
+            Some(Some(db_value)) => {
+                json_db_value_to_response(&db_value, inner_path, key, ctx).await
+            }
+            _ => Response::Nil,
+        };
+    }
+    drop(tx_guard);
+
+    // Non-transactional read
     match ctx.db.get(key) {
-        Some(entry) => {
-            if ctx.memory.is_enabled() {
-                ctx.memory.track_access(key).await;
-            }
-            match entry.value() {
-                DbValue::Json(v) => {
-                    let pointer = json_path_to_pointer(inner_path);
-                    match v.pointer(&pointer) {
-                        Some(val) => Response::Bytes(val.to_string().into_bytes()),
-                        None => Response::Nil,
-                    }
-                }
-                DbValue::JsonB(b) => {
-                    let v: Value = match serde_json::from_slice(&b) {
-                        Ok(val) => val,
-                        Err(_) => return Response::Error("Could not parse JSONB value".to_string()),
-                    };
-                    if inner_path.is_empty() || inner_path == "." {
-                        return Response::Bytes(v.to_string().into_bytes());
-                    }
-                    let pointer = json_path_to_pointer(inner_path);
-                    match v.pointer(&pointer) {
-                        Some(val) => Response::Bytes(val.to_string().into_bytes()),
-                        None => Response::Nil,
-                    }
-                }
-                _ => Response::Error("WRONGTYPE Operation against a non-JSON value".to_string()),
-            }
-        }
+        Some(entry) => json_db_value_to_response(entry.value(), inner_path, key, ctx).await,
         None => Response::Nil,
     }
 }
 
-async fn handle_json_del(command: Command, ctx: &AppContext) -> Response {
+async fn json_db_value_to_response(
+    db_value: &DbValue,
+    inner_path: &str,
+    key: &str,
+    ctx: &AppContext,
+) -> Response {
+    if ctx.memory.is_enabled() {
+        ctx.memory.track_access(key).await;
+    }
+    match db_value {
+        DbValue::Json(v) => {
+            let pointer = json_path_to_pointer(inner_path);
+            match v.pointer(&pointer) {
+                Some(val) => Response::Bytes(val.to_string().into_bytes()),
+                None => Response::Nil,
+            }
+        }
+        DbValue::JsonB(b) => {
+            let v: Value = match serde_json::from_slice(&b) {
+                Ok(val) => val,
+                Err(_) => return Response::Error("Could not parse JSONB value".to_string()),
+            };
+            if inner_path.is_empty() || inner_path == "." {
+                return Response::Bytes(v.to_string().into_bytes());
+            }
+            let pointer = json_path_to_pointer(inner_path);
+            match v.pointer(&pointer) {
+                Some(val) => Response::Bytes(val.to_string().into_bytes()),
+                None => Response::Nil,
+            }
+        }
+        _ => Response::Error("WRONGTYPE Operation against a non-JSON value".to_string()),
+    }
+}
+
+async fn handle_json_del(
+    command: Command,
+    ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
     if command.args.len() != 2 {
         return Response::Error("JSON.DEL requires a key/path".to_string());
     }
@@ -732,17 +892,60 @@ async fn handle_json_del(command: Command, ctx: &AppContext) -> Response {
     };
     let inner_path = parts.next().unwrap_or("");
 
-    let mut tx = ctx.current_transaction.write().await;
-    if let Some(tx) = tx.as_mut() {
+    let mut tx_guard = transaction_handle.write().await;
+    if let Some(tx) = tx_guard.as_mut() {
         let log_entry = if inner_path.is_empty() || inner_path == "." {
             LogEntry::Delete { key: key.clone() }
         } else {
             LogEntry::JsonDelete { path: path.clone() }
         };
         tx.log_entries.push(log_entry);
-        return Response::Ok;
+
+        // Apply change to the transaction's write set for read-your-writes
+        if inner_path.is_empty() || inner_path == "." {
+            tx.writes.insert(key.clone(), None);
+        } else {
+            let current_db_val = tx
+                .writes
+                .get(&key)
+                .and_then(|v| v.value().clone())
+                .or_else(|| tx.read_cache.get(&key).and_then(|v| v.value().clone()))
+                .or_else(|| ctx.db.get(&key).map(|v| v.value().clone()));
+
+            let mut current_val = match current_db_val {
+                Some(DbValue::Json(v)) => v.clone(),
+                Some(DbValue::JsonB(b)) => serde_json::from_slice(&b).unwrap_or(json!({})),
+                _ => json!({}), // Key doesn't exist, so deletion is a no-op
+            };
+
+            let mut pointer_parts: Vec<&str> = inner_path.split('.').collect();
+            let final_key = pointer_parts.pop().unwrap();
+            let parent_pointer = json_path_to_pointer(&pointer_parts.join("."));
+            let mut modified = false;
+
+            if let Some(target) = current_val.pointer_mut(&parent_pointer) {
+                if let Some(obj) = target.as_object_mut() {
+                    if obj.remove(final_key).is_some() {
+                        modified = true;
+                    }
+                }
+            }
+
+            if modified {
+                let new_value_bytes = match serde_json::to_vec(&current_val) {
+                    Ok(b) => b,
+                    Err(_) => return Response::Error("Failed to serialize new JSON value".to_string()),
+                };
+                tx.writes
+                    .insert(key.clone(), Some(DbValue::JsonB(new_value_bytes)));
+            } else {
+                // If not modified, we don't need to add it to the writeset
+            }
+        }
+
+        return Response::Integer(1); // Assuming success, though can't confirm deletion
     }
-    drop(tx);
+    drop(tx_guard);
 
     let (old_size, mut current_val, old_val_for_index) = {
         let old_db_value = match ctx.db.get(&key) {
@@ -750,7 +953,8 @@ async fn handle_json_del(command: Command, ctx: &AppContext) -> Response {
             None => return Response::Integer(0),
         };
 
-        let old_size = key.len() as u64 + memory::estimate_db_value_size(old_db_value.value()).await;
+        let old_size =
+            key.len() as u64 + memory::estimate_db_value_size(old_db_value.value()).await;
 
         let current_val = match old_db_value.value() {
             DbValue::Json(v) => v.clone(),
@@ -806,7 +1010,8 @@ async fn handle_json_del(command: Command, ctx: &AppContext) -> Response {
         let ack_response = log_to_wal(log_entry, ctx).await;
 
         if let Response::Ok = ack_response {
-            ctx.db.insert(key.clone(), DbValue::JsonB(new_value_bytes.clone()));
+            ctx.db
+                .insert(key.clone(), DbValue::JsonB(new_value_bytes.clone()));
             let new_size = key.len() as u64 + new_value_bytes.len() as u64;
             ctx.memory.decrease_memory(old_size);
             ctx.memory.increase_memory(new_size);
@@ -826,7 +1031,11 @@ async fn handle_json_del(command: Command, ctx: &AppContext) -> Response {
     }
 }
 
-async fn handle_lpush(command: Command, ctx: &AppContext) -> Response {
+async fn handle_lpush(
+    command: Command,
+    ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
     if command.args.len() < 3 {
         return Response::Error("LPUSH requires a key and at least one value".to_string());
     }
@@ -841,12 +1050,33 @@ async fn handle_lpush(command: Command, ctx: &AppContext) -> Response {
         values: values.clone(),
     };
 
-    let mut tx = ctx.current_transaction.write().await;
-    if let Some(tx) = tx.as_mut() {
+    let mut tx_guard = transaction_handle.write().await;
+    if let Some(tx) = tx_guard.as_mut() {
         tx.log_entries.push(log_entry);
-        return Response::Ok;
+
+        let current_db_val = tx
+            .writes
+            .get(&key)
+            .and_then(|v| v.value().clone())
+            .or_else(|| tx.read_cache.get(&key).and_then(|v| v.value().clone()))
+            .or_else(|| ctx.db.get(&key).map(|v| v.value().clone()));
+
+        let mut current_list = match current_db_val {
+            Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
+            _ => VecDeque::new(),
+        };
+
+        for v in values.into_iter().rev() {
+            current_list.push_front(v);
+        }
+
+        let new_len = current_list.len() as i64;
+        tx.writes
+            .insert(key, Some(DbValue::List(RwLock::new(current_list))));
+
+        return Response::Integer(new_len);
     }
-    drop(tx);
+    drop(tx_guard);
 
     let mut old_size = 0;
     if let Some(entry) = ctx.db.get(&key) {
@@ -888,13 +1118,16 @@ async fn handle_lpush(command: Command, ctx: &AppContext) -> Response {
         } else {
             Response::Error("WRONGTYPE Operation against a non-list value".to_string())
         }
-    }
-    else {
+    } else {
         ack_response
     }
 }
 
-async fn handle_rpush(command: Command, ctx: &AppContext) -> Response {
+async fn handle_rpush(
+    command: Command,
+    ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
     if command.args.len() < 3 {
         return Response::Error("RPUSH requires a key and at least one value".to_string());
     }
@@ -909,12 +1142,33 @@ async fn handle_rpush(command: Command, ctx: &AppContext) -> Response {
         values: values.clone(),
     };
 
-    let mut tx = ctx.current_transaction.write().await;
-    if let Some(tx) = tx.as_mut() {
+    let mut tx_guard = transaction_handle.write().await;
+    if let Some(tx) = tx_guard.as_mut() {
         tx.log_entries.push(log_entry);
-        return Response::Ok;
+
+        let current_db_val = tx
+            .writes
+            .get(&key)
+            .and_then(|v| v.value().clone())
+            .or_else(|| tx.read_cache.get(&key).and_then(|v| v.value().clone()))
+            .or_else(|| ctx.db.get(&key).map(|v| v.value().clone()));
+
+        let mut current_list = match current_db_val {
+            Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
+            _ => VecDeque::new(),
+        };
+
+        for v in values {
+            current_list.push_back(v);
+        }
+
+        let new_len = current_list.len() as i64;
+        tx.writes
+            .insert(key, Some(DbValue::List(RwLock::new(current_list))));
+
+        return Response::Integer(new_len);
     }
-    drop(tx);
+    drop(tx_guard);
 
     let mut old_size = 0;
     if let Some(entry) = ctx.db.get(&key) {
@@ -956,13 +1210,16 @@ async fn handle_rpush(command: Command, ctx: &AppContext) -> Response {
         } else {
             Response::Error("WRONGTYPE Operation against a non-list value".to_string())
         }
-    }
-    else {
+    } else {
         ack_response
     }
 }
 
-async fn handle_lpop(command: Command, ctx: &AppContext) -> Response {
+async fn handle_lpop(
+    command: Command,
+    ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
     if command.args.len() != 2 && command.args.len() != 3 {
         return Response::Error("LPOP requires a key and an optional count".to_string());
     }
@@ -985,12 +1242,43 @@ async fn handle_lpop(command: Command, ctx: &AppContext) -> Response {
         count,
     };
 
-    let mut tx = ctx.current_transaction.write().await;
-    if let Some(tx) = tx.as_mut() {
+    let mut tx_guard = transaction_handle.write().await;
+    if let Some(tx) = tx_guard.as_mut() {
         tx.log_entries.push(log_entry);
-        return Response::Ok;
+
+        let current_db_val = tx
+            .writes
+            .get(&key)
+            .and_then(|v| v.value().clone())
+            .or_else(|| tx.read_cache.get(&key).and_then(|v| v.value().clone()))
+            .or_else(|| ctx.db.get(&key).map(|v| v.value().clone()));
+
+        let mut current_list = match current_db_val {
+            Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
+            _ => VecDeque::new(),
+        };
+
+        let mut popped = Vec::new();
+        for _ in 0..count {
+            if let Some(val) = current_list.pop_front() {
+                popped.push(val);
+            } else {
+                break;
+            }
+        }
+
+        tx.writes
+            .insert(key, Some(DbValue::List(RwLock::new(current_list))));
+
+        if popped.is_empty() {
+            return Response::Nil;
+        } else if !was_count_provided {
+            return Response::Bytes(popped.into_iter().next().unwrap());
+        } else {
+            return Response::MultiBytes(popped);
+        }
     }
-    drop(tx);
+    drop(tx_guard);
 
     let mut old_size = 0;
     if let Some(entry) = ctx.db.get(&key) {
@@ -1033,13 +1321,16 @@ async fn handle_lpop(command: Command, ctx: &AppContext) -> Response {
         } else {
             Response::Nil
         }
-    }
-    else {
+    } else {
         ack_response
     }
 }
 
-async fn handle_rpop(command: Command, ctx: &AppContext) -> Response {
+async fn handle_rpop(
+    command: Command,
+    ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
     if command.args.len() != 2 && command.args.len() != 3 {
         return Response::Error("RPOP requires a key and an optional count".to_string());
     }
@@ -1062,12 +1353,43 @@ async fn handle_rpop(command: Command, ctx: &AppContext) -> Response {
         count,
     };
 
-    let mut tx = ctx.current_transaction.write().await;
-    if let Some(tx) = tx.as_mut() {
+    let mut tx_guard = transaction_handle.write().await;
+    if let Some(tx) = tx_guard.as_mut() {
         tx.log_entries.push(log_entry);
-        return Response::Ok;
+
+        let current_db_val = tx
+            .writes
+            .get(&key)
+            .and_then(|v| v.value().clone())
+            .or_else(|| tx.read_cache.get(&key).and_then(|v| v.value().clone()))
+            .or_else(|| ctx.db.get(&key).map(|v| v.value().clone()));
+
+        let mut current_list = match current_db_val {
+            Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
+            _ => VecDeque::new(),
+        };
+
+        let mut popped = Vec::new();
+        for _ in 0..count {
+            if let Some(val) = current_list.pop_back() {
+                popped.push(val);
+            } else {
+                break;
+            }
+        }
+
+        tx.writes
+            .insert(key, Some(DbValue::List(RwLock::new(current_list))));
+
+        if popped.is_empty() {
+            return Response::Nil;
+        } else if !was_count_provided {
+            return Response::Bytes(popped.into_iter().next().unwrap());
+        } else {
+            return Response::MultiBytes(popped);
+        }
     }
-    drop(tx);
+    drop(tx_guard);
 
     let mut old_size = 0;
     if let Some(entry) = ctx.db.get(&key) {
@@ -1110,13 +1432,16 @@ async fn handle_rpop(command: Command, ctx: &AppContext) -> Response {
         } else {
             Response::Nil
         }
-    }
-    else {
+    } else {
         ack_response
     }
 }
 
-async fn handle_llen(command: Command, ctx: &AppContext) -> Response {
+async fn handle_llen(
+    command: Command,
+    ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
     if command.args.len() != 2 {
         return Response::Error("LLEN requires one argument".to_string());
     }
@@ -1124,6 +1449,31 @@ async fn handle_llen(command: Command, ctx: &AppContext) -> Response {
         Ok(k) => k,
         Err(_) => return Response::Error("Invalid key".to_string()),
     };
+
+    let tx_guard = transaction_handle.read().await;
+    if let Some(tx) = tx_guard.as_ref() {
+        let entry_opt = tx.writes.get(&key).map(|e| e.value().clone()).or_else(|| {
+            tx.read_cache.get(&key).map(|e| e.value().clone()).or_else(|| {
+                let db_entry = ctx.db.get(&key);
+                let value_clone = db_entry.as_ref().map(|e| e.value().clone());
+                drop(db_entry);
+                tx.read_cache.insert(key.to_string(), value_clone.clone());
+                Some(value_clone)
+            })
+        });
+
+        return match entry_opt {
+            Some(Some(DbValue::List(list_lock))) => {
+                let list = list_lock.read().await;
+                Response::Integer(list.len() as i64)
+            }
+            Some(Some(_)) => {
+                Response::Error("WRONGTYPE Operation against a non-list value".to_string())
+            }
+            _ => Response::Integer(0),
+        };
+    }
+    drop(tx_guard);
 
     match ctx.db.get(&key) {
         Some(entry) => {
@@ -1141,7 +1491,11 @@ async fn handle_llen(command: Command, ctx: &AppContext) -> Response {
     }
 }
 
-async fn handle_lrange(command: Command, ctx: &AppContext) -> Response {
+async fn handle_lrange(
+    command: Command,
+    ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
     if command.args.len() != 4 {
         return Response::Error("LRANGE requires three arguments".to_string());
     }
@@ -1163,6 +1517,48 @@ async fn handle_lrange(command: Command, ctx: &AppContext) -> Response {
         Ok(s) => s,
         Err(_) => return Response::Error("Invalid stop index".to_string()),
     };
+
+    let tx_guard = transaction_handle.read().await;
+    if let Some(tx) = tx_guard.as_ref() {
+        let entry_opt = tx.writes.get(&key).map(|e| e.value().clone()).or_else(|| {
+            tx.read_cache.get(&key).map(|e| e.value().clone()).or_else(|| {
+                let db_entry = ctx.db.get(&key);
+                let value_clone = db_entry.as_ref().map(|e| e.value().clone());
+                drop(db_entry);
+                tx.read_cache.insert(key.to_string(), value_clone.clone());
+                Some(value_clone)
+            })
+        });
+
+        return match entry_opt {
+            Some(Some(DbValue::List(list_lock))) => {
+                let list = list_lock.read().await;
+                let len = list.len() as i64;
+                let start = if start < 0 { len + start } else { start };
+                let stop = if stop < 0 { len + stop } else { stop };
+                let start = if start < 0 { 0 } else { start as usize };
+                let stop = if stop < 0 { 0 } else { stop as usize };
+
+                if start > stop || start >= list.len() {
+                    return Response::MultiBytes(vec![]);
+                }
+                let stop = std::cmp::min(stop, list.len() - 1);
+
+                let mut result = Vec::new();
+                for i in start..=stop {
+                    if let Some(val) = list.get(i) {
+                        result.push(val.clone());
+                    }
+                }
+                Response::MultiBytes(result)
+            }
+            Some(Some(_)) => {
+                Response::Error("WRONGTYPE Operation against a non-list value".to_string())
+            }
+            _ => Response::MultiBytes(vec![]),
+        };
+    }
+    drop(tx_guard);
 
     match ctx.db.get(&key) {
         Some(entry) => {
@@ -1197,7 +1593,11 @@ async fn handle_lrange(command: Command, ctx: &AppContext) -> Response {
     }
 }
 
-async fn handle_sadd(command: Command, ctx: &AppContext) -> Response {
+async fn handle_sadd(
+    command: Command,
+    ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
     if command.args.len() < 3 {
         return Response::Error("SADD requires a key and at least one member".to_string());
     }
@@ -1212,12 +1612,35 @@ async fn handle_sadd(command: Command, ctx: &AppContext) -> Response {
         members: members.clone(),
     };
 
-    let mut tx = ctx.current_transaction.write().await;
-    if let Some(tx) = tx.as_mut() {
+    let mut tx_guard = transaction_handle.write().await;
+    if let Some(tx) = tx_guard.as_mut() {
         tx.log_entries.push(log_entry);
-        return Response::Ok;
+
+        let current_db_val = tx
+            .writes
+            .get(&key)
+            .and_then(|v| v.value().clone())
+            .or_else(|| tx.read_cache.get(&key).and_then(|v| v.value().clone()))
+            .or_else(|| ctx.db.get(&key).map(|v| v.value().clone()));
+
+        let mut current_set = match current_db_val {
+            Some(DbValue::Set(set_lock)) => set_lock.read().await.clone(),
+            _ => HashSet::new(),
+        };
+
+        let mut added_count = 0;
+        for m in members {
+            if current_set.insert(m) {
+                added_count += 1;
+            }
+        }
+
+        tx.writes
+            .insert(key, Some(DbValue::Set(RwLock::new(current_set))));
+
+        return Response::Integer(added_count);
     }
-    drop(tx);
+    drop(tx_guard);
 
     let mut old_size = 0;
     if let Some(entry) = ctx.db.get(&key) {
@@ -1262,13 +1685,16 @@ async fn handle_sadd(command: Command, ctx: &AppContext) -> Response {
         } else {
             Response::Error("WRONGTYPE Operation against a non-set value".to_string())
         }
-    }
-    else {
+    } else {
         ack_response
     }
 }
 
-async fn handle_srem(command: Command, ctx: &AppContext) -> Response {
+async fn handle_srem(
+    command: Command,
+    ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
     if command.args.len() < 3 {
         return Response::Error("SREM requires a key and at least one member".to_string());
     }
@@ -1283,12 +1709,35 @@ async fn handle_srem(command: Command, ctx: &AppContext) -> Response {
         members: members.clone(),
     };
 
-    let mut tx = ctx.current_transaction.write().await;
-    if let Some(tx) = tx.as_mut() {
+    let mut tx_guard = transaction_handle.write().await;
+    if let Some(tx) = tx_guard.as_mut() {
         tx.log_entries.push(log_entry);
-        return Response::Ok;
+
+        let current_db_val = tx
+            .writes
+            .get(&key)
+            .and_then(|v| v.value().clone())
+            .or_else(|| tx.read_cache.get(&key).and_then(|v| v.value().clone()))
+            .or_else(|| ctx.db.get(&key).map(|v| v.value().clone()));
+
+        let mut current_set = match current_db_val {
+            Some(DbValue::Set(set_lock)) => set_lock.read().await.clone(),
+            _ => HashSet::new(),
+        };
+
+        let mut removed_count = 0;
+        for m in members {
+            if current_set.remove(&m) {
+                removed_count += 1;
+            }
+        }
+
+        tx.writes
+            .insert(key, Some(DbValue::Set(RwLock::new(current_set))));
+
+        return Response::Integer(removed_count);
     }
-    drop(tx);
+    drop(tx_guard);
 
     let mut old_size = 0;
     if let Some(entry) = ctx.db.get(&key) {
@@ -1323,13 +1772,16 @@ async fn handle_srem(command: Command, ctx: &AppContext) -> Response {
         } else {
             Response::Integer(0)
         }
-    }
-    else {
+    } else {
         ack_response
     }
 }
 
-async fn handle_smembers(command: Command, ctx: &AppContext) -> Response {
+async fn handle_smembers(
+    command: Command,
+    ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
     if command.args.len() != 2 {
         return Response::Error("SMEMBERS requires one argument".to_string());
     }
@@ -1337,6 +1789,32 @@ async fn handle_smembers(command: Command, ctx: &AppContext) -> Response {
         Ok(k) => k,
         Err(_) => return Response::Error("Invalid key".to_string()),
     };
+
+    let tx_guard = transaction_handle.read().await;
+    if let Some(tx) = tx_guard.as_ref() {
+        let entry_opt = tx.writes.get(&key).map(|e| e.value().clone()).or_else(|| {
+            tx.read_cache.get(&key).map(|e| e.value().clone()).or_else(|| {
+                let db_entry = ctx.db.get(&key);
+                let value_clone = db_entry.as_ref().map(|e| e.value().clone());
+                drop(db_entry);
+                tx.read_cache.insert(key.to_string(), value_clone.clone());
+                Some(value_clone)
+            })
+        });
+
+        return match entry_opt {
+            Some(Some(DbValue::Set(set_lock))) => {
+                let set = set_lock.read().await;
+                let members: Vec<Vec<u8>> = set.iter().cloned().collect();
+                Response::MultiBytes(members)
+            }
+            Some(Some(_)) => {
+                Response::Error("WRONGTYPE Operation against a non-set value".to_string())
+            }
+            _ => Response::MultiBytes(vec![]),
+        };
+    }
+    drop(tx_guard);
 
     match ctx.db.get(&key) {
         Some(entry) => {
@@ -1355,7 +1833,11 @@ async fn handle_smembers(command: Command, ctx: &AppContext) -> Response {
     }
 }
 
-async fn handle_scard(command: Command, ctx: &AppContext) -> Response {
+async fn handle_scard(
+    command: Command,
+    ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
     if command.args.len() != 2 {
         return Response::Error("SCARD requires one argument".to_string());
     }
@@ -1363,6 +1845,31 @@ async fn handle_scard(command: Command, ctx: &AppContext) -> Response {
         Ok(k) => k,
         Err(_) => return Response::Error("Invalid key".to_string()),
     };
+
+    let tx_guard = transaction_handle.read().await;
+    if let Some(tx) = tx_guard.as_ref() {
+        let entry_opt = tx.writes.get(&key).map(|e| e.value().clone()).or_else(|| {
+            tx.read_cache.get(&key).map(|e| e.value().clone()).or_else(|| {
+                let db_entry = ctx.db.get(&key);
+                let value_clone = db_entry.as_ref().map(|e| e.value().clone());
+                drop(db_entry);
+                tx.read_cache.insert(key.to_string(), value_clone.clone());
+                Some(value_clone)
+            })
+        });
+
+        return match entry_opt {
+            Some(Some(DbValue::Set(set_lock))) => {
+                let set = set_lock.read().await;
+                Response::Integer(set.len() as i64)
+            }
+            Some(Some(_)) => {
+                Response::Error("WRONGTYPE Operation against a non-set value".to_string())
+            }
+            _ => Response::Integer(0),
+        };
+    }
+    drop(tx_guard);
 
     match ctx.db.get(&key) {
         Some(entry) => {
@@ -1380,7 +1887,11 @@ async fn handle_scard(command: Command, ctx: &AppContext) -> Response {
     }
 }
 
-async fn handle_sismember(command: Command, ctx: &AppContext) -> Response {
+async fn handle_sismember(
+    command: Command,
+    ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
     if command.args.len() != 3 {
         return Response::Error("SISMEMBER requires a key and a member".to_string());
     }
@@ -1389,6 +1900,35 @@ async fn handle_sismember(command: Command, ctx: &AppContext) -> Response {
         Err(_) => return Response::Error("Invalid key".to_string()),
     };
     let member = &command.args[2];
+
+    let tx_guard = transaction_handle.read().await;
+    if let Some(tx) = tx_guard.as_ref() {
+        let entry_opt = tx.writes.get(&key).map(|e| e.value().clone()).or_else(|| {
+            tx.read_cache.get(&key).map(|e| e.value().clone()).or_else(|| {
+                let db_entry = ctx.db.get(&key);
+                let value_clone = db_entry.as_ref().map(|e| e.value().clone());
+                drop(db_entry);
+                tx.read_cache.insert(key.to_string(), value_clone.clone());
+                Some(value_clone)
+            })
+        });
+
+        return match entry_opt {
+            Some(Some(DbValue::Set(set_lock))) => {
+                let set = set_lock.read().await;
+                if set.contains(member) {
+                    Response::Integer(1)
+                } else {
+                    Response::Integer(0)
+                }
+            }
+            Some(Some(_)) => {
+                Response::Error("WRONGTYPE Operation against a non-set value".to_string())
+            }
+            _ => Response::Integer(0),
+        };
+    }
+    drop(tx_guard);
 
     match ctx.db.get(&key) {
         Some(entry) => {
@@ -1410,7 +1950,11 @@ async fn handle_sismember(command: Command, ctx: &AppContext) -> Response {
     }
 }
 
-async fn handle_keys(command: Command, ctx: &AppContext) -> Response {
+async fn handle_keys(
+    command: Command,
+    ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
     if command.args.len() != 2 {
         return Response::Error("KEYS requires one argument (pattern)".to_string());
     }
@@ -1424,6 +1968,33 @@ async fn handle_keys(command: Command, ctx: &AppContext) -> Response {
         Ok(r) => r,
         Err(_) => return Response::Error("Invalid pattern syntax".to_string()),
     };
+
+    let tx_guard = transaction_handle.read().await;
+    if let Some(tx) = tx_guard.as_ref() {
+        // In a transaction, KEYS should operate on a merged view of the main DB and the transaction's writes.
+        // This is complex to do efficiently. For now, we'll merge the keysets.
+        let mut keys: HashSet<String> = ctx
+            .db
+            .iter()
+            .filter(|entry| re.is_match(entry.key()))
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        for item in tx.writes.iter() {
+            let key = item.key();
+            if re.is_match(key) {
+                if item.value().is_some() {
+                    keys.insert(key.clone());
+                } else {
+                    keys.remove(key);
+                }
+            }
+        }
+        let key_bytes: Vec<Vec<u8>> = keys.into_iter().map(|k| k.into_bytes()).collect();
+        return Response::MultiBytes(key_bytes);
+    }
+    drop(tx_guard);
+
     let keys: Vec<Vec<u8>> = ctx
         .db
         .iter()
@@ -1615,24 +2186,24 @@ async fn handle_idx_list(command: Command, ctx: &AppContext) -> Response {
     Response::MultiBytes(index_names)
 }
 
-async fn handle_begin(command: Command, ctx: &AppContext) -> Response {
+async fn handle_begin(
+    command: Command,
+    _ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
     if command.args.len() != 1 {
         return Response::Error("BEGIN takes no arguments".to_string());
     }
 
-    let mut current_transaction = ctx.current_transaction.write().await;
-    if current_transaction.is_some() {
+    let mut tx_guard = transaction_handle.write().await;
+    if tx_guard.is_some() {
         return Response::Error("Transaction already in progress".to_string());
     }
 
-    let tx_id = Uuid::new_v4();
-    *current_transaction = Some(crate::types::Transaction {
-        id: tx_id,
-        state: crate::types::TransactionState::Active,
-        log_entries: Vec::new(),
-    });
+    let new_tx = Transaction::new();
+    println!("Transaction {} started.", new_tx.id);
+    *tx_guard = Some(new_tx);
 
-    println!("Transaction {} started.", tx_id);
     Response::Ok
 }
 
@@ -1721,47 +2292,66 @@ pub fn apply_json_delete_to_db(db: &crate::types::Db, path: &str) -> Result<i64>
     }
 }
 
-async fn handle_commit(command: Command, ctx: &AppContext) -> Response {
+async fn handle_commit(
+    command: Command,
+    ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
     if command.args.len() != 1 {
         return Response::Error("COMMIT takes no arguments".to_string());
     }
 
-    let mut current_transaction = ctx.current_transaction.write().await;
-    let tx = match current_transaction.take() {
+    let tx = match transaction_handle.write().await.take() {
         Some(t) => t,
         None => return Response::Error("No transaction in progress".to_string()),
     };
 
-    println!("Committing transaction {} with {} entries.", tx.id, tx.log_entries.len());
-    for (i, entry) in tx.log_entries.iter().enumerate() {
-        println!("  Entry {}: {:?}", i, entry);
-    }
+    println!(
+        "Committing transaction {} with {} entries.",
+        tx.id,
+        tx.log_entries.len()
+    );
+
+    // Acquire a global lock to serialize commits.
+    let _commit_lock = ctx.commit_lock.lock().await;
 
     for entry in tx.log_entries.iter() {
+        // 1. Apply the change to the in-memory database.
         if let Err(e) = apply_log_entry(entry, ctx).await {
-            println!("Error applying log entry: {}", e);
-            return Response::Error(format!("Error applying transaction log: {}", e));
+            // This is a critical error. The transaction logic might have diverged from the
+            // main database logic. A more robust system might try to roll back the in-memory changes.
+            return Response::Error(format!(
+                "FATAL: Error applying transaction log during commit: {}. State may be inconsistent.",
+                e
+            ));
         }
-    }
 
-    if ctx.config.persistence {
-        // Apply buffered log entries to the persistence engine
-        for entry in tx.log_entries {
+        // 2. Write the change to the WAL.
+        if ctx.config.persistence {
             let (ack_tx, ack_rx) = oneshot::channel();
-            if ctx.logger
+            if ctx
+                .logger
                 .send(LogRequest {
-                    entry: entry,
+                    entry: entry.clone(),
                     ack: ack_tx,
                 })
                 .await
                 .is_err()
             {
-                return Response::Error("Persistence engine is down, commit failed".to_string());
+                return Response::Error(
+                    "Persistence engine is down, commit failed".to_string(),
+                );
             }
             match ack_rx.await {
-                Ok(Ok(())) => {},
-                Ok(Err(e)) => return Response::Error(format!("WAL write error during commit: {}", e)),
-                Err(_) => return Response::Error("Persistence engine dropped ACK channel during commit".to_string()),
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    return Response::Error(format!("WAL write error during commit: {}", e))
+                }
+                Err(_) => {
+                    return Response::Error(
+                        "Persistence engine dropped ACK channel during commit".to_string(),
+                    )
+                }
             }
         }
     }
@@ -1770,13 +2360,17 @@ async fn handle_commit(command: Command, ctx: &AppContext) -> Response {
     Response::Ok
 }
 
-async fn handle_rollback(command: Command, ctx: &AppContext) -> Response {
+async fn handle_rollback(
+    command: Command,
+    _ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
     if command.args.len() != 1 {
         return Response::Error("ROLLBACK takes no arguments".to_string());
     }
 
-    let mut current_transaction = ctx.current_transaction.write().await;
-    if let Some(tx) = current_transaction.take() {
+    let mut tx_guard = transaction_handle.write().await;
+    if let Some(tx) = tx_guard.take() {
         println!("Transaction {} rolled back.", tx.id);
         Response::Ok
     } else {

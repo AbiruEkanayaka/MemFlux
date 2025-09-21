@@ -1,4 +1,3 @@
-
 use anyhow::Result;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -6,7 +5,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -24,6 +23,25 @@ pub enum DbValue {
     Set(RwLock<HashSet<Vec<u8>>>),
     Bytes(Vec<u8>),
     Array(Vec<Value>),
+}
+
+impl Clone for DbValue {
+    fn clone(&self) -> Self {
+        match self {
+            DbValue::Json(v) => DbValue::Json(v.clone()),
+            DbValue::JsonB(b) => DbValue::JsonB(b.clone()),
+            DbValue::Bytes(b) => DbValue::Bytes(b.clone()),
+            DbValue::Array(a) => DbValue::Array(a.clone()),
+            DbValue::List(lock) => {
+                let list = lock.try_read().expect("Cloning a List failed due to a write lock being held.").clone();
+                DbValue::List(RwLock::new(list))
+            }
+            DbValue::Set(lock) => {
+                let set = lock.try_read().expect("Cloning a Set failed due to a write lock being held.").clone();
+                DbValue::Set(RwLock::new(set))
+            }
+        }
+    }
 }
 
 impl fmt::Debug for DbValue {
@@ -126,19 +144,6 @@ pub type SchemaCache = Arc<DashMap<String, Arc<VirtualSchema>>>;
 pub type ViewCache = Arc<DashMap<String, Arc<ViewDefinition>>>;
 pub type ScalarFunction = Box<dyn Fn(Vec<Value>) -> Result<Value> + Send + Sync>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TransactionState {
-    Active,
-    Committed,
-    RolledBack,
-}
-
-pub struct Transaction {
-    pub id: Uuid,
-    pub state: TransactionState,
-    pub log_entries: Vec<LogEntry>,
-}
-
 // --- Function Registry ---
 
 #[derive(Default)]
@@ -174,7 +179,7 @@ pub struct AppContext {
     pub function_registry: Arc<FunctionRegistry>,
     pub config: Arc<Config>,
     pub memory: Arc<MemoryManager>,
-    pub current_transaction: Arc<RwLock<Option<Transaction>>>,
+    pub commit_lock: Arc<Mutex<()>>,
 }
 
 pub struct Command {
@@ -220,13 +225,3 @@ impl Response {
         }
     }
 }
-
-
-
-
-
-
-
-
-
-

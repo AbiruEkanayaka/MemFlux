@@ -6,6 +6,7 @@ use once_cell::sync::Lazy;
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 use tokio::runtime::{Builder, Runtime};
+use tokio::sync::RwLock;
 
 // A global Tokio runtime for the FFI layer.
 static TOKIO_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
@@ -16,7 +17,7 @@ static TOKIO_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
 });
 
 // The opaque pointer to the database instance.
-pub struct MemFluxDBHandle(Arc<MemFluxDB>);
+pub struct MemFluxDBHandle(Arc<MemFluxDB>, crate::transaction::TransactionHandle);
 
 // The C-compatible response structure.
 #[repr(C)]
@@ -61,7 +62,9 @@ pub extern "C" fn memflux_open(config_json: *const c_char) -> *mut MemFluxDBHand
         Err(_) => return std::ptr::null_mut(),
     };
 
-    let handle = Box::new(MemFluxDBHandle(Arc::new(db)));
+    let transaction_handle: crate::transaction::TransactionHandle = Arc::new(RwLock::new(None));
+
+    let handle = Box::new(MemFluxDBHandle(Arc::new(db), transaction_handle));
     Box::into_raw(handle)
 }
 
@@ -79,10 +82,12 @@ pub extern "C" fn memflux_exec(
     handle: *mut MemFluxDBHandle,
     command_str: *const c_char,
 ) -> *mut FFIResponse {
-    let db = match unsafe { handle.as_ref() } {
-        Some(h) => &h.0,
+    let db_handle = match unsafe { handle.as_ref() } {
+        Some(h) => h,
         None => return std::ptr::null_mut(),
     };
+    let db = &db_handle.0;
+    let transaction_handle = db_handle.1.clone();
 
     let command_c_str = unsafe { CStr::from_ptr(command_str) };
 
@@ -113,7 +118,8 @@ pub extern "C" fn memflux_exec(
 
     let command = Command { name: command_name, args };
 
-    let response = TOKIO_RUNTIME.block_on(db.execute_command(command));
+
+    let response = TOKIO_RUNTIME.block_on(db.execute_command(command, transaction_handle));
 
     Box::into_raw(Box::new(response_to_ffi(response)))
 }

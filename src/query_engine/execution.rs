@@ -1,9 +1,10 @@
+use crate::transaction::{Transaction, TransactionHandle};
 use anyhow::{anyhow, Result};
 use async_stream::try_stream;
 use futures::stream::{Stream, StreamExt, TryStreamExt};
 use serde_json::{json, Value};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -22,12 +23,6 @@ type Row = Value;
 macro_rules! log_and_wait_qe {
     ($logger:expr, $entry:expr, $ctx:expr) => {
         async {
-            let mut current_transaction = $ctx.current_transaction.write().await;
-            if let Some(tx) = current_transaction.as_mut() {
-                tx.log_entries.push($entry);
-                return Ok(());
-            }
-
             let (ack_tx, ack_rx) = oneshot::channel();
             if $logger
                 .send(LogRequest {
@@ -151,6 +146,7 @@ async fn project_row<'a>(
     ctx: Arc<AppContext>,
     outer_row: Option<&'a Row>,
     _working_tables: Option<&'a HashMap<String, Vec<Row>>>,
+    transaction_handle: Option<TransactionHandle>,
 ) -> Result<Row> {
     let mut new_row = json!({});
     let mut is_star = false;
@@ -174,7 +170,7 @@ async fn project_row<'a>(
         }
     } else {
         for (expr, alias) in expressions {
-            let val = expr.evaluate_with_context(row, outer_row, ctx.clone()).await?;
+            let val = expr.evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone()).await?;
             let name = alias.clone().unwrap_or_else(|| expr.to_string());
             new_row[name] = val;
         }
@@ -187,34 +183,82 @@ pub fn execute<'a>(
     ctx: Arc<AppContext>,
     outer_row: Option<&'a Row>,
     _working_tables: Option<&'a HashMap<String, Vec<Row>>>,
+    transaction_handle: Option<TransactionHandle>,
 ) -> Pin<Box<dyn Stream<Item = Result<Row>> + Send + 'a>> {
     Box::pin(try_stream! {        match plan {
             PhysicalPlan::TableScan { prefix } => {
                 let table_name = prefix.strip_suffix(':').unwrap_or(&prefix).to_string();
-                let mut keys = Vec::new();
+
+                let tx_guard = if let Some(handle) = &transaction_handle {
+                    Some(handle.read().await)
+                } else {
+                    None
+                };
+
+                let mut keys_to_process: HashSet<String> = HashSet::new();
+
+                // 1. Get keys from the main database
                 for r in ctx.db.iter() {
                     if r.key().starts_with(&prefix) {
-                        keys.push(r.key().clone());
+                        keys_to_process.insert(r.key().clone());
                     }
                 }
-                for key in keys {
-                    if let Some(r) = ctx.db.get(&key) {
-                        let mut value = match r.value() {
+
+                if let Some(Some(tx)) = tx_guard.as_deref() {
+                    for item in tx.writes.iter() {
+                        let key = item.key();
+                        if key.starts_with(&prefix) {
+                            if item.value().is_some() {
+                                // It's a set or update
+                                keys_to_process.insert(key.clone());
+                            } else {
+                                // It's a delete
+                                keys_to_process.remove(key);
+                            }
+                        }
+                    }
+                }
+
+                for key in keys_to_process {
+                    let mut value_opt: Option<DbValue> = None;
+                    let mut found_in_tx = false;
+
+                    // Read from transaction first
+                    if let Some(Some(tx)) = tx_guard.as_deref() {
+                        if let Some(write_entry) = tx.writes.get(&key) {
+                            value_opt = write_entry.value().clone();
+                            found_in_tx = true;
+                        } else if let Some(read_entry) = tx.read_cache.get(&key) {
+                            value_opt = read_entry.value().clone();
+                            found_in_tx = true;
+                        }
+                    }
+
+                    // Fallback to main DB if not in transaction
+                    if !found_in_tx {
+                        if let Some(r) = ctx.db.get(&key) {
+                            value_opt = Some(r.value().clone());
+                            // Populate read cache if in a transaction
+                            if let Some(Some(tx)) = tx_guard.as_deref() {
+                                tx.read_cache.insert(key.clone(), value_opt.clone());
+                            }
+                        }
+                    }
+
+                    if let Some(db_value) = value_opt {
+                        let mut value = match db_value {
                             DbValue::Json(v) => v.clone(),
-                            DbValue::JsonB(b) => serde_json::from_slice(b)?,
+                            DbValue::JsonB(b) => serde_json::from_slice(&b)?,
                             _ => json!({}),
                         };
                         if let Some(obj) = value.as_object_mut() {
                             let key_without_prefix = key.strip_prefix(&prefix).unwrap_or(&key);
                             let id_from_key = key_without_prefix.strip_suffix(':').unwrap_or(key_without_prefix);
-                            // Only insert 'id' if it's not already present.
                             if !obj.contains_key("id") {
                                 obj.insert("id".to_string(), json!(id_from_key));
                             }
                             obj.insert("_key".to_string(), json!(key));
                         }
-                        // Wrap the row in an object with the table name as the key
-                        // to provide context for downstream operators like joins.
                         let mut new_row = json!({});
                         new_row[table_name.clone()] = value;
                         yield new_row;
@@ -252,10 +296,10 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::Filter { input, predicate } => {
-                let mut stream = execute(*input, ctx.clone(), outer_row, _working_tables);
+                let mut stream = execute(*input, ctx.clone(), outer_row, _working_tables, transaction_handle.clone());
                 while let Some(row_result) = stream.next().await {
                     let row = row_result?;
-                    if predicate.evaluate_with_context(&row, outer_row, ctx.clone()).await?.as_bool().unwrap_or(false) {
+                    if predicate.evaluate_with_context(&row, outer_row, ctx.clone(), transaction_handle.clone()).await?.as_bool().unwrap_or(false) {
                         yield row;
                     }
                 }
@@ -264,7 +308,7 @@ pub fn execute<'a>(
                 input,
                 expressions,
             } => {
-                let mut stream = execute(*input, ctx.clone(), outer_row, _working_tables);
+                let mut stream = execute(*input, ctx.clone(), outer_row, _working_tables, transaction_handle.clone());
                 while let Some(row_result) = stream.next().await {
                     let row = row_result?;
                     let mut new_row = json!({});
@@ -303,7 +347,7 @@ pub fn execute<'a>(
                             let key = format!("{}", expr);
                             row.get(&key).cloned().unwrap_or(Value::Null)
                         } else {
-                            expr.evaluate_with_context(&row, outer_row, ctx.clone()).await?
+                            expr.evaluate_with_context(&row, outer_row, ctx.clone(), transaction_handle.clone()).await?
                         };
 
                         // Determine the output column name. Use alias if it exists.
@@ -331,8 +375,8 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::Join { left, right, condition, join_type } => {
-                let left_rows: Vec<Row> = execute(*left, ctx.clone(), outer_row, _working_tables).try_collect().await?;
-                let right_rows: Vec<Row> = execute(*right, ctx.clone(), outer_row, _working_tables).try_collect().await?;
+                let left_rows: Vec<Row> = execute(*left, ctx.clone(), outer_row, _working_tables, transaction_handle.clone()).try_collect().await?;
+                let right_rows: Vec<Row> = execute(*right, ctx.clone(), outer_row, _working_tables, transaction_handle.clone()).try_collect().await?;
 
                 if join_type == JoinType::Cross {
                     for l_row in &left_rows {
@@ -355,7 +399,7 @@ pub fn execute<'a>(
                         combined.extend(r_row.as_object().unwrap().clone());
                         let combined_row = json!(combined);
 
-                        if condition.evaluate_with_context(&combined_row, outer_row, ctx.clone()).await?.as_bool().unwrap_or(false) {
+                        if condition.evaluate_with_context(&combined_row, outer_row, ctx.clone(), transaction_handle.clone()).await?.as_bool().unwrap_or(false) {
                             yield combined_row;
                             has_match = true;
                             if i < right_matched.len() {
@@ -381,7 +425,7 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::HashAggregate { input, group_expressions, agg_expressions } => {
-                let all_rows: Vec<Row> = execute(*input, ctx.clone(), outer_row, _working_tables).try_collect().await?;
+                let all_rows: Vec<Row> = execute(*input, ctx.clone(), outer_row, _working_tables, transaction_handle.clone()).try_collect().await?;
                 let mut groups: HashMap<String, (Row, Vec<Row>)> = HashMap::new();
 
                 if group_expressions.is_empty() {
@@ -389,7 +433,7 @@ pub fn execute<'a>(
                         let mut agg_row = json!({});
                         for agg_expr in &agg_expressions {
                             if let Expression::AggregateFunction { func, arg } = agg_expr {
-                                let result = run_agg_fn(func, arg, &all_rows, outer_row, ctx.clone()).await?;
+                                let result = run_agg_fn(func, arg, &all_rows, outer_row, ctx.clone(), transaction_handle.clone()).await?;
                                 let agg_name = format!("{}", agg_expr);
                                 agg_row[agg_name] = result;
                             }
@@ -402,7 +446,7 @@ pub fn execute<'a>(
                 for row in all_rows {
                     let mut group_key_parts = Vec::new();
                     for expr in &group_expressions {
-                        group_key_parts.push(expr.evaluate_with_context(&row, outer_row, ctx.clone()).await?.to_string());
+                        group_key_parts.push(expr.evaluate_with_context(&row, outer_row, ctx.clone(), transaction_handle.clone()).await?.to_string());
                     }
                     let group_key = group_key_parts.join("-");
 
@@ -411,7 +455,7 @@ pub fn execute<'a>(
                         for expr in &group_expressions {
                             // The expression already knows how to get the value from the nested row
                             let value =
-                                expr.evaluate_with_context(&row, outer_row, ctx.clone())
+                                expr.evaluate_with_context(&row, outer_row, ctx.clone(), transaction_handle.clone())
                                     .await
                                     .unwrap_or(Value::Null);
                             // We need the final name of the column for the output row
@@ -427,7 +471,7 @@ pub fn execute<'a>(
                 for (_, (mut group_row, rows)) in groups {
                     for agg_expr in &agg_expressions {
                         if let Expression::AggregateFunction { func, arg } = agg_expr {
-                            let result = run_agg_fn(func, arg, &rows, outer_row, ctx.clone()).await?;
+                            let result = run_agg_fn(func, arg, &rows, outer_row, ctx.clone(), transaction_handle.clone()).await?;
                             let agg_name = format!("{}", agg_expr);
                             group_row[agg_name] = result;
                         }
@@ -436,12 +480,12 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::Sort { input, sort_expressions } => {
-                let rows: Vec<Row> = execute(*input, ctx.clone(), outer_row, _working_tables).try_collect().await?;
+                let rows: Vec<Row> = execute(*input, ctx.clone(), outer_row, _working_tables, transaction_handle.clone()).try_collect().await?;
                 let mut sort_data = Vec::new();
                 for row in rows.into_iter() {
                     let mut keys = Vec::new();
                     for (expr, _) in &sort_expressions {
-                        keys.push(expr.evaluate_with_context(&row, outer_row, ctx.clone()).await?);
+                        keys.push(expr.evaluate_with_context(&row, outer_row, ctx.clone(), transaction_handle.clone()).await?);
                     }
                     sort_data.push((keys, row));
                 }
@@ -467,7 +511,7 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::Limit { input, limit, offset } => {
-                let stream = execute(*input, ctx.clone(), outer_row, _working_tables).skip(offset.unwrap_or(0));
+                let stream = execute(*input, ctx.clone(), outer_row, _working_tables, transaction_handle.clone()).skip(offset.unwrap_or(0));
                 let stream = if let Some(limit) = limit {
                     if limit == 0 { stream.take(0) } else { stream.take(limit) }
                 } else {
@@ -657,7 +701,7 @@ pub fn execute<'a>(
                 let mut returned_rows = Vec::new();
 
                 // Step 1: Execute the source plan and collect all rows to prevent deadlocks.
-                let source_rows: Vec<Row> = execute(*source, ctx.clone(), outer_row, _working_tables).try_collect().await?;
+                let source_rows: Vec<Row> = execute(*source, ctx.clone(), outer_row, _working_tables, transaction_handle.clone()).try_collect().await?;
 
                 // Step 2: Iterate over the collected rows to perform inserts.
                 for source_row in source_rows {
@@ -699,7 +743,7 @@ pub fn execute<'a>(
                         for (col_name, col_def) in &s.columns {
                             if !row_data.get(col_name).is_some() {
                                 if let Some(default_expr) = &col_def.default {
-                                    let mut val = default_expr.evaluate_with_context(&json!({}), None, ctx.clone()).await?;
+                                    let mut val = default_expr.evaluate_with_context(&json!({}), None, ctx.clone(), transaction_handle.clone()).await?;
                                     val = cast_value_to_type(val, &col_def.data_type)?;
                                     row_data[col_name.clone()] = val;
                                 }
@@ -718,14 +762,14 @@ pub fn execute<'a>(
                         for constraint in &s.constraints {
                             if let TableConstraint::Check { name: _, expression } = constraint {
                                 let check_row = json!({ table_name.clone(): row_data.clone() });
-                                if !super::logical_plan::simple_expr_to_expression(expression.clone(), &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry, None)?.evaluate_with_context(&check_row, None, ctx.clone()).await?.as_bool().unwrap_or(false) {
+                                if !super::logical_plan::simple_expr_to_expression(expression.clone(), &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry, None)?.evaluate_with_context(&check_row, None, ctx.clone(), transaction_handle.clone()).await?.as_bool().unwrap_or(false) {
                                     Err(anyhow!("CHECK constraint failed for table '{}'", table_name))?;
                                 }
                             }
                         }
                     }
 
-                    check_foreign_key_constraints(&table_name, &row_data, &ctx).await?;
+                    check_foreign_key_constraints(&table_name, &row_data, &ctx, transaction_handle.clone()).await?;
 
                     // Check UNIQUE constraints
                     if let Some(s) = &schema {
@@ -794,7 +838,7 @@ pub fn execute<'a>(
                                     let excluded_row = json!({ "excluded": row_data.clone() });
 
                                     for (col, expr) in set_clauses {
-                                        let mut val = expr.evaluate_with_context(&excluded_row, Some(&old_val), ctx.clone()).await?;
+                                        let mut val = expr.evaluate_with_context(&excluded_row, Some(&old_val), ctx.clone(), transaction_handle.clone()).await?;
                                         if let Some(s) = &schema {
                                             if let Some(col_def) = s.columns.get(col) {
                                                 if !col_def.nullable && val.is_null() {
@@ -806,7 +850,7 @@ pub fn execute<'a>(
                                         new_val[col] = val;
                                     }
 
-                                    apply_on_update_actions(&table_name, &old_val, &new_val, &ctx).await?;
+                                    apply_on_update_actions(&table_name, &old_val, &new_val, &ctx, transaction_handle.clone()).await?;
 
                                     if let Some(s) = &schema {
                                         for constraint in &s.constraints {
@@ -835,7 +879,7 @@ pub fn execute<'a>(
                                         for constraint in &s.constraints {
                                             if let TableConstraint::Check { name: _, expression } = constraint {
                                                 let check_row = json!({ table_name.clone(): new_val.clone() });
-                                                if !super::logical_plan::simple_expr_to_expression(expression.clone(), &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry, None)?.evaluate_with_context(&check_row, None, ctx.clone()).await?.as_bool().unwrap_or(false)
+                                                if !super::logical_plan::simple_expr_to_expression(expression.clone(), &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry, None)?.evaluate_with_context(&check_row, None, ctx.clone(), transaction_handle.clone()).await?.as_bool().unwrap_or(false)
                                                 {
                                                     Err(anyhow!("CHECK constraint failed for table '{}'", table_name))?;
                                                 }
@@ -843,7 +887,7 @@ pub fn execute<'a>(
                                         }
                                     }
 
-                                    check_foreign_key_constraints(&table_name, &new_val, &ctx).await?;
+                                    check_foreign_key_constraints(&table_name, &new_val, &ctx, transaction_handle.clone()).await?;
 
                                     let new_val_bytes = serde_json::to_vec(&new_val)?;
                                     let log_entry = LogEntry::SetJsonB { key: key.clone(), value: new_val_bytes.clone() };
@@ -884,7 +928,7 @@ pub fn execute<'a>(
 
                 if !returning.is_empty() {
                     for returned_row in returned_rows {
-                        let proj_row = project_row(&returned_row, &returning, ctx.clone(), outer_row, _working_tables).await?;
+                        let proj_row = project_row(&returned_row, &returning, ctx.clone(), outer_row, _working_tables, transaction_handle.clone()).await?;
                         yield proj_row;
                     }
                 }
@@ -893,15 +937,16 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::Delete { table_name, from, returning } => {
-                let stream = execute(*from, ctx.clone(), outer_row, _working_tables);
+                let stream = execute(*from, ctx.clone(), outer_row, _working_tables, transaction_handle.clone());
                 let rows_to_delete: Vec<Row> = stream.try_collect().await?;
+
 
                 // First, apply all ON DELETE actions. If any of these fail, we abort before any actual deletion.
                 for row in &rows_to_delete {
                     if let Some(obj) = row.as_object() {
                         if let Some(table_obj) = obj.get(&table_name) {
                             // table_obj is the inner JSON object, e.g., {"id": 1, "name": "Alice"}
-                            apply_on_delete_actions(&table_name, table_obj, &ctx).await?;
+                            apply_on_delete_actions(&table_name, table_obj, &ctx, transaction_handle.clone()).await?;
                         }
                     }
                 }
@@ -935,7 +980,7 @@ pub fn execute<'a>(
                         // The row from the plan is nested, e.g. {"users": {"id":1, ...}}
                         // We need to un-nest it for projection.
                         if let Some(inner_row) = returned_row.get(&table_name) {
-                            let proj_row = project_row(inner_row, &returning, ctx.clone(), outer_row, _working_tables).await?;
+                            let proj_row = project_row(inner_row, &returning, ctx.clone(), outer_row, _working_tables, transaction_handle.clone()).await?;
                             yield proj_row;
                         }
                     }
@@ -945,7 +990,7 @@ pub fn execute<'a>(
             }
             PhysicalPlan::Update { table_name, from, set, returning } => {
                 let schema = ctx.schema_cache.get(&table_name);
-                let stream = execute(*from, ctx.clone(), outer_row, _working_tables);
+                let stream = execute(*from, ctx.clone(), outer_row, _working_tables, transaction_handle.clone());
                 let rows_to_update: Vec<Row> = stream.try_collect().await?;
 
                 let mut updated_count = 0;
@@ -966,7 +1011,7 @@ pub fn execute<'a>(
                     let mut new_val = table_part.clone();
 
                     for (col, expr) in &set {
-                        let mut val = expr.evaluate_with_context(&row, outer_row, ctx.clone()).await?;
+                        let mut val = expr.evaluate_with_context(&row, outer_row, ctx.clone(), transaction_handle.clone()).await?;
 
                         if let Some(schema) = &schema {
                             if let Some(col_def) = schema.columns.get(col) {
@@ -979,7 +1024,7 @@ pub fn execute<'a>(
                         new_val[col] = val;
                     }
 
-                    apply_on_update_actions(&table_name, old_val_for_index, &new_val, &ctx).await?;
+                    apply_on_update_actions(&table_name, old_val_for_index, &new_val, &ctx, transaction_handle.clone()).await?;
 
                     if let Some(schema) = &schema {
                         for constraint in &schema.constraints {
@@ -1008,7 +1053,7 @@ pub fn execute<'a>(
                         for constraint in &schema.constraints {
                             if let TableConstraint::Check { name: _, expression } = constraint {
                                 let check_row = json!({ table_name.clone(): new_val.clone() });
-                                if !super::logical_plan::simple_expr_to_expression(expression.clone(), &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry, None)?.evaluate_with_context(&check_row, None, ctx.clone()).await?.as_bool().unwrap_or(false)
+                                if !super::logical_plan::simple_expr_to_expression(expression.clone(), &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry, None)?.evaluate_with_context(&check_row, None, ctx.clone(), transaction_handle.clone()).await?.as_bool().unwrap_or(false)
                                 {
                                     Err(anyhow!("CHECK constraint failed for table '{}'", table_name))?;
                                 }
@@ -1016,7 +1061,7 @@ pub fn execute<'a>(
                         }
                     }
 
-                    check_foreign_key_constraints(&table_name, &new_val, &ctx).await?;
+                    check_foreign_key_constraints(&table_name, &new_val, &ctx, transaction_handle.clone()).await?;
 
                     let new_val_bytes = serde_json::to_vec(&new_val)?;
                     let log_entry = LogEntry::SetJsonB { key: key.clone(), value: new_val_bytes.clone() };
@@ -1039,7 +1084,7 @@ pub fn execute<'a>(
 
                 if !returning.is_empty() {
                     for returned_row in returned_rows {
-                        let proj_row = project_row(&returned_row, &returning, ctx.clone(), outer_row, _working_tables).await?;
+                        let proj_row = project_row(&returned_row, &returning, ctx.clone(), outer_row, _working_tables, transaction_handle.clone()).await?;
                         yield proj_row;
                     }
                 } else {
@@ -1356,7 +1401,7 @@ pub fn execute<'a>(
                 for row_values in values {
                     let mut row = json!({});
                     for (i, value_expr) in row_values.iter().enumerate() {
-                        let value = value_expr.evaluate_with_context(&json!({}), None, ctx.clone()).await?;
+                        let value = value_expr.evaluate_with_context(&json!({}), None, ctx.clone(), transaction_handle.clone()).await?;
                         // Use a generic column name like "column_0", "column_1", etc.
                         row[format!("column_{}", i)] = value;
                     }
@@ -1364,13 +1409,13 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::DistinctOn { input, expressions } => {
-                let mut seen_keys = std::collections::HashSet::new();
-                let mut stream = execute(*input, ctx.clone(), outer_row, _working_tables);
+                let mut seen_keys = HashSet::new();
+                let mut stream = execute(*input, ctx.clone(), outer_row, _working_tables, transaction_handle.clone());
                 while let Some(row_result) = stream.next().await {
                     let row = row_result?;
                     let mut key_parts = Vec::new();
                     for expr in &expressions {
-                        key_parts.push(expr.evaluate_with_context(&row, outer_row, ctx.clone()).await?);
+                        key_parts.push(expr.evaluate_with_context(&row, outer_row, ctx.clone(), transaction_handle.clone()).await?);
                     }
                     let key = serde_json::to_string(&key_parts)?;
                     if seen_keys.insert(key) {
@@ -1379,21 +1424,21 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::UnionAll { left, right } => {
-                let mut left_stream = execute(*left, ctx.clone(), outer_row, _working_tables);
+                let mut left_stream = execute(*left, ctx.clone(), outer_row, _working_tables, transaction_handle.clone());
                 while let Some(row) = left_stream.next().await {
                     yield row?;
                 }
-                let mut right_stream = execute(*right, ctx.clone(), outer_row, _working_tables);
+                let mut right_stream = execute(*right, ctx.clone(), outer_row, _working_tables, transaction_handle.clone());
                 while let Some(row) = right_stream.next().await {
                     yield row?;
                 }
             }
             PhysicalPlan::Intersect { left, right } => {
-                let left_rows: std::collections::HashSet<String> = execute(*left, ctx.clone(), outer_row, _working_tables)
+                let left_rows: std::collections::HashSet<String> = execute(*left, ctx.clone(), outer_row, _working_tables, transaction_handle.clone())
                     .map_ok(|row| row.to_string())
                     .try_collect()
                     .await?;
-                let right_rows: std::collections::HashSet<String> = execute(*right, ctx.clone(), outer_row, _working_tables)
+                let right_rows: std::collections::HashSet<String> = execute(*right, ctx.clone(), outer_row, _working_tables, transaction_handle.clone())
                     .map_ok(|row| row.to_string())
                     .try_collect()
                     .await?;
@@ -1403,11 +1448,11 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::Except { left, right } => {
-                let left_rows: std::collections::HashSet<String> = execute(*left, ctx.clone(), outer_row, _working_tables)
+                let left_rows: std::collections::HashSet<String> = execute(*left, ctx.clone(), outer_row, _working_tables, transaction_handle.clone())
                     .map_ok(|row| row.to_string())
                     .try_collect()
                     .await?;
-                let right_rows: std::collections::HashSet<String> = execute(*right, ctx.clone(), outer_row, _working_tables)
+                let right_rows: std::collections::HashSet<String> = execute(*right, ctx.clone(), outer_row, _working_tables, transaction_handle.clone())
                     .map_ok(|row| row.to_string())
                     .try_collect()
                     .await?;
@@ -1454,7 +1499,7 @@ pub fn execute<'a>(
                                 &ctx.function_registry,
                                 None,
                             )?;
-                            let evaluated_val = expr.evaluate_with_context(&val, None, ctx.clone()).await?;
+                            let evaluated_val = expr.evaluate_with_context(&val, None, ctx.clone(), transaction_handle.clone()).await?;
                             index_values.push(evaluated_val);
                         }
 
@@ -1474,7 +1519,7 @@ pub fn execute<'a>(
                 yield json!({ "status": format!("Index '{}' created and backfilled {} items.", statement.index_name, backfilled_count) });
             },
             PhysicalPlan::SubqueryScan { alias, input } => {
-                let mut stream = execute(*input, ctx.clone(), outer_row, _working_tables);
+                let mut stream = execute(*input, ctx.clone(), outer_row, _working_tables, transaction_handle.clone());
                 while let Some(row_result) = stream.next().await {
                     let row = row_result?;
                     let mut new_row = json!({});
@@ -1562,7 +1607,7 @@ pub fn execute<'a>(
                     }
                 };
 
-                let non_recursive_rows_unaliased: Vec<Row> = execute(*non_recursive, ctx.clone(), outer_row, _working_tables).try_collect().await?;
+                let non_recursive_rows_unaliased: Vec<Row> = execute(*non_recursive, ctx.clone(), outer_row, _working_tables, transaction_handle.clone()).try_collect().await?;
                 let mut non_recursive_rows = Vec::new();
                 for row in non_recursive_rows_unaliased {
                     non_recursive_rows.push(rename_row_columns(row, &column_aliases, &non_recursive_cols)?);
@@ -1586,7 +1631,7 @@ pub fn execute<'a>(
                     let mut current_working_tables = HashMap::new();
                     current_working_tables.insert(alias.clone(), working_set);
 
-                    let recursive_stream = execute(*recursive.clone(), ctx.clone(), outer_row, Some(&current_working_tables));
+                    let recursive_stream = execute(*recursive.clone(), ctx.clone(), outer_row, Some(&current_working_tables), transaction_handle.clone());
                     let next_working_set_unaliased: Vec<Row> = recursive_stream.try_collect().await?;
 
                     let mut next_working_set = Vec::new();
@@ -1622,66 +1667,69 @@ pub fn execute<'a>(
                 }
             }
             PhysicalPlan::BeginTransaction => {
-                let mut current_transaction = ctx.current_transaction.write().await;
-                if current_transaction.is_some() {
-                    Err(anyhow!("Transaction already in progress"))?;
+                if let Some(handle) = transaction_handle {
+                    let mut tx_guard = handle.write().await;
+                    if tx_guard.is_some() {
+                        Err(anyhow!("Transaction already in progress"))?;
+                    }
+                    *tx_guard = Some(Transaction::new());
+                    yield json!({"status": "Transaction started"});
+                } else {
+                    Err(anyhow!("Transaction handle not provided for BEGIN"))?;
                 }
-
-                let tx_id = Uuid::new_v4();
-                *current_transaction = Some(crate::types::Transaction {
-                    id: tx_id,
-                    state: crate::types::TransactionState::Active,
-                    log_entries: Vec::new(),
-                });
-
-                println!("Transaction {} started.", tx_id);
-                yield json!({"status": "Transaction started"});
             }
             PhysicalPlan::CommitTransaction => {
-                let mut current_transaction = ctx.current_transaction.write().await;
-                let tx = match current_transaction.take() {
-                    Some(t) => t,
-                    None => Err(anyhow!("No transaction in progress"))?,
-                };
+                if let Some(handle) = transaction_handle {
+                    let mut tx_guard = handle.write().await;
+                    let tx = match tx_guard.take() {
+                        Some(t) => t,
+                        None => Err(anyhow!("No transaction in progress"))?,
+                    };
 
-                for entry in &tx.log_entries {
-                    if let Err(e) = crate::commands::apply_log_entry(entry, &ctx).await {
-                        Err(anyhow!("Error applying transaction log: {}", e))?;
-                    }
-                }
-
-                if ctx.config.persistence {
-                    // Apply buffered log entries to the persistence engine
-                    for entry in tx.log_entries {
-                        let (ack_tx, ack_rx) = oneshot::channel();
-                        if ctx.logger
-                            .send(LogRequest {
-                                entry: entry,
-                                ack: ack_tx,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            Err(anyhow!("Persistence engine is down, commit failed"))?;
-                        }
-                        match ack_rx.await {
-                            Ok(Ok(())) => {},
-                            Ok(Err(e)) => Err(anyhow!("WAL write error during commit: {}", e))?,
-                            Err(_) => Err(anyhow!("Persistence engine dropped ACK channel during commit"))?,
+                    for entry in &tx.log_entries {
+                        if let Err(e) = crate::commands::apply_log_entry(entry, &ctx).await {
+                            Err(anyhow!("Error applying transaction log: {}", e))?;
                         }
                     }
-                }
 
-                println!("Transaction {} committed.", tx.id);
-                yield json!({"status": "Transaction committed"});
+                    if ctx.config.persistence {
+                        for entry in tx.log_entries {
+                            let (ack_tx, ack_rx) = oneshot::channel();
+                            if ctx.logger
+                                .send(LogRequest {
+                                    entry: entry,
+                                    ack: ack_tx,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                Err(anyhow!("Persistence engine is down, commit failed"))?;
+                            }
+                            match ack_rx.await {
+                                Ok(Ok(())) => {},
+                                Ok(Err(e)) => Err(anyhow!("WAL write error during commit: {}", e))?,
+                                Err(_) => Err(anyhow!("Persistence engine dropped ACK channel during commit"))?,
+                            }
+                        }
+                    }
+
+                    println!("Transaction {} committed.", tx.id);
+                    yield json!({"status": "Transaction committed"});
+                } else {
+                    Err(anyhow!("Transaction handle not provided for COMMIT"))?;
+                }
             }
             PhysicalPlan::RollbackTransaction => {
-                let mut current_transaction = ctx.current_transaction.write().await;
-                if let Some(tx) = current_transaction.take() {
-                    println!("Transaction {} rolled back.", tx.id);
-                    yield json!({"status": "Transaction rolled back"});
+                if let Some(handle) = transaction_handle {
+                    let mut tx_guard = handle.write().await;
+                    if let Some(tx) = tx_guard.take() {
+                        println!("Transaction {} rolled back.", tx.id);
+                        yield json!({"status": "Transaction rolled back"});
+                    } else {
+                        Err(anyhow!("No transaction in progress"))?;
+                    }
                 } else {
-                    Err(anyhow!("No transaction in progress"))?;
+                    Err(anyhow!("Transaction handle not provided for ROLLBACK"))?;
                 }
             }
         }
@@ -1694,13 +1742,14 @@ async fn run_agg_fn<'a>(
     rows: &'a [Row],
     outer_row: Option<&'a Row>,
     ctx: Arc<AppContext>,
+    transaction_handle: Option<TransactionHandle>,
 ) -> Result<Value> {
     let result = match func.to_uppercase().as_str() {
         "COUNT" => json!(rows.len()),
         "SUM" => {
             let mut sum = 0.0;
             for row in rows {
-                if let Some(n) = arg.evaluate_with_context(row, outer_row, ctx.clone()).await?.as_f64() {
+                if let Some(n) = arg.evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone()).await?.as_f64() {
                     sum += n;
                 }
             }
@@ -1710,7 +1759,7 @@ async fn run_agg_fn<'a>(
             let mut sum = 0.0;
             let mut count = 0;
             for row in rows {
-                if let Some(n) = arg.evaluate_with_context(row, outer_row, ctx.clone()).await?.as_f64() {
+                if let Some(n) = arg.evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone()).await?.as_f64() {
                     sum += n;
                     count += 1;
                 }
@@ -1720,7 +1769,7 @@ async fn run_agg_fn<'a>(
         "MIN" => {
             let mut min = Value::Null;
             for row in rows {
-                let val = arg.evaluate_with_context(row, outer_row, ctx.clone()).await?;
+                let val = arg.evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone()).await?;
                 if min.is_null() || (!val.is_null() && val.as_f64() < min.as_f64()) {
                     min = val;
                 }
@@ -1730,7 +1779,7 @@ async fn run_agg_fn<'a>(
         "MAX" => {
             let mut max = Value::Null;
             for row in rows {
-                let val = arg.evaluate_with_context(row, outer_row, ctx.clone()).await?;
+                let val = arg.evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone()).await?;
                 if max.is_null() || (!val.is_null() && val.as_f64() > max.as_f64()) {
                     max = val;
                 }
@@ -1747,6 +1796,7 @@ async fn check_foreign_key_constraints(
     table_name: &str,
     row_data: &Value,
     ctx: &Arc<AppContext>,
+    transaction_handle: Option<TransactionHandle>,
 ) -> Result<()> {
     if let Some(schema) = ctx.schema_cache.get(table_name) {
         for constraint in &schema.constraints {
@@ -1798,7 +1848,7 @@ async fn check_foreign_key_constraints(
                     let physical_plan =
                         super::physical_plan::logical_to_physical_plan(limit_plan, &ctx.index_manager)?;
 
-                    let results: Vec<Value> = execute(physical_plan, ctx.clone(), None, None).try_collect().await?;
+                    let results: Vec<Value> = execute(physical_plan, ctx.clone(), None, None, transaction_handle.clone()).try_collect().await?;
 
                     if results.is_empty() {
                         return Err(anyhow!(
@@ -1820,6 +1870,7 @@ async fn apply_on_delete_actions(
     parent_table_name: &str,
     parent_row_data: &Value, // The inner object of the parent row
     ctx: &Arc<AppContext>,
+    transaction_handle: Option<TransactionHandle>,
 ) -> Result<()> {
     for schema_entry in ctx.schema_cache.iter() {
         let child_schema = schema_entry.value();
@@ -1865,7 +1916,7 @@ async fn apply_on_delete_actions(
                         let physical_plan =
                             super::physical_plan::logical_to_physical_plan(filter_plan, &ctx.index_manager)?;
 
-                        let results: Vec<Value> = execute(physical_plan, ctx.clone(), None, None).try_collect().await?;
+                        let results: Vec<Value> = execute(physical_plan, ctx.clone(), None, None, transaction_handle.clone()).try_collect().await?;
 
                         if !results.is_empty() {
                             let on_delete_action = fk.on_delete.as_deref().unwrap_or("NO ACTION").to_uppercase();
@@ -1944,7 +1995,7 @@ async fn apply_on_delete_actions(
                                                 .ok_or_else(|| anyhow!("Column '{}' not found in child table '{}' for SET DEFAULT", col_name, child_schema.table_name))?;
 
                                             if let Some(default_expr) = &col_def.default {
-                                                let mut default_val = default_expr.evaluate_with_context(&json!({}), None, ctx.clone()).await?;
+                                                let mut default_val = default_expr.evaluate_with_context(&json!({}), None, ctx.clone(), transaction_handle.clone()).await?;
                                                 default_val = cast_value_to_type(default_val, &col_def.data_type)?;
                                                 new_child_val[col_name] = default_val;
                                             } else {
@@ -1985,6 +2036,7 @@ async fn apply_on_update_actions(
     old_parent_row_data: &Value, // The old inner object of the parent row
     new_parent_row_data: &Value, // The new inner object of the parent row
     ctx: &Arc<AppContext>,
+    transaction_handle: Option<TransactionHandle>,
 ) -> Result<()> {
     for schema_entry in ctx.schema_cache.iter() {
         let child_schema = schema_entry.value();
@@ -2030,7 +2082,7 @@ async fn apply_on_update_actions(
                         let physical_plan =
                             super::physical_plan::logical_to_physical_plan(filter_plan, &ctx.index_manager)?;
 
-                        let results: Vec<Value> = execute(physical_plan, ctx.clone(), None, None).try_collect().await?;
+                        let results: Vec<Value> = execute(physical_plan, ctx.clone(), None, None, transaction_handle.clone()).try_collect().await?;
 
                         if !results.is_empty() {
                             let on_update_action = fk.on_update.as_deref().unwrap_or("NO ACTION").to_uppercase();
@@ -2122,7 +2174,7 @@ async fn apply_on_update_actions(
                                                 .ok_or_else(|| anyhow!("Column '{}' not found in child table '{}' for SET DEFAULT", col_name, child_schema.table_name))?;
 
                                             if let Some(default_expr) = &col_def.default {
-                                                let mut default_val = default_expr.evaluate_with_context(&json!({}), None, ctx.clone()).await?;
+                                                let mut default_val = default_expr.evaluate_with_context(&json!({}), None, ctx.clone(), transaction_handle.clone()).await?;
                                                 default_val = cast_value_to_type(default_val, &col_def.data_type)?;
                                                 new_child_val[col_name] = default_val;
                                             } else {

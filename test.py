@@ -90,7 +90,7 @@ def unit_test(conn, reader, mode, ffi_path=None):
     if mode in ("cte", "all"):
         test_cte(conn, reader)
     if mode in ("transactions", "all"):
-        test_transactions(conn, reader)
+        test_transactions(conn, reader, ffi_path=ffi_path)
     
     return conn, reader
 

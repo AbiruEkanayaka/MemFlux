@@ -12,6 +12,7 @@ use hex;
 
 use super::ast::*;
 use crate::schema::{DataType, VirtualSchema};
+use crate::transaction::TransactionHandle;
 use crate::types::{AppContext, FunctionRegistry, SchemaCache, ViewCache};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -276,6 +277,7 @@ impl Expression {
         row: &'a Value,
         outer_row: Option<&'a Value>,
         ctx: Arc<AppContext>,
+        transaction_handle: Option<TransactionHandle>,
     ) -> Pin<Box<dyn futures::Future<Output = Result<Value>> + Send + 'a>> {
         Box::pin(async move {
             match self {
@@ -326,7 +328,7 @@ impl Expression {
                 }
                 Expression::BinaryOp { left, op, right } => {
                     let left_val = left
-                        .evaluate_with_context(row, outer_row, ctx.clone())
+                        .evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone())
                         .await?;
 
                     if *op == Operator::In {
@@ -335,7 +337,7 @@ impl Expression {
                                 subquery_plan.as_ref().clone(),
                                 &ctx.index_manager,
                             )?;
-                            let results: Vec<Value> = execute(physical_plan, ctx, Some(row), None).try_collect().await?;
+                            let results: Vec<Value> = execute(physical_plan, ctx, Some(row), None, transaction_handle).try_collect().await?;
 
                             let subquery_values: Result<Vec<Value>> = results.iter().map(|result_row| {
                                 let obj = result_row
@@ -352,14 +354,14 @@ impl Expression {
                         } else if let Expression::List(list) = &**right {
                             let mut values = Vec::new();
                             for expr in list {
-                                values.push(expr.evaluate_with_context(row, outer_row, ctx.clone()).await?);
+                                values.push(expr.evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone()).await?);
                             }
                             return Ok(Value::Bool(values.contains(&left_val)));
                         }
                     }
 
                     let right_val = right
-                        .evaluate_with_context(row, outer_row, ctx.clone())
+                        .evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle)
                         .await?;
 
                     if matches!(*op, Operator::Plus | Operator::Minus | Operator::Multiply | Operator::Divide) {
@@ -449,12 +451,12 @@ impl Expression {
                 }
                 Expression::LogicalOp { left, op, right } => {
                     let left_val = left
-                        .evaluate_with_context(row, outer_row, ctx.clone())
+                        .evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone())
                         .await?;
                     match op {
                         LogicalOperator::And => {
                             if left_val.as_bool().unwrap_or(false) {
-                                right.evaluate_with_context(row, outer_row, ctx).await
+                                right.evaluate_with_context(row, outer_row, ctx, transaction_handle).await
                             } else {
                                 Ok(Value::Bool(false))
                             }
@@ -463,7 +465,7 @@ impl Expression {
                             if left_val.as_bool().unwrap_or(false) {
                                 Ok(Value::Bool(true))
                             } else {
-                                right.evaluate_with_context(row, outer_row, ctx).await
+                                right.evaluate_with_context(row, outer_row, ctx, transaction_handle).await
                             }
                         }
                     }
@@ -488,11 +490,11 @@ impl Expression {
                                 subquery_plan.as_ref().clone(),
                                 &ctx.index_manager,
                             )?;
-                            let results: Vec<Value> = execute(physical_plan, ctx.clone(), Some(row), None).try_collect().await?;
+                            let results: Vec<Value> = execute(physical_plan, ctx.clone(), Some(row), None, transaction_handle.clone()).try_collect().await?;
                             evaluated_args.push(Value::Array(results));
                         } else {
                             evaluated_args.push(
-                                arg.evaluate_with_context(row, outer_row, ctx.clone())
+                                arg.evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone())
                                     .await?,
                             );
                         }
@@ -506,25 +508,25 @@ impl Expression {
                 } => {
                     for (when_expr, then_expr) in when_then_pairs {
                         if when_expr
-                            .evaluate_with_context(row, outer_row, ctx.clone())
+                            .evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone())
                             .await? 
                             .as_bool()
                             .unwrap_or(false)
                         {
                             return then_expr
-                                .evaluate_with_context(row, outer_row, ctx)
+                                .evaluate_with_context(row, outer_row, ctx, transaction_handle)
                                 .await;
                         }
                     }
                     if let Some(else_expr) = else_expression {
                         return else_expr
-                            .evaluate_with_context(row, outer_row, ctx)
+                            .evaluate_with_context(row, outer_row, ctx, transaction_handle)
                             .await;
                     }
                     Ok(Value::Null)
                 }
                 Expression::Cast { expr, data_type } => {
-                    let value = expr.evaluate_with_context(row, outer_row, ctx).await?;
+                    let value = expr.evaluate_with_context(row, outer_row, ctx, transaction_handle).await?;
                     cast_value_to_type(value, data_type)
                 }
                 Expression::Subquery(subquery_plan) => {
@@ -533,7 +535,7 @@ impl Expression {
                         &ctx.index_manager,
                     )?;
 
-                    let results: Vec<Value> = execute(physical_plan, ctx, Some(row), None).try_collect().await?;
+                    let results: Vec<Value> = execute(physical_plan, ctx, Some(row), None, transaction_handle).try_collect().await?;
 
                     if results.len() > 1 {
                         return Err(anyhow!("Subquery for '=' operator must return exactly one row"));
@@ -556,7 +558,7 @@ impl Expression {
                 Expression::List(list) => {
                     let mut evaluated_list = Vec::new();
                     for expr in list {
-                        evaluated_list.push(expr.evaluate_with_context(row, outer_row, ctx.clone()).await?);
+                        evaluated_list.push(expr.evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone()).await?);
                     }
                     Ok(Value::Array(evaluated_list))
                 }
@@ -742,7 +744,7 @@ pub(crate) fn simple_expr_to_expression(
             let json_val = match val {
                 SimpleValue::String(s) => Value::String(s),
                 SimpleValue::Number(n) => {
-                    serde_json::from_str(&n).map_err(|e| anyhow!("Invalid number literal: {}", e))?
+                    serde_json::from_str(&n).map_err(|e| anyhow!("Invalid number literal: {}", e))? 
                 }
                 SimpleValue::Boolean(b) => Value::Bool(b),
                 SimpleValue::Null => Value::Null,
