@@ -255,7 +255,8 @@ def send_resp_command(conn, reader, parts):
         total = (t2 - t0) * 1000
         return response_bytes.decode('utf-8', errors='replace'), send_time, latency, total
     else: # FFI mode
-        ffi_conn = conn
+        # In FFI mode, 'conn' is the cursor object itself.
+        cursor = conn
         if parts[0].upper() == 'SQL':
             command_str = " ".join(parts)
         else:
@@ -263,7 +264,6 @@ def send_resp_command(conn, reader, parts):
         
         t0 = time.perf_counter()
         try:
-            cursor = ffi_conn.cursor()
             cursor.execute(command_str)
             t1 = time.perf_counter()
             
@@ -276,6 +276,7 @@ def send_resp_command(conn, reader, parts):
             exec_time = (t1 - t0) * 1000
             total_time = (t2 - t0) * 1000
             
+            # The cursor must be closed by the test function that created it.
             return response_bytes.decode('utf-8', errors='replace'), exec_time, 0, total_time
 
         except memflux.DatabaseError as e:
