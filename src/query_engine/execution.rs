@@ -13,6 +13,7 @@ use uuid::Uuid;
 use super::ast::{AlterTableAction, TableConstraint};
 use super::logical_plan::{cast_value_to_type, Expression, JoinType, LogicalOperator, LogicalPlan, OnConflictAction, Operator};
 use super::physical_plan::PhysicalPlan;
+use crate::config::DurabilityLevel;
 use crate::schema::{ColumnDefinition, DataType, VirtualSchema, SCHEMA_PREFIX, VIEW_PREFIX};
 use crate::types::{AppContext, Command, DbValue, LogEntry, LogRequest, Response, SchemaCache, ViewDefinition};
 
@@ -1680,35 +1681,53 @@ pub fn execute<'a>(
             }
             PhysicalPlan::CommitTransaction => {
                 if let Some(handle) = transaction_handle {
-                    let mut tx_guard = handle.write().await;
-                    let tx = match tx_guard.take() {
-                        Some(t) => t,
-                        None => Err(anyhow!("No transaction in progress"))?,
+                    let tx = {
+                        let mut tx_guard = handle.write().await;
+                        match tx_guard.take() {
+                            Some(t) => t,
+                            None => Err(anyhow!("No transaction in progress"))?,
+                        }
                     };
 
-                    for entry in &tx.log_entries {
-                        if let Err(e) = crate::commands::apply_log_entry(entry, &ctx).await {
-                            Err(anyhow!("Error applying transaction log: {}", e))?;
-                        }
-                    }
+                    let _commit_lock_guard = ctx.commit_lock.lock().await;
 
-                    if ctx.config.persistence {
-                        for entry in tx.log_entries {
-                            let (ack_tx, ack_rx) = oneshot::channel();
-                            if ctx.logger
-                                .send(LogRequest {
-                                    entry: entry,
-                                    ack: ack_tx,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                Err(anyhow!("Persistence engine is down, commit failed"))?;
+                    match ctx.config.durability {
+                        DurabilityLevel::None => {
+                            // Apply to memory first, then fire-and-forget to WAL
+                            for entry in &tx.log_entries {
+                                if let Err(e) = crate::commands::apply_log_entry(entry, &ctx).await {
+                                    Err(anyhow!("CRITICAL: In-memory apply failed for 'none' durability: {}. Transaction partially applied.", e))?;
+                                }
                             }
-                            match ack_rx.await {
-                                Ok(Ok(())) => {},
-                                Ok(Err(e)) => Err(anyhow!("WAL write error during commit: {}", e))?,
-                                Err(_) => Err(anyhow!("Persistence engine dropped ACK channel during commit"))?,
+                            if ctx.config.persistence {
+                                for entry in tx.log_entries {
+                                    let (ack_tx, _) = oneshot::channel(); // We don't wait for the ack
+                                    let _ = ctx.logger.try_send(LogRequest { entry, ack: ack_tx });
+                                }
+                            }
+                        }
+                        DurabilityLevel::Fsync | DurabilityLevel::Full => {
+                            // For both Fsync and Full, we write to WAL and wait for the OS buffer ack.
+                            // A true 'Full' would require a blocking fsync, which the current persistence engine doesn't support per-request.
+                            if ctx.config.persistence {
+                                for entry in &tx.log_entries {
+                                    let (ack_tx, ack_rx) = oneshot::channel();
+                                    if ctx.logger.send(LogRequest { entry: entry.clone(), ack: ack_tx }).await.is_err() {
+                                        Err(anyhow!("Persistence engine is down, commit failed. Transaction rolled back."))?;
+                                    }
+                                    match ack_rx.await {
+                                        Ok(Ok(())) => {} // Success
+                                        Ok(Err(e)) => Err(anyhow!("WAL write error during commit: {}. Transaction rolled back.", e))?,
+                                        Err(_) => Err(anyhow!("Persistence engine dropped ACK channel during commit. Transaction rolled back."))?,
+                                    }
+                                }
+                            }
+
+                            // Apply changes to the in-memory DB after WAL write.
+                            for entry in &tx.log_entries {
+                                if let Err(e) = crate::commands::apply_log_entry(entry, &ctx).await {
+                                    Err(anyhow!("CRITICAL: In-memory apply failed after WAL write: {}. Database may be inconsistent.", e))?;
+                                }
                             }
                         }
                     }

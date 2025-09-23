@@ -5,6 +5,20 @@ use std::path::Path;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+pub enum DurabilityLevel {
+    None,
+    Fsync,
+    Full,
+}
+
+impl Default for DurabilityLevel {
+    fn default() -> Self {
+        DurabilityLevel::Fsync
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum EvictionPolicy {
     LRU,
     LFU,
@@ -26,6 +40,8 @@ pub struct Config {
     pub requirepass: String,
     #[serde(default = "default_true")]
     pub persistence: bool,
+    #[serde(default)]
+    pub durability: DurabilityLevel,
     pub wal_file: String,
     #[serde(default = "default_wal_overflow_file")]
     pub wal_overflow_file: String,
@@ -58,6 +74,8 @@ pub struct FFIConfig {
     pub maxmemory_mb: u64,
     #[serde(default)]
     pub eviction_policy: EvictionPolicy,
+    #[serde(default)]
+    pub durability: DurabilityLevel,
 }
 
 impl From<FFIConfig> for Config {
@@ -74,6 +92,7 @@ impl From<FFIConfig> for Config {
             wal_size_threshold_mb: ffi_config.wal_size_threshold_mb,
             maxmemory_mb: ffi_config.maxmemory_mb,
             eviction_policy: ffi_config.eviction_policy,
+            durability: ffi_config.durability,
             encrypt: false,
             cert_file: "".to_string(),
             key_file: "".to_string(),
@@ -108,6 +127,7 @@ impl Default for Config {
             port: 8360,
             requirepass: "".to_string(),
             persistence: true,
+            durability: DurabilityLevel::default(),
             wal_file: "memflux.wal".to_string(),
             wal_overflow_file: "memflux.wal.overflow".to_string(),
             snapshot_file: "memflux.snapshot".to_string(),

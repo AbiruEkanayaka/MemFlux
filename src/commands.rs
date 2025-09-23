@@ -4,6 +4,7 @@ use std::collections::{HashSet, VecDeque};
 use std::str;
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
+use crate::config::DurabilityLevel;
 use crate::indexing::Index;
 use crate::memory;
 use crate::transaction::{Transaction, TransactionHandle};
@@ -2293,70 +2294,86 @@ pub fn apply_json_delete_to_db(db: &crate::types::Db, path: &str) -> Result<i64>
 }
 
 async fn handle_commit(
-    command: Command,
+    _command: Command,
     ctx: &AppContext,
     transaction_handle: TransactionHandle,
 ) -> Response {
-    if command.args.len() != 1 {
-        return Response::Error("COMMIT takes no arguments".to_string());
-    }
-
-    let tx = match transaction_handle.write().await.take() {
-        Some(t) => t,
-        None => return Response::Error("No transaction in progress".to_string()),
+    let tx = {
+        let mut tx_guard = transaction_handle.write().await;
+        match tx_guard.take() {
+            Some(t) => t,
+            None => return Response::Error("No transaction in progress".to_string()),
+        }
     };
 
-    println!(
-        "Committing transaction {} with {} entries.",
-        tx.id,
-        tx.log_entries.len()
-    );
+    // Acquire a global lock to ensure the commit is atomic.
+    let _commit_lock_guard = ctx.commit_lock.lock().await;
 
-    // Acquire a global lock to serialize commits.
-    let _commit_lock = ctx.commit_lock.lock().await;
-
-    for entry in tx.log_entries.iter() {
-        // 1. Apply the change to the in-memory database.
-        if let Err(e) = apply_log_entry(entry, ctx).await {
-            // This is a critical error. The transaction logic might have diverged from the
-            // main database logic. A more robust system might try to roll back the in-memory changes.
-            return Response::Error(format!(
-                "FATAL: Error applying transaction log during commit: {}. State may be inconsistent.",
-                e
-            ));
-        }
-
-        // 2. Write the change to the WAL.
-        if ctx.config.persistence {
-            let (ack_tx, ack_rx) = oneshot::channel();
-            if ctx
-                .logger
-                .send(LogRequest {
-                    entry: entry.clone(),
-                    ack: ack_tx,
-                })
-                .await
-                .is_err()
-            {
-                return Response::Error(
-                    "Persistence engine is down, commit failed".to_string(),
-                );
-            }
-            match ack_rx.await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    return Response::Error(format!("WAL write error during commit: {}", e))
+    match ctx.config.durability {
+        DurabilityLevel::None => {
+            // Apply to memory first, then fire-and-forget to WAL
+            for entry in &tx.log_entries {
+                if let Err(e) = apply_log_entry(entry, ctx).await {
+                    return Response::Error(format!(
+                        "CRITICAL: In-memory apply failed for 'none' durability: {}. Transaction partially applied.",
+                        e
+                    ));
                 }
-                Err(_) => {
-                    return Response::Error(
-                        "Persistence engine dropped ACK channel during commit".to_string(),
-                    )
+            }
+            if ctx.config.persistence {
+                for entry in tx.log_entries {
+                    let (ack_tx, _) = oneshot::channel(); // We don't wait for the ack
+                    let _ = ctx.logger.try_send(LogRequest { entry, ack: ack_tx });
+                }
+            }
+        }
+        DurabilityLevel::Fsync | DurabilityLevel::Full => {
+            // For both Fsync and Full, we write to WAL and wait for the OS buffer ack.
+            // A true 'Full' would require a blocking fsync, which the current persistence engine doesn't support per-request.
+            if ctx.config.persistence {
+                for entry in &tx.log_entries {
+                    let (ack_tx, ack_rx) = oneshot::channel();
+                    if ctx
+                        .logger
+                        .send(LogRequest { entry: entry.clone(), ack: ack_tx })
+                        .await
+                        .is_err()
+                    {
+                        return Response::Error(
+                            "Persistence engine is down, commit failed. Transaction rolled back."
+                                .to_string(),
+                        );
+                    }
+                    match ack_rx.await {
+                        Ok(Ok(())) => {} // Success
+                        Ok(Err(e)) => {
+                            return Response::Error(format!(
+                                "WAL write error during commit: {}. Transaction rolled back.",
+                                e
+                            ))
+                        }
+                        Err(_) => {
+                            return Response::Error(
+                                "Persistence engine dropped ACK channel during commit. Transaction rolled back."
+                                    .to_string(),
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Apply changes to the in-memory DB after WAL write.
+            for entry in &tx.log_entries {
+                if let Err(e) = apply_log_entry(entry, ctx).await {
+                    return Response::Error(format!(
+                        "CRITICAL: In-memory apply failed after WAL write: {}. Database may be inconsistent.",
+                        e
+                    ));
                 }
             }
         }
     }
 
-    println!("Transaction {} committed.", tx.id);
     Response::Ok
 }
 
