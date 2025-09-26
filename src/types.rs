@@ -130,6 +130,13 @@ pub struct ViewDefinition {
     pub query: SelectStatement,
 }
 
+#[derive(Debug)]
+pub enum PersistenceRequest {
+    Log(LogRequest),
+    Sync(oneshot::Sender<Result<(), String>>),
+}
+
+#[derive(Debug)]
 pub struct LogRequest {
     pub entry: LogEntry,
     pub ack: oneshot::Sender<Result<(), String>>,
@@ -137,7 +144,7 @@ pub struct LogRequest {
 
 // --- Type Aliases ---
 
-pub type Logger = mpsc::Sender<LogRequest>;
+pub type Logger = mpsc::Sender<PersistenceRequest>;
 pub type Db = Arc<DashMap<String, DbValue>>;
 pub type JsonCache = Arc<DashMap<String, Arc<Vec<u8>>>>;
 pub type SchemaCache = Arc<DashMap<String, Arc<VirtualSchema>>>;

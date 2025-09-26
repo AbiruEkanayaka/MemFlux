@@ -27,7 +27,7 @@ use crate::persistence::{load_db_from_disk, PersistenceEngine};
 use crate::query_engine::functions;
 use crate::schema::{load_schemas_from_db, VIEW_PREFIX};
 use crate::transaction::TransactionHandle;
-use crate::types::{AppContext, Db, FunctionRegistry, ViewCache, ViewDefinition};
+use crate::types::{AppContext, Db, FunctionRegistry, PersistenceRequest, ViewCache, ViewDefinition};
 
 /// The main database instance, providing the primary API for interaction.
 pub struct MemFluxDB {
@@ -67,10 +67,12 @@ impl MemFluxDB {
             });
             (logger, Some(handle))
         } else {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::types::LogRequest>(1024);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<PersistenceRequest>(1024);
             tokio::spawn(async move {
                 while let Some(req) = rx.recv().await {
-                    let _ = req.ack.send(Ok(()));
+                    if let PersistenceRequest::Log(log_req) = req {
+                        let _ = log_req.ack.send(Ok(()));
+                    }
                 }
             });
             (tx, None)

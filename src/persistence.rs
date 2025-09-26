@@ -9,10 +9,10 @@ use tokio::task::{self, JoinHandle};
 
 use crate::commands::{apply_json_delete_to_db, apply_json_set_to_db};
 use crate::config::Config;
-use crate::types::*;
+use crate::types::{Db, DbValue, LogEntry, PersistenceRequest, SerializableDbValue, SnapshotEntry};
 
 pub struct PersistenceEngine {
-    receiver: mpsc::Receiver<LogRequest>,
+    receiver: mpsc::Receiver<PersistenceRequest>,
     primary_wal_path: String,
     overflow_wal_path: String,
     snapshot_path: String,
@@ -22,7 +22,7 @@ pub struct PersistenceEngine {
 }
 
 impl PersistenceEngine {
-    pub fn new(config: &Config, db: Db) -> (Self, Logger) {
+    pub fn new(config: &Config, db: Db) -> (Self, mpsc::Sender<PersistenceRequest>) {
         let (tx, rx) = mpsc::channel(1024);
         let engine = PersistenceEngine {
             receiver: rx,
@@ -188,32 +188,75 @@ impl PersistenceEngine {
                         None => break, // Channel closed, shutdown.
                     };
 
-                    write_buffer.clear();
                     let mut batch = vec![first_req];
                     while batch.len() < 256 {
                         if let Ok(req) = self.receiver.try_recv() {
+                            if matches!(req, PersistenceRequest::Sync(_)) {
+                                // Stop batching if we see a sync request to ensure it acts as a barrier
+                                batch.push(req);
+                                break;
+                            }
                             batch.push(req);
                         } else {
                             break;
                         }
                     }
-                    for req in &batch {
-                        let data = bincode::serialize(&req.entry)?;
-                        let len = data.len() as u32;
-                        write_buffer.extend_from_slice(&len.to_le_bytes());
-                        write_buffer.extend_from_slice(&data);
-                    }
-                    let write_result = file.write_all(&write_buffer).await.map_err(|e| anyhow!(e));
-                    let _ = fsync_notify_tx.try_send(());
-                    let write_result_for_ack = write_result.map_err(|e| e.to_string());
+
+                    let mut log_requests = Vec::new();
+                    let mut sync_requests = Vec::new();
+                    let mut has_sync = false;
+
+                    write_buffer.clear();
+
                     for req in batch {
-                        let _ = req.ack.send(write_result_for_ack.clone());
+                        match req {
+                            PersistenceRequest::Log(log_req) => {
+                                match bincode::serialize(&log_req.entry) {
+                                    Ok(data) => {
+                                        let len = data.len() as u32;
+                                        write_buffer.extend_from_slice(&len.to_le_bytes());
+                                        write_buffer.extend_from_slice(&data);
+                                        log_requests.push(log_req);
+                                    }
+                                    Err(e) => {
+                                        let _ = log_req.ack.send(Err(format!("Serialization failed: {}", e)));
+                                    }
+                                }
+                            }
+                            PersistenceRequest::Sync(sync_ack) => {
+                                has_sync = true;
+                                sync_requests.push(sync_ack);
+                            }
+                        }
                     }
-                    if write_result_for_ack.is_err() {
-                        bail!(
-                            "Failed to write to WAL: {}",
-                            write_result_for_ack.unwrap_err()
-                        );
+
+                    let write_result = if !write_buffer.is_empty() {
+                        file.write_all(&write_buffer).await.map_err(|e| anyhow!(e))
+                    } else {
+                        Ok(())
+                    };
+
+                    let final_result = if write_result.is_ok() && has_sync {
+                        file.sync_all().await.map_err(|e| anyhow!(e))
+                    } else {
+                        write_result
+                    };
+
+                    if final_result.is_ok() && !has_sync {
+                         let _ = fsync_notify_tx.try_send(());
+                    }
+
+                    let result_for_ack = final_result.map_err(|e| e.to_string());
+
+                    for log_req in log_requests {
+                        let _ = log_req.ack.send(result_for_ack.clone());
+                    }
+                    for sync_req in sync_requests {
+                        let _ = sync_req.send(result_for_ack.clone());
+                    }
+
+                    if let Err(e) = &result_for_ack {
+                        bail!("Failed to write to WAL: {}", e);
                     }
 
                     // Check if we need to trigger the start of a new compaction cycle

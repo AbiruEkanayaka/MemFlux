@@ -6,7 +6,8 @@ use tokio::sync::{oneshot, RwLock};
 
 use crate::arc::ArcCache;
 use crate::config::EvictionPolicy;
-use crate::types::{AppContext, DbValue, LogEntry, LogRequest};
+use crate::types::{AppContext, DbValue, LogEntry, LogRequest, PersistenceRequest};
+
 
 // A rough estimation of the memory used by a DbValue.
 // It's not perfect but gives us a baseline for memory management.
@@ -418,10 +419,10 @@ impl MemoryManager {
                     let log_entry = LogEntry::Delete { key: key.clone() };
                     let (ack_tx, ack_rx) = oneshot::channel();
                     if ctx.logger
-                        .send(LogRequest {
+                        .send(PersistenceRequest::Log(LogRequest {
                             entry: log_entry,
                             ack: ack_tx,
-                        })
+                        }))
                         .await
                         .is_err()
                     {

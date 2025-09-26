@@ -391,11 +391,13 @@ pub async fn process_command(
 
 async fn log_to_wal(log_entry: LogEntry, ctx: &AppContext) -> Response {
     let (ack_tx, ack_rx) = oneshot::channel();
-    if ctx.logger
-        .send(LogRequest {
-            entry: log_entry,
-            ack: ack_tx,
-        })
+    let log_req = LogRequest {
+        entry: log_entry,
+        ack: ack_tx,
+    };
+    if ctx
+        .logger
+        .send(PersistenceRequest::Log(log_req))
         .await
         .is_err()
     {
@@ -2323,7 +2325,7 @@ async fn handle_commit(
             if ctx.config.persistence {
                 for entry in tx.log_entries {
                     let (ack_tx, _) = oneshot::channel(); // We don't wait for the ack
-                    let _ = ctx.logger.try_send(LogRequest { entry, ack: ack_tx });
+                    let _ = ctx.logger.try_send(PersistenceRequest::Log(LogRequest { entry, ack: ack_tx }));
                 }
             }
         }
@@ -2335,7 +2337,7 @@ async fn handle_commit(
                     let (ack_tx, ack_rx) = oneshot::channel();
                     if ctx
                         .logger
-                        .send(LogRequest { entry: entry.clone(), ack: ack_tx })
+                        .send(PersistenceRequest::Log(LogRequest { entry: entry.clone(), ack: ack_tx }))
                         .await
                         .is_err()
                     {
