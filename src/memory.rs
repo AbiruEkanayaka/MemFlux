@@ -408,11 +408,16 @@ impl MemoryManager {
             };
 
             if let Some((key, old_freq)) = key_to_evict_info {
-                let old_value_for_index =
-                    ctx.db.get(&key).and_then(|entry| match entry.value() {
-                        DbValue::Json(v) => Some(v.clone()),
+                let old_value_for_index = if let Some(version_chain_lock) = ctx.db.get(&key) {
+                    let version_chain = version_chain_lock.read().await;
+                    version_chain.last().and_then(|v| match &v.value {
+                        DbValue::Json(val) => Some(val.clone()),
+                        DbValue::JsonB(b) => serde_json::from_slice(b).ok(),
                         _ => None,
-                    });
+                    })
+                } else {
+                    None
+                };
 
                 if ctx.config.persistence {
                     // Log the deletion for persistence
@@ -450,8 +455,12 @@ impl MemoryManager {
 
                 // WAL write successful or persistence disabled, now evict from memory
                 if let Some(entry) = ctx.db.remove(&key) {
-                    let size = estimate_db_value_size(&entry.1).await;
-                    self.decrease_memory(size + key.len() as u64);
+                    let version_chain = entry.1.read().await;
+                    let mut total_size = 0;
+                    for version in version_chain.iter() {
+                        total_size += estimate_db_value_size(&version.value).await;
+                    }
+                    self.decrease_memory(total_size + key.len() as u64);
 
                     if let Some(ref old_val) = old_value_for_index {
                         ctx.index_manager

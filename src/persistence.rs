@@ -7,9 +7,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio::task::{self, JoinHandle};
 
-use crate::commands::{apply_json_delete_to_db, apply_json_set_to_db};
+
 use crate::config::Config;
-use crate::types::{Db, DbValue, LogEntry, PersistenceRequest, SerializableDbValue, SnapshotEntry};
+use crate::types::{
+    Db, DbValue, LogEntry, PersistenceRequest, SerializableDbValue, SnapshotEntry, VersionedValue,
+};
+use tokio::sync::RwLock;
 
 pub struct PersistenceEngine {
     receiver: mpsc::Receiver<PersistenceRequest>,
@@ -82,15 +85,21 @@ impl PersistenceEngine {
             });
 
             let reader_task = async move {
-                for item in db_clone.iter() {
-                    let serializable_value =
-                        SerializableDbValue::from_db_value(item.value()).await;
-                    let entry = SnapshotEntry {
-                        key: item.key().clone(),
-                        value: serializable_value,
-                    };
-                    if tx.send(entry).await.is_err() {
-                        break;
+                let keys: Vec<String> = db_clone.iter().map(|item| item.key().clone()).collect();
+                for key in keys {
+                    if let Some(item) = db_clone.get(&key) {
+                        let version_chain = item.value().read().await;
+                        if let Some(latest_version) = version_chain.last() {
+                            let serializable_value =
+                                SerializableDbValue::from_db_value(&latest_version.value).await;
+                            let entry = SnapshotEntry {
+                                key: item.key().clone(),
+                                value: serializable_value,
+                            };
+                            if tx.send(entry).await.is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
             };
@@ -389,7 +398,13 @@ async fn load_from_snapshot(snapshot_path: &str, db: &Db) -> Result<()> {
 
             let batch_count = batch.len();
             batch.into_par_iter().for_each(|entry| {
-                db_clone.insert(entry.key, entry.value.into_db_value());
+                let db_value = entry.value.into_db_value();
+                let versioned_value = VersionedValue {
+                    value: db_value,
+                    creator_txid: 0, // Pre-existing data
+                    expirer_txid: 0,
+                };
+                db_clone.insert(entry.key, RwLock::new(vec![versioned_value]));
             });
             total_count += batch_count as i32;
         }
@@ -409,7 +424,6 @@ async fn load_from_snapshot(snapshot_path: &str, db: &Db) -> Result<()> {
 
 async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
     use std::collections::{HashSet, VecDeque};
-    use tokio::sync::RwLock;
     let file = match File::open(wal_path).await {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -438,84 +452,178 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
         count += 1;
         match entry {
             LogEntry::SetBytes { key, value } => {
-                db.insert(key, DbValue::Bytes(value));
+                let new_version = VersionedValue {
+                    value: DbValue::Bytes(value),
+                    creator_txid: 0,
+                    expirer_txid: 0,
+                };
+                db.insert(key, RwLock::new(vec![new_version]));
             }
             LogEntry::SetJsonB { key, value } => {
-                db.insert(key, DbValue::JsonB(value));
+                let new_version = VersionedValue {
+                    value: DbValue::JsonB(value),
+                    creator_txid: 0,
+                    expirer_txid: 0,
+                };
+                db.insert(key, RwLock::new(vec![new_version]));
             }
             LogEntry::Delete { key } => {
                 db.remove(&key);
             }
             LogEntry::JsonSet { path, value } => {
-                let value: serde_json::Value = serde_json::from_str(&value).unwrap_or(serde_json::Value::Null);
-                let _ = apply_json_set_to_db(db, &path, value);
+                // This is a simplified version for WAL replay.
+                // It overwrites the latest version.
+                let mut parts = path.splitn(2, '.');
+                if let Some(key) = parts.next() {
+                    let value: serde_json::Value = serde_json::from_str(&value).unwrap_or(serde_json::Value::Null);
+                    let entry = db.entry(key.to_string()).or_insert_with(|| {
+                        RwLock::new(vec![VersionedValue {
+                            value: DbValue::JsonB(b"{}".to_vec()),
+                            creator_txid: 0,
+                            expirer_txid: 0,
+                        }])
+                    });
+                    let mut version_chain = entry.value().write().await;
+                    if let Some(latest_version) = version_chain.last_mut() {
+                        let mut current_val: serde_json::Value = match &latest_version.value {
+                            DbValue::Json(v) => v.clone(),
+                            DbValue::JsonB(b) => serde_json::from_slice(&b).unwrap_or_default(),
+                            _ => serde_json::json!({}),
+                        };
+
+                        let inner_path = parts.next().unwrap_or("");
+                        let pointer = crate::commands::json_path_to_pointer(inner_path);
+                        if pointer.is_empty() {
+                            current_val = value;
+                        } else if let Some(target) = current_val.pointer_mut(&pointer) {
+                            *target = value;
+                        } // Simplified: does not create nested paths
+
+                        if let Ok(new_bytes) = serde_json::to_vec(&current_val) {
+                            latest_version.value = DbValue::JsonB(new_bytes);
+                        }
+                    }
+                }
             }
             LogEntry::JsonDelete { path } => {
-                let _ = apply_json_delete_to_db(db, &path);
+                let mut parts = path.splitn(2, '.');
+                if let Some(key) = parts.next() {
+                    if let Some(entry) = db.get(key) {
+                        let mut version_chain = entry.value().write().await;
+                        if let Some(latest_version) = version_chain.last_mut() {
+                             let mut current_val: serde_json::Value = match &latest_version.value {
+                                DbValue::Json(v) => v.clone(),
+                                DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
+                                _ => continue,
+                            };
+                            let inner_path = parts.next().unwrap_or("");
+                            if inner_path.is_empty() || inner_path == "." {
+                                // This would mean deleting the whole key, but we handle that with LogEntry::Delete
+                            } else {
+                                let mut pointer_parts: Vec<&str> = inner_path.split('.').collect();
+                                let final_key = pointer_parts.pop().unwrap();
+                                let parent_pointer = crate::commands::json_path_to_pointer(&pointer_parts.join("."));
+
+                                if let Some(target) = current_val.pointer_mut(&parent_pointer) {
+                                    if let Some(obj) = target.as_object_mut() {
+                                        obj.remove(final_key);
+                                    }
+                                }
+                            }
+                            if let Ok(new_bytes) = serde_json::to_vec(&current_val) {
+                                latest_version.value = DbValue::JsonB(new_bytes);
+                            }
+                        }
+                    }
+                }
             }
             LogEntry::LPush { key, values } => {
-                let entry = db
-                    .entry(key)
-                    .or_insert_with(|| DbValue::List(RwLock::new(VecDeque::new())));
-                if let DbValue::List(list_lock) = entry.value() {
-                    let mut list = list_lock.write().await;
-                    for v in values {
-                        list.push_front(v);
+                let entry = db.entry(key).or_insert_with(|| {
+                    RwLock::new(vec![VersionedValue {
+                        value: DbValue::List(RwLock::new(VecDeque::new())),
+                        creator_txid: 0,
+                        expirer_txid: 0,
+                    }])
+                });
+                if let Some(latest_version) = entry.value().write().await.last_mut() {
+                    if let DbValue::List(list_lock) = &mut latest_version.value {
+                        let mut list = list_lock.write().await;
+                        for v in values {
+                            list.push_front(v);
+                        }
                     }
                 }
             }
             LogEntry::RPush { key, values } => {
-                let entry = db
-                    .entry(key)
-                    .or_insert_with(|| DbValue::List(RwLock::new(VecDeque::new())));
-                if let DbValue::List(list_lock) = entry.value() {
-                    let mut list = list_lock.write().await;
-                    for v in values {
-                        list.push_back(v);
+                let entry = db.entry(key).or_insert_with(|| {
+                    RwLock::new(vec![VersionedValue {
+                        value: DbValue::List(RwLock::new(VecDeque::new())),
+                        creator_txid: 0,
+                        expirer_txid: 0,
+                    }])
+                });
+                if let Some(latest_version) = entry.value().write().await.last_mut() {
+                    if let DbValue::List(list_lock) = &mut latest_version.value {
+                        let mut list = list_lock.write().await;
+                        for v in values {
+                            list.push_back(v);
+                        }
                     }
                 }
             }
             LogEntry::LPop { key, count } => {
-                if let Some(mut entry) = db.get_mut(&key) {
-                    if let DbValue::List(list_lock) = entry.value_mut() {
-                        let mut list = list_lock.write().await;
-                        for _ in 0..count {
-                            if list.pop_front().is_none() {
-                                break;
+                if let Some(entry) = db.get(&key) {
+                    if let Some(latest_version) = entry.value().write().await.last_mut() {
+                        if let DbValue::List(list_lock) = &mut latest_version.value {
+                            let mut list = list_lock.write().await;
+                            for _ in 0..count {
+                                if list.pop_front().is_none() {
+                                    break;
+                                }
                             }
                         }
                     }
                 }
             }
             LogEntry::RPop { key, count } => {
-                if let Some(mut entry) = db.get_mut(&key) {
-                    if let DbValue::List(list_lock) = entry.value_mut() {
-                        let mut list = list_lock.write().await;
-                        for _ in 0..count {
-                            if list.pop_back().is_none() {
-                                break;
+                if let Some(entry) = db.get(&key) {
+                    if let Some(latest_version) = entry.value().write().await.last_mut() {
+                        if let DbValue::List(list_lock) = &mut latest_version.value {
+                            let mut list = list_lock.write().await;
+                            for _ in 0..count {
+                                if list.pop_back().is_none() {
+                                    break;
+                                }
                             }
                         }
                     }
                 }
             }
             LogEntry::SAdd { key, members } => {
-                let entry = db
-                    .entry(key)
-                    .or_insert_with(|| DbValue::Set(RwLock::new(HashSet::new())));
-                if let DbValue::Set(set_lock) = entry.value() {
-                    let mut set = set_lock.write().await;
-                    for m in members {
-                        set.insert(m);
+                let entry = db.entry(key).or_insert_with(|| {
+                    RwLock::new(vec![VersionedValue {
+                        value: DbValue::Set(RwLock::new(HashSet::new())),
+                        creator_txid: 0,
+                        expirer_txid: 0,
+                    }])
+                });
+                if let Some(latest_version) = entry.value().write().await.last_mut() {
+                    if let DbValue::Set(set_lock) = &mut latest_version.value {
+                        let mut set = set_lock.write().await;
+                        for m in members {
+                            set.insert(m);
+                        }
                     }
                 }
             }
             LogEntry::SRem { key, members } => {
-                if let Some(mut entry) = db.get_mut(&key) {
-                    if let DbValue::Set(set_lock) = entry.value_mut() {
-                        let mut set = set_lock.write().await;
-                        for m in members {
-                            set.remove(&m);
+                if let Some(entry) = db.get(&key) {
+                    if let Some(latest_version) = entry.value().write().await.last_mut() {
+                        if let DbValue::Set(set_lock) = &mut latest_version.value {
+                            let mut set = set_lock.write().await;
+                            for m in members {
+                                set.remove(&m);
+                            }
                         }
                     }
                 }
@@ -524,7 +632,8 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                 // 1. Rename data keys
                 let old_prefix = format!("{}:", old_name);
                 let new_prefix = format!("{}:", new_name);
-                let keys_to_rename: Vec<String> = db.iter()
+                let keys_to_rename: Vec<String> = db
+                    .iter()
                     .filter(|entry| entry.key().starts_with(&old_prefix))
                     .map(|entry| entry.key().clone())
                     .collect();
@@ -538,13 +647,24 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
 
                 // 2. Rename schema key and update its content
                 let old_schema_key = format!("{}{}", crate::schema::SCHEMA_PREFIX, old_name);
-                if let Some((_, schema_val)) = db.remove(&old_schema_key) {
-                    if let DbValue::Bytes(bytes) = schema_val {
-                        if let Ok(mut schema) = serde_json::from_slice::<crate::schema::VirtualSchema>(&bytes) {
-                            schema.table_name = new_name.clone();
-                            if let Ok(new_bytes) = serde_json::to_vec(&schema) {
-                                let new_schema_key = format!("{}{}", crate::schema::SCHEMA_PREFIX, new_name);
-                                db.insert(new_schema_key, DbValue::Bytes(new_bytes));
+                if let Some((_, schema_val_rwlock)) = db.remove(&old_schema_key) {
+                    let mut version_chain = schema_val_rwlock.write().await;
+                    if let Some(latest_version) = version_chain.last_mut() {
+                        if let DbValue::Bytes(bytes) = &latest_version.value {
+                            if let Ok(mut schema) =
+                                serde_json::from_slice::<crate::schema::VirtualSchema>(bytes)
+                            {
+                                schema.table_name = new_name.clone();
+                                if let Ok(new_bytes) = serde_json::to_vec(&schema) {
+                                    let new_schema_key =
+                                        format!("{}{}", crate::schema::SCHEMA_PREFIX, new_name);
+                                    let new_version = VersionedValue {
+                                        value: DbValue::Bytes(new_bytes),
+                                        creator_txid: 0,
+                                        expirer_txid: 0,
+                                    };
+                                    db.insert(new_schema_key, RwLock::new(vec![new_version]));
+                                }
                             }
                         }
                     }

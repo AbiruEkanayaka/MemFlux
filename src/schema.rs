@@ -184,25 +184,28 @@ pub async fn load_schemas_from_db(db: &Db, schema_cache: &SchemaCache) -> Result
     for item in db.iter() {
         let key = item.key();
         if key.starts_with(SCHEMA_PREFIX) {
-            let schema_result: Result<VirtualSchema, _> = match item.value() {
-                DbValue::Bytes(bytes) => serde_json::from_slice(bytes),
-                DbValue::Json(json_value) => serde_json::from_value(json_value.clone()),
-                _ => {
-                    eprintln!(
-                        "Warning: Schema key '{}' has non-JSON/Bytes value type. Skipping.",
-                        key
-                    );
-                    continue;
-                }
-            };
+            let version_chain = item.value().read().await;
+            if let Some(latest_version) = version_chain.last() {
+                let schema_result: Result<VirtualSchema, _> = match &latest_version.value {
+                    DbValue::Bytes(bytes) => serde_json::from_slice(bytes),
+                    DbValue::Json(json_value) => serde_json::from_value(json_value.clone()),
+                    _ => {
+                        eprintln!(
+                            "Warning: Schema key '{}' has non-JSON/Bytes value type. Skipping.",
+                            key
+                        );
+                        continue;
+                    }
+                };
 
-            match schema_result {
-                Ok(schema) => {
-                    let table_name = schema.table_name.clone();
-                    schema_cache.insert(table_name, Arc::new(schema));
-                }
-                Err(e) => {
-                    eprintln!("Failed to parse schema for key '{}': {}", key, e);
+                match schema_result {
+                    Ok(schema) => {
+                        let table_name = schema.table_name.clone();
+                        schema_cache.insert(table_name, Arc::new(schema));
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to parse schema for key '{}': {}", key, e);
+                    }
                 }
             }
         }
