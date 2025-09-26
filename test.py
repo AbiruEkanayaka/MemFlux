@@ -26,6 +26,7 @@ from tests.test_dml_enhancements import test_dml_enhancements
 from tests.test_dql_enhancements import test_dql_enhancements
 from tests.test_cte import test_cte
 from tests.test_transactions import test_transactions
+from tests.test_vacuum import test_vacuum
 
 
 # Add prompt_toolkit for better interactive input
@@ -91,6 +92,8 @@ def unit_test(conn, reader, mode, ffi_path=None):
         test_cte(conn, reader)
     if mode in ("transactions", "all"):
         test_transactions(conn, reader, ffi_path=ffi_path)
+    if mode in ("vacuum", "all"): # Add this block
+        test_vacuum(conn, reader, ffi_path=ffi_path)
     
     return conn, reader
 
@@ -174,7 +177,7 @@ if __name__ == "__main__":
                         print(f"Send: {send:.2f}ms, Latency: {lat:.2f}ms, Total: {tot:.2f}ms")
             elif parsed_args.command == "unit":
                 if not parsed_args.args:
-                    print("Usage: python test.py unit {json,byte,lists,sets,sql,snapshot,types,schema,aliases,case,like,functions,union,advanced,operators,indexing,recovery,wrongtype,constraints,ddl_enhancements,dml_enhancements,dql_enhancements,cte,transactions,all}")
+                    print("Usage: python test.py unit {json,byte,lists,sets,sql,snapshot,types,schema,aliases,case,like,functions,union,advanced,operators,indexing,recovery,wrongtype,constraints,ddl_enhancements,dml_enhancements,dql_enhancements,cte,transactions,vacuum,all}")
                     sys.exit(1)
                 mode = parsed_args.args[0]
                 conn, reader = unit_test(conn, reader, mode.lower(), ffi_path=parsed_args.ffi_path)

@@ -18,6 +18,7 @@ pub mod query_engine;
 pub mod schema;
 pub mod transaction;
 pub mod types;
+pub mod vacuum;
 
 // Public exports for the library API
 use crate::config::Config;
@@ -38,6 +39,8 @@ pub struct MemFluxDB {
     // The handle to the persistence engine's background task.
     // Kept to ensure the task is not dropped prematurely.
     _persistence_handle: Option<JoinHandle<()>>,
+    // The handle to the vacuum background task.
+    _vacuum_handle: Option<JoinHandle<()>>,
 }
 
 impl MemFluxDB {
@@ -169,9 +172,31 @@ impl MemFluxDB {
             }
         }
 
+        let vacuum_app_context = app_context.clone();
+        let vacuum_handle = tokio::spawn(async move {
+            // Run vacuum every 60 seconds.
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                println!("Running background vacuum...");
+                match vacuum::vacuum(&vacuum_app_context).await {
+                    Ok((versions, keys)) => {
+                        if versions > 0 || keys > 0 {
+                            println!(
+                                "Vacuum complete. Removed {} versions and {} keys.",
+                                versions, keys
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!("Error during background vacuum: {}", e),
+                }
+            }
+        });
+
         Ok(MemFluxDB {
             app_context,
             _persistence_handle: persistence_handle,
+            _vacuum_handle: Some(vacuum_handle),
         })
     }
 

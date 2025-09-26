@@ -9,6 +9,7 @@ use crate::indexing::Index;
 use crate::memory;
 use crate::transaction::{Transaction, TransactionHandle};
 use crate::types::*;
+use crate::vacuum;
 
 
 
@@ -48,7 +49,19 @@ pub async fn process_command(
         "BEGIN" => handle_begin(command, ctx, transaction_handle).await,
         "COMMIT" => handle_commit(command, ctx, transaction_handle).await,
         "ROLLBACK" => handle_rollback(command, ctx, transaction_handle).await,
+        "VACUUM" => handle_vacuum(ctx).await,
         _ => Response::Error(format!("Unknown command: {}", command.name)),
+    }
+}
+
+async fn handle_vacuum(ctx: &AppContext) -> Response {
+    match vacuum::vacuum(ctx).await {
+        Ok((versions_removed, keys_removed)) => Response::SimpleString(format!(
+            "Removed {} versions and {} keys",
+            versions_removed,
+            keys_removed
+        )),
+        Err(e) => Response::Error(format!("VACUUM failed: {}", e)),
     }
 }
 
