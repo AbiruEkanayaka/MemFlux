@@ -255,15 +255,21 @@ def send_resp_command(conn, reader, parts):
         total = (t2 - t0) * 1000
         return response_bytes.decode('utf-8', errors='replace'), send_time, latency, total
     else: # FFI mode
-        # In FFI mode, 'conn' is the cursor object itself.
-        cursor = conn
-        if parts[0].upper() == 'SQL':
-            command_str = " ".join(parts)
-        else:
-            command_str = shlex.join(parts)
+        # In FFI mode, 'conn' can be a Connection or a Cursor.
+        # For most tests, it's a Connection, and we should create a cursor per command.
+        # For transaction tests, it's a Cursor that's managed externally.
+        is_connection = isinstance(conn, memflux.Connection)
         
-        t0 = time.perf_counter()
+        cursor = None
         try:
+            cursor = conn.cursor() if is_connection else conn
+
+            if parts[0].upper() == 'SQL':
+                command_str = " ".join(parts)
+            else:
+                command_str = shlex.join(parts)
+            
+            t0 = time.perf_counter()
             cursor.execute(command_str)
             t1 = time.perf_counter()
             
@@ -276,16 +282,18 @@ def send_resp_command(conn, reader, parts):
             exec_time = (t1 - t0) * 1000
             total_time = (t2 - t0) * 1000
             
-            # The cursor must be closed by the test function that created it.
             return response_bytes.decode('utf-8', errors='replace'), exec_time, 0, total_time
 
         except memflux.DatabaseError as e:
             t1 = time.perf_counter()
             response_str = f"-ERR {e}\r\n"
             t2 = time.perf_counter()
-            exec_time = (t1 - t0) * 1000
+            exec_time = (t1 - t0) * 1000 if 't1' in locals() else 0
             total_time = (t2 - t0) * 1000
             return response_str, exec_time, 0, total_time
+        finally:
+            if is_connection and cursor:
+                cursor.close()
 
 def assert_eq(actual, expected, desc):
     if actual == expected:
