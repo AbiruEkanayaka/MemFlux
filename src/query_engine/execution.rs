@@ -27,6 +27,7 @@ macro_rules! log_and_wait_qe {
             let log_req = LogRequest {
                 entry: $entry,
                 ack: ack_tx,
+                durability: $ctx.config.durability.clone(),
             };
             if $logger.send(PersistenceRequest::Log(log_req)).await.is_err() {
                 Err(anyhow!("Persistence engine is down"))
@@ -1857,76 +1858,148 @@ pub fn execute<'a>(
                     Err(anyhow!("Transaction handle not provided for BEGIN"))?;
                 }
             }
-            PhysicalPlan::CommitTransaction => {
-                if let Some(handle) = transaction_handle {
-                    let tx = {
-                        let mut tx_guard = handle.write().await;
-                        match tx_guard.take() {
-                            Some(t) => t,
-                            None => Err(anyhow!("No transaction in progress"))?,
-                        }
-                    };
-
-                    // --- Write to WAL first ---
-                    if ctx.config.persistence {
-                        for entry in &tx.log_entries {
-                            let (ack_tx, ack_rx) = oneshot::channel();
-                            if ctx.logger.send(PersistenceRequest::Log(LogRequest { entry: entry.clone(), ack: ack_tx })).await.is_err() {
-                                ctx.tx_status_manager.abort(tx.txid);
-                                Err(anyhow!("Persistence engine is down, commit failed. Transaction rolled back."))?;
-                            }
-                            match ack_rx.await {
-                                Ok(Ok(())) => {} // Success
-                                Ok(Err(e)) => {
-                                    ctx.tx_status_manager.abort(tx.txid);
-                                    Err(anyhow!("WAL write error during commit: {}. Transaction rolled back.", e))?;
+                    PhysicalPlan::CommitTransaction => {
+                        if let Some(handle) = transaction_handle {
+                            let tx = {
+                                let mut tx_guard = handle.write().await;
+                                match tx_guard.take() {
+                                    Some(t) => t,
+                                    None => Err(anyhow!("No transaction in progress"))?,
                                 }
-                                Err(_) => {
-                                    ctx.tx_status_manager.abort(tx.txid);
-                                    Err(anyhow!("Persistence engine dropped ACK channel during commit. Transaction rolled back."))?;
-                                }
-                            }
-                        }
-                    }
-
-                    // --- Apply changes to in-memory DB ---
-                    for write_item in tx.writes.iter() {
-                        let key = write_item.key();
-                        let new_value_opt = write_item.value();
-
-                        let mut version_chain_lock = ctx.db.entry(key.clone()).or_default();
-                        let mut version_chain = version_chain_lock.value_mut().write().await;
-
-                        // Find the version that was visible to this transaction and expire it.
-                        for version in version_chain.iter_mut().rev() {
-                            if tx.snapshot.is_visible(version, &ctx.tx_status_manager) {
-                                if version.expirer_txid == 0 {
-                                    version.expirer_txid = tx.txid;
-                                }
-                                break; // Only expire the most recent visible version
-                            }
-                        }
-
-                        // Add the new version if it's an insert or update
-                        if let Some(new_db_value) = new_value_opt {
-                            let new_version = crate::types::VersionedValue {
-                                value: new_db_value.clone(),
-                                creator_txid: tx.txid,
-                                expirer_txid: 0,
                             };
-                            version_chain.push(new_version);
+            
+                            if ctx.config.durability == crate::config::DurabilityLevel::None && ctx.config.persistence {
+                                // --- Apply changes to in-memory DB FIRST ---
+                                for write_item in tx.writes.iter() {
+                                    let key = write_item.key();
+                                    let new_value_opt = write_item.value();
+            
+                                    let mut version_chain_lock = ctx.db.entry(key.clone()).or_default();
+                                    let mut version_chain = version_chain_lock.value_mut().write().await;
+            
+                                    // Find the version that was visible to this transaction and expire it.
+                                    for version in version_chain.iter_mut().rev() {
+                                        if tx.snapshot.is_visible(version, &ctx.tx_status_manager) {
+                                            if version.expirer_txid == 0 {
+                                                version.expirer_txid = tx.txid;
+                                            }
+                                            break; // Only expire the most recent visible version
+                                        }
+                                    }
+            
+                                    // Add the new version if it's an insert or update
+                                    if let Some(new_db_value) = new_value_opt {
+                                        let new_version = crate::types::VersionedValue {
+                                            value: new_db_value.clone(),
+                                            creator_txid: tx.txid,
+                                            expirer_txid: 0,
+                                        };
+                                        version_chain.push(new_version);
+                                    }
+                                }
+            
+                                // --- Mark transaction as committed ---
+                                ctx.tx_status_manager.commit(tx.txid);
+            
+                                // --- Log to WAL in background ---
+                                let logger = ctx.logger.clone();
+                                let log_entries = tx.log_entries; // move
+                                let txid = tx.txid;
+                                tokio::spawn(async move {
+                                    if !log_entries.is_empty() {
+                                        for entry in log_entries {
+                                            let (ack_tx, _ack_rx) = oneshot::channel();
+                                            let log_req = LogRequest {
+                                                entry,
+                                                ack: ack_tx,
+                                                durability: crate::config::DurabilityLevel::None,
+                                            };
+                                            if logger.send(PersistenceRequest::Log(log_req)).await.is_err() {
+                                                eprintln!("Error sending to persistence engine for committed tx {}", txid);
+                                            }
+                                        }
+                                    }
+                                });
+            
+                                println!("Transaction {} committed.", tx.txid);
+                                yield json!({ "status": "Transaction committed" });
+            
+                            } else {
+                                // Original logic for Fsync/Full
+                                // --- Write to WAL first ---
+                                if ctx.config.persistence {
+                                    let num_entries = tx.log_entries.len();
+                                    if num_entries > 0 {
+                                        for (i, entry) in tx.log_entries.iter().enumerate() {
+                                            // For the final entry, use the configured durability. For all others, use None.
+                                            let durability = if i == num_entries - 1 {
+                                                ctx.config.durability.clone()
+                                            } else {
+                                                crate::config::DurabilityLevel::None
+                                            };
+            
+                                            let (ack_tx, ack_rx) = oneshot::channel();
+                                            if ctx.logger.send(PersistenceRequest::Log(LogRequest { entry: entry.clone(), ack: ack_tx, durability })).await.is_err() {
+                                                ctx.tx_status_manager.abort(tx.txid);
+                                                Err(anyhow!("Persistence engine is down, commit failed. Transaction rolled back."))?;
+                                            }
+            
+                                            // Only wait for the ACK on the final, durable write.
+                                            if i == num_entries - 1 {
+                                                match ack_rx.await {
+                                                    Ok(Ok(())) => {} // Success
+                                                    Ok(Err(e)) => {
+                                                        ctx.tx_status_manager.abort(tx.txid);
+                                                        Err(anyhow!("WAL write error during commit: {}. Transaction rolled back.", e))?;
+                                                    }
+                                                    Err(_) => {
+                                                        ctx.tx_status_manager.abort(tx.txid);
+                                                        Err(anyhow!("Persistence engine dropped ACK channel during commit. Transaction rolled back."))?;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+            
+                                // --- Apply changes to in-memory DB ---
+                                for write_item in tx.writes.iter() {
+                                    let key = write_item.key();
+                                    let new_value_opt = write_item.value();
+            
+                                    let mut version_chain_lock = ctx.db.entry(key.clone()).or_default();
+                                    let mut version_chain = version_chain_lock.value_mut().write().await;
+            
+                                    // Find the version that was visible to this transaction and expire it.
+                                    for version in version_chain.iter_mut().rev() {
+                                        if tx.snapshot.is_visible(version, &ctx.tx_status_manager) {
+                                            if version.expirer_txid == 0 {
+                                                version.expirer_txid = tx.txid;
+                                            }
+                                            break; // Only expire the most recent visible version
+                                        }
+                                    }
+            
+                                    // Add the new version if it's an insert or update
+                                    if let Some(new_db_value) = new_value_opt {
+                                        let new_version = crate::types::VersionedValue {
+                                            value: new_db_value.clone(),
+                                            creator_txid: tx.txid,
+                                            expirer_txid: 0,
+                                        };
+                                        version_chain.push(new_version);
+                                    }
+                                }
+            
+                                // --- Mark transaction as committed ---
+                                ctx.tx_status_manager.commit(tx.txid);
+                                println!("Transaction {} committed.", tx.txid);
+                                yield json!({ "status": "Transaction committed" });
+                            }
+                        } else {
+                            Err(anyhow!("Transaction handle not provided for COMMIT"))?;
                         }
-                    }
-
-                    // --- Mark transaction as committed ---
-                    ctx.tx_status_manager.commit(tx.txid);
-                    println!("Transaction {} committed.", tx.txid);
-                    yield json!({"status": "Transaction committed"});
-                } else {
-                    Err(anyhow!("Transaction handle not provided for COMMIT"))?;
-                }
-            }
-            PhysicalPlan::RollbackTransaction => {
+                    }            PhysicalPlan::RollbackTransaction => {
                 if let Some(handle) = transaction_handle {
                     let mut tx_guard = handle.write().await;
                     if let Some(tx) = tx_guard.take() {

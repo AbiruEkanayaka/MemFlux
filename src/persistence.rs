@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use lz4_flex;
 use rayon::prelude::*;
 use std::io::{Read, Write};
@@ -198,14 +198,17 @@ impl PersistenceEngine {
                     };
 
                     let mut batch = vec![first_req];
+                    // Stop batching if we see a sync request or a full durability request
                     while batch.len() < 256 {
                         if let Ok(req) = self.receiver.try_recv() {
-                            if matches!(req, PersistenceRequest::Sync(_)) {
-                                // Stop batching if we see a sync request to ensure it acts as a barrier
-                                batch.push(req);
+                            let stop_batching = match &req {
+                                PersistenceRequest::Sync(_) => true,
+                                PersistenceRequest::Log(log_req) => log_req.durability == crate::config::DurabilityLevel::Full,
+                            };
+                            batch.push(req);
+                            if stop_batching {
                                 break;
                             }
-                            batch.push(req);
                         } else {
                             break;
                         }
@@ -213,13 +216,16 @@ impl PersistenceEngine {
 
                     let mut log_requests = Vec::new();
                     let mut sync_requests = Vec::new();
-                    let mut has_sync = false;
+                    let mut highest_durability = crate::config::DurabilityLevel::None;
 
                     write_buffer.clear();
 
                     for req in batch {
                         match req {
                             PersistenceRequest::Log(log_req) => {
+                                if log_req.durability > highest_durability {
+                                    highest_durability = log_req.durability.clone();
+                                }
                                 match bincode::serialize(&log_req.entry) {
                                     Ok(data) => {
                                         let len = data.len() as u32;
@@ -233,27 +239,33 @@ impl PersistenceEngine {
                                 }
                             }
                             PersistenceRequest::Sync(sync_ack) => {
-                                has_sync = true;
+                                highest_durability = crate::config::DurabilityLevel::Full;
                                 sync_requests.push(sync_ack);
                             }
                         }
                     }
 
                     let write_result = if !write_buffer.is_empty() {
-                        file.write_all(&write_buffer).await.map_err(|e| anyhow!(e))
+                        file.write_all(&write_buffer).await
                     } else {
                         Ok(())
                     };
 
-                    let final_result = if write_result.is_ok() && has_sync {
-                        file.sync_all().await.map_err(|e| anyhow!(e))
+                    let final_result = if write_result.is_ok() {
+                        match highest_durability {
+                            crate::config::DurabilityLevel::Full => {
+                                file.sync_all().await
+                            }
+                            crate::config::DurabilityLevel::Fsync | crate::config::DurabilityLevel::None => {
+                                // For both Fsync and None, we acknowledge after the OS write.
+                                // The background fsync loop will handle flushing to disk.
+                                let _ = fsync_notify_tx.try_send(());
+                                Ok(())
+                            }
+                        }
                     } else {
                         write_result
                     };
-
-                    if final_result.is_ok() && !has_sync {
-                         let _ = fsync_notify_tx.try_send(());
-                    }
 
                     let result_for_ack = final_result.map_err(|e| e.to_string());
 

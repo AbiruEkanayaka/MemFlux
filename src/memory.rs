@@ -427,6 +427,7 @@ impl MemoryManager {
                         .send(PersistenceRequest::Log(LogRequest {
                             entry: log_entry,
                             ack: ack_tx,
+                            durability: ctx.config.durability.clone(),
                         }))
                         .await
                         .is_err()

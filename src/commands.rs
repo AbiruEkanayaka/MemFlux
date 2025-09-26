@@ -4,6 +4,7 @@ use std::collections::{HashSet, VecDeque};
 use std::str;
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
+use crate::config::DurabilityLevel;
 use crate::indexing::Index;
 use crate::memory;
 use crate::transaction::{Transaction, TransactionHandle};
@@ -52,10 +53,27 @@ pub async fn process_command(
 }
 
 async fn log_to_wal(log_entry: LogEntry, ctx: &AppContext) -> Response {
+    if ctx.config.durability == DurabilityLevel::None && ctx.config.persistence {
+        let logger = ctx.logger.clone();
+        tokio::spawn(async move {
+            let (ack_tx, _ack_rx) = oneshot::channel();
+            let log_req = LogRequest {
+                entry: log_entry,
+                ack: ack_tx,
+                durability: DurabilityLevel::None,
+            };
+            if logger.send(PersistenceRequest::Log(log_req)).await.is_err() {
+                eprintln!("Error sending to persistence engine with 'none' durability.");
+            }
+        });
+        return Response::Ok;
+    }
+
     let (ack_tx, ack_rx) = oneshot::channel();
     let log_req = LogRequest {
         entry: log_entry,
         ack: ack_tx,
+        durability: ctx.config.durability.clone(),
     };
     if ctx
         .logger
@@ -2021,37 +2039,50 @@ async fn handle_commit(
 
     // --- Write to WAL first ---
     if ctx.config.persistence {
-        for entry in &tx.log_entries {
-            let (ack_tx, ack_rx) = oneshot::channel();
-            if ctx
-                .logger
-                .send(PersistenceRequest::Log(LogRequest {
-                    entry: entry.clone(),
-                    ack: ack_tx,
-                }))
-                .await
-                .is_err()
-            {
-                ctx.tx_status_manager.abort(tx.txid);
-                return Response::Error(
-                    "Persistence engine is down, commit failed. Transaction rolled back.".to_string(),
-                );
-            }
-            match ack_rx.await {
-                Ok(Ok(())) => {} // Success
-                Ok(Err(e)) => {
-                    ctx.tx_status_manager.abort(tx.txid);
-                    return Response::Error(format!(
-                        "WAL write error during commit: {}. Transaction rolled back.",
-                        e
-                    ));
-                }
-                Err(_) => {
+        let num_entries = tx.log_entries.len();
+        if num_entries > 0 {
+            for (i, entry) in tx.log_entries.iter().enumerate() {
+                let durability = if i == num_entries - 1 {
+                    ctx.config.durability.clone()
+                } else {
+                    crate::config::DurabilityLevel::None
+                };
+
+                let (ack_tx, ack_rx) = oneshot::channel();
+                if ctx
+                    .logger
+                    .send(PersistenceRequest::Log(LogRequest {
+                        entry: entry.clone(),
+                        ack: ack_tx,
+                        durability,
+                    }))
+                    .await
+                    .is_err()
+                {
                     ctx.tx_status_manager.abort(tx.txid);
                     return Response::Error(
-                        "Persistence engine dropped ACK channel during commit. Transaction rolled back."
-                            .to_string(),
+                        "Persistence engine is down, commit failed. Transaction rolled back.".to_string(),
                     );
+                }
+
+                if i == num_entries - 1 {
+                    match ack_rx.await {
+                        Ok(Ok(())) => {} // Success
+                        Ok(Err(e)) => {
+                            ctx.tx_status_manager.abort(tx.txid);
+                            return Response::Error(format!(
+                                "WAL write error during commit: {}. Transaction rolled back.",
+                                e
+                            ));
+                        }
+                        Err(_) => {
+                            ctx.tx_status_manager.abort(tx.txid);
+                            return Response::Error(
+                                "Persistence engine dropped ACK channel during commit. Transaction rolled back."
+                                    .to_string(),
+                            );
+                        }
+                    }
                 }
             }
         }

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use uuid::Uuid;
 
-use crate::config::Config;
+use crate::config::{Config, DurabilityLevel};
 use crate::indexing::IndexManager;
 use crate::memory::MemoryManager;
 use crate::query_engine::ast::SelectStatement;
@@ -297,6 +297,7 @@ pub enum PersistenceRequest {
 pub struct LogRequest {
     pub entry: LogEntry,
     pub ack: oneshot::Sender<Result<(), String>>,
+    pub durability: DurabilityLevel,
 }
 
 // --- Type Aliases ---
