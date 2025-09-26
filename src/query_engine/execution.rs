@@ -1852,7 +1852,9 @@ pub fn execute<'a>(
                     if tx_guard.is_some() {
                         Err(anyhow!("Transaction already in progress"))?;
                     }
-                    *tx_guard = Some(Transaction::new(&ctx.tx_id_manager, &ctx.tx_status_manager));
+                    let new_tx = Transaction::new(&ctx.tx_id_manager, &ctx.tx_status_manager);
+                    println!("Transaction {} started.", new_tx.id);
+                    *tx_guard = Some(new_tx);
                     yield json!({"status": "Transaction started"});
                 } else {
                     Err(anyhow!("Transaction handle not provided for BEGIN"))?;
@@ -1904,7 +1906,7 @@ pub fn execute<'a>(
                                 // --- Log to WAL in background ---
                                 let logger = ctx.logger.clone();
                                 let log_entries = tx.log_entries; // move
-                                let txid = tx.txid;
+                                let tx_id = tx.id;
                                 tokio::spawn(async move {
                                     if !log_entries.is_empty() {
                                         for entry in log_entries {
@@ -1915,13 +1917,13 @@ pub fn execute<'a>(
                                                 durability: crate::config::DurabilityLevel::None,
                                             };
                                             if logger.send(PersistenceRequest::Log(log_req)).await.is_err() {
-                                                eprintln!("Error sending to persistence engine for committed tx {}", txid);
+                                                eprintln!("Error sending to persistence engine for committed tx {}", tx_id);
                                             }
                                         }
                                     }
                                 });
             
-                                println!("Transaction {} committed.", tx.txid);
+                                println!("Transaction {} committed.", tx.id);
                                 yield json!({ "status": "Transaction committed" });
             
                             } else {
@@ -1993,7 +1995,7 @@ pub fn execute<'a>(
             
                                 // --- Mark transaction as committed ---
                                 ctx.tx_status_manager.commit(tx.txid);
-                                println!("Transaction {} committed.", tx.txid);
+                                println!("Transaction {} committed.", tx.id);
                                 yield json!({ "status": "Transaction committed" });
                             }
                         } else {
@@ -2004,7 +2006,7 @@ pub fn execute<'a>(
                     let mut tx_guard = handle.write().await;
                     if let Some(tx) = tx_guard.take() {
                         ctx.tx_status_manager.abort(tx.txid);
-                        println!("Transaction {} rolled back.", tx.txid);
+                        println!("Transaction {} rolled back.", tx.id);
                         yield json!({"status": "Transaction rolled back"});
                     } else {
                         Err(anyhow!("No transaction in progress"))?;

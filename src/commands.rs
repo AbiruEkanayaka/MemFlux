@@ -2009,107 +2009,86 @@ async fn handle_begin(
     if command.args.len() != 1 {
         return Response::Error("BEGIN takes no arguments".to_string());
     }
-
     let mut tx_guard = transaction_handle.write().await;
     if tx_guard.is_some() {
         return Response::Error("Transaction already in progress".to_string());
     }
-
     let new_tx = Transaction::new(&ctx.tx_id_manager, &ctx.tx_status_manager);
-    println!("Transaction {} started.", new_tx.txid);
+    println!("Transaction {} started.", new_tx.id);
     *tx_guard = Some(new_tx);
-
     Response::Ok
 }
-
-
 
 async fn handle_commit(
     _command: Command,
     ctx: &AppContext,
     transaction_handle: TransactionHandle,
 ) -> Response {
-    let tx = {
-        let mut tx_guard = transaction_handle.write().await;
-        match tx_guard.take() {
-            Some(t) => t,
-            None => return Response::Error("No transaction in progress".to_string()),
-        }
+    let mut tx_guard = transaction_handle.write().await;
+    let tx = match tx_guard.take() {
+        Some(tx) => tx,
+        None => return Response::Error("No transaction in progress".to_string()),
     };
 
-    // --- Write to WAL first ---
+    // --- Persistence ---
     if ctx.config.persistence {
-        let num_entries = tx.log_entries.len();
-        if num_entries > 0 {
-            for (i, entry) in tx.log_entries.iter().enumerate() {
-                let durability = if i == num_entries - 1 {
-                    ctx.config.durability.clone()
-                } else {
-                    crate::config::DurabilityLevel::None
-                };
+        let log_entry = LogEntry::CommitTransaction { id: tx.id };
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let log_req = LogRequest {
+            entry: log_entry,
+            ack: ack_tx,
+            durability: ctx.config.durability.clone(),
+        };
 
-                let (ack_tx, ack_rx) = oneshot::channel();
-                if ctx
-                    .logger
-                    .send(PersistenceRequest::Log(LogRequest {
-                        entry: entry.clone(),
-                        ack: ack_tx,
-                        durability,
-                    }))
-                    .await
-                    .is_err()
-                {
-                    ctx.tx_status_manager.abort(tx.txid);
-                    return Response::Error(
-                        "Persistence engine is down, commit failed. Transaction rolled back.".to_string(),
-                    );
-                }
+        if ctx.logger.send(PersistenceRequest::Log(log_req)).await.is_err() {
+            // Rollback if the persistence layer is down
+            ctx.tx_status_manager.abort(tx.txid);
+            *tx_guard = None; // Ensure the transaction is gone
+            return Response::Error(
+                "Persistence engine is down, commit failed. Transaction rolled back.".to_string(),
+            );
+        }
 
-                if i == num_entries - 1 {
-                    match ack_rx.await {
-                        Ok(Ok(())) => {} // Success
-                        Ok(Err(e)) => {
-                            ctx.tx_status_manager.abort(tx.txid);
-                            return Response::Error(format!(
-                                "WAL write error during commit: {}. Transaction rolled back.",
-                                e
-                            ));
-                        }
-                        Err(_) => {
-                            ctx.tx_status_manager.abort(tx.txid);
-                            return Response::Error(
-                                "Persistence engine dropped ACK channel during commit. Transaction rolled back."
-                                    .to_string(),
-                            );
-                        }
-                    }
-                }
+        match ack_rx.await {
+            Ok(Ok(())) => { /* Continue to commit */ }
+            Ok(Err(e)) => {
+                ctx.tx_status_manager.abort(tx.txid);
+                *tx_guard = None;
+                return Response::Error(format!(
+                    "WAL write error during commit: {}. Transaction rolled back.",
+                    e
+                ));
+            }
+            Err(_) => {
+                ctx.tx_status_manager.abort(tx.txid);
+                *tx_guard = None;
+                return Response::Error(
+                    "Persistence engine dropped ACK channel during commit. Transaction rolled back."
+                        .to_string(),
+                );
             }
         }
     }
 
-    // --- Apply changes to in-memory DB ---
-    for write_item in tx.writes.iter() {
-        let key = write_item.key();
-        let new_value_opt = write_item.value();
 
+    // --- Apply changes to in-memory DB ---
+    for item in tx.writes.iter() {
+        let key = item.key();
+        let value = item.value();
         let mut version_chain_lock = ctx.db.entry(key.clone()).or_default();
         let mut version_chain = version_chain_lock.value_mut().write().await;
 
         // Find the version that was visible to this transaction and expire it.
-        for version in version_chain.iter_mut().rev() {
-            if tx.snapshot.is_visible(version, &ctx.tx_status_manager) {
-                if version.expirer_txid == 0 {
-                    version.expirer_txid = tx.txid;
-                }
-                break; // Only expire the most recent visible version
-            }
+        if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| {
+            tx.snapshot
+                .is_visible(v, &ctx.tx_status_manager)
+        }) {
+            latest_version.expirer_txid = tx.txid;
         }
 
-        // Add the new version if it's an insert or update
-        if let Some(new_db_value) = new_value_opt {
+        if let Some(db_value) = value {
             let new_version = VersionedValue {
-                value: new_db_value.clone(),
+                value: db_value.clone(),
                 creator_txid: tx.txid,
                 expirer_txid: 0,
             };
@@ -2119,22 +2098,22 @@ async fn handle_commit(
 
     // --- Mark transaction as committed ---
     ctx.tx_status_manager.commit(tx.txid);
-    println!("Transaction {} committed.", tx.txid);
+    println!("Transaction {} committed.", tx.id);
 
     Response::Ok
 }
 
 async fn handle_rollback(
     command: Command,
-    _ctx: &AppContext,
+    ctx: &AppContext,
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() != 1 {
         return Response::Error("ROLLBACK takes no arguments".to_string());
     }
-
     let mut tx_guard = transaction_handle.write().await;
     if let Some(tx) = tx_guard.take() {
+        ctx.tx_status_manager.abort(tx.txid);
         println!("Transaction {} rolled back.", tx.id);
         Response::Ok
     } else {
