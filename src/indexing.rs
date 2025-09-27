@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::commands::json_path_to_pointer;
+use crate::storage_executor::json_path_to_pointer;
 
 pub type Index = RwLock<BTreeMap<String, HashSet<String>>>;
 

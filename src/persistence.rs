@@ -504,7 +504,7 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                         };
 
                         let inner_path = parts.next().unwrap_or("");
-                        let pointer = crate::commands::json_path_to_pointer(inner_path);
+                        let pointer = crate::storage_executor::json_path_to_pointer(inner_path);
                         if pointer.is_empty() {
                             current_val = value;
                         } else if let Some(target) = current_val.pointer_mut(&pointer) {
@@ -534,7 +534,7 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                             } else {
                                 let mut pointer_parts: Vec<&str> = inner_path.split('.').collect();
                                 let final_key = pointer_parts.pop().unwrap();
-                                let parent_pointer = crate::commands::json_path_to_pointer(&pointer_parts.join("."));
+                                let parent_pointer = crate::storage_executor::json_path_to_pointer(&pointer_parts.join("."));
 
                                 if let Some(target) = current_val.pointer_mut(&parent_pointer) {
                                     if let Some(obj) = target.as_object_mut() {

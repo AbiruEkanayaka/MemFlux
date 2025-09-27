@@ -1,15 +1,14 @@
 
-use serde_json::{json, Value};
-use std::collections::{HashSet, VecDeque};
-use std::str;
-use std::sync::Arc;
-use tokio::sync::{oneshot, RwLock};
-use crate::config::DurabilityLevel;
-use crate::indexing::Index;
-use crate::memory;
+use crate::storage_executor::{get_visible_db_value, json_path_to_pointer, StorageExecutor};
 use crate::transaction::{Transaction, TransactionHandle};
 use crate::types::*;
 use crate::vacuum;
+use serde_json::Value;
+use std::collections::HashSet;
+use std::str;
+use std::sync::Arc;
+use tokio::sync::oneshot;
+use crate::indexing::Index;
 
 
 
@@ -66,43 +65,7 @@ async fn handle_vacuum(ctx: &AppContext) -> Response {
     }
 }
 
-async fn log_to_wal(log_entry: LogEntry, ctx: &AppContext) -> Response {
-    if ctx.config.durability == DurabilityLevel::None && ctx.config.persistence {
-        let logger = ctx.logger.clone();
-        tokio::spawn(async move {
-            let (ack_tx, _ack_rx) = oneshot::channel();
-            let log_req = LogRequest {
-                entry: log_entry,
-                ack: ack_tx,
-                durability: DurabilityLevel::None,
-            };
-            if logger.send(PersistenceRequest::Log(log_req)).await.is_err() {
-                eprintln!("Error sending to persistence engine with 'none' durability.");
-            }
-        });
-        return Response::Ok;
-    }
 
-    let (ack_tx, ack_rx) = oneshot::channel();
-    let log_req = LogRequest {
-        entry: log_entry,
-        ack: ack_tx,
-        durability: ctx.config.durability.clone(),
-    };
-    if ctx
-        .logger
-        .send(PersistenceRequest::Log(log_req))
-        .await
-        .is_err()
-    {
-        return Response::Error("Persistence engine is down".to_string());
-    }
-    match ack_rx.await {
-        Ok(Ok(())) => Response::Ok,
-        Ok(Err(e)) => Response::Error(format!("WAL write error: {}", e)),
-        Err(_) => Response::Error("Persistence engine dropped ACK channel".to_string()),
-    }
-}
 
 async fn db_value_to_response(value: &DbValue, key: &str, ctx: &AppContext) -> Response {
     if ctx.memory.is_enabled() {
@@ -120,60 +83,7 @@ async fn db_value_to_response(value: &DbValue, key: &str, ctx: &AppContext) -> R
     }
 }
 
-pub async fn get_visible_db_value<'a>(
-    key: &str,
-    ctx: &'a AppContext,
-    tx: Option<&Transaction>,
-) -> Option<DbValue> {
-    if let Some(tx) = tx {
-        // 1. Check writes cache (read-your-writes)
-        if let Some(entry) = tx.writes.get(key) {
-            return entry.value().clone();
-        }
 
-        // 2. Read from main DB using snapshot visibility
-        if let Some(version_chain_lock) = ctx.db.get(key) {
-            let version_chain = version_chain_lock.read().await;
-            for version in version_chain.iter().rev() {
-                if tx.snapshot.is_visible(version, &ctx.tx_status_manager) {
-                    if ctx.memory.is_enabled() {
-                        ctx.memory.track_access(key).await;
-                    }
-                    return Some(version.value.clone());
-                }
-            }
-        }
-        return None; // No visible version found
-    }
-
-    // No transaction, read the latest committed version.
-    if let Some(version_chain_lock) = ctx.db.get(key) {
-        let version_chain = version_chain_lock.read().await;
-        for version in version_chain.iter().rev() {
-            if ctx.tx_status_manager.get_status(version.creator_txid)
-                == Some(TransactionStatus::Committed)
-            {
-                if version.expirer_txid == 0
-                    || ctx
-                        .tx_status_manager
-                        .get_status(version.expirer_txid)
-                        != Some(TransactionStatus::Committed)
-                {
-                    // It's visible
-                    if ctx.memory.is_enabled() {
-                        ctx.memory.track_access(key).await;
-                    }
-                    return Some(version.value.clone());
-                } else {
-                    // It was created by a committed transaction, but also expired by a committed transaction.
-                    // So it's not visible, and no older version can be either.
-                    return None;
-                }
-            }
-        }
-    }
-    None
-}
 
 async fn handle_get(
     command: Command,
@@ -209,80 +119,8 @@ async fn handle_set(
     };
     let value = command.args[2].clone();
 
-    let log_entry = LogEntry::SetBytes {
-        key: key.clone(),
-        value: value.clone(),
-    };
-
-    let mut tx_guard = transaction_handle.write().await;
-    if let Some(tx) = tx_guard.as_mut() {
-        tx.log_entries.push(log_entry);
-        tx.writes
-            .insert(key.clone(), Some(DbValue::Bytes(value.clone())));
-        return Response::Ok;
-    }
-    drop(tx_guard);
-
-    // Non-transactional SET: a single, atomic, auto-committed operation.
-    let txid = ctx.tx_id_manager.new_txid();
-    ctx.tx_status_manager.begin(txid);
-
-    // --- Memory and WAL --- 
-    let mut old_size = 0;
-    if let Some(version_chain_lock) = ctx.db.get(&key) {
-        let version_chain = version_chain_lock.read().await;
-        if let Some(latest_version) = version_chain.last() {
-            if ctx.tx_status_manager.get_status(latest_version.creator_txid) == Some(TransactionStatus::Committed) {
-                 old_size = key.len() as u64 + memory::estimate_db_value_size(&latest_version.value).await;
-            }
-        }
-    }
-
-    if ctx.memory.is_enabled() {
-        let new_size = key.len() as u64 + value.len() as u64;
-        let needed = new_size.saturating_sub(old_size);
-        if let Err(e) = ctx.memory.ensure_memory_for(needed, ctx).await {
-            ctx.tx_status_manager.abort(txid);
-            return Response::Error(e.to_string());
-        }
-    }
-
-    let ack_response = log_to_wal(log_entry, ctx).await;
-    if !matches!(ack_response, Response::Ok) {
-        ctx.tx_status_manager.abort(txid);
-        return ack_response;
-    }
-
-    // --- Apply changes to in-memory DB ---
-    let mut version_chain_lock = ctx.db.entry(key.clone()).or_default();
-    let mut version_chain = version_chain_lock.value_mut().write().await;
-
-    // Expire previous latest committed version
-    if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| {
-        v.expirer_txid == 0
-            && ctx.tx_status_manager.get_status(v.creator_txid) == Some(TransactionStatus::Committed)
-    }) {
-        latest_version.expirer_txid = txid;
-    }
-
-    let new_version = VersionedValue {
-        value: DbValue::Bytes(value.clone()),
-        creator_txid: txid,
-        expirer_txid: 0,
-    };
-    version_chain.push(new_version);
-
-    let new_size = key.len() as u64 + value.len() as u64;
-    ctx.memory.decrease_memory(old_size);
-    ctx.memory.increase_memory(new_size);
-    if ctx.memory.is_enabled() {
-        ctx.memory.track_access(&key).await;
-    }
-
-    ctx.tx_status_manager.commit(txid);
-
-    Response::Ok
-}
+    let executor = StorageExecutor::new(ctx.clone().into(), transaction_handle);
+    executor.set(key, value).await}
 
 async fn handle_delete(
     command: Command,
@@ -293,86 +131,20 @@ async fn handle_delete(
         return Response::Error("DELETE requires at least one argument".to_string());
     }
 
-    let mut tx_guard = transaction_handle.write().await;
-    if let Some(tx) = tx_guard.as_mut() {
-        let mut deleted_count = 0;
-        for key_bytes in &command.args[1..] {
-            if let Ok(key) = String::from_utf8(key_bytes.clone()) {
-                tx.log_entries.push(LogEntry::Delete { key: key.clone() });
-                tx.writes.insert(key, None);
-                deleted_count += 1;
-            }
-        }
-        return Response::Integer(deleted_count);
+    let keys: Vec<String> = command.args[1..]
+        .iter()
+        .filter_map(|arg| String::from_utf8(arg.clone()).ok())
+        .collect();
+
+    if keys.is_empty() && command.args.len() > 1 {
+        return Response::Error("Invalid key(s) provided".to_string());
     }
-    drop(tx_guard);
 
-    let mut deleted_count = 0;
-    for key_bytes in &command.args[1..] {
-        let key = match String::from_utf8(key_bytes.clone()) {
-            Ok(k) => k,
-            Err(_) => continue,
-        };
-
-        let txid = ctx.tx_id_manager.new_txid();
-        ctx.tx_status_manager.begin(txid);
-
-        let log_entry = LogEntry::Delete { key: key.clone() };
-        let ack_response = log_to_wal(log_entry, ctx).await;
-        if !matches!(ack_response, Response::Ok) {
-            ctx.tx_status_manager.abort(txid);
-            // Should we stop or continue? For now, continue with next key.
-            continue;
-        }
-
-        let mut old_size = 0;
-        let mut old_value_for_index: Option<Value> = None;
-
-        if let Some(version_chain_lock) = ctx.db.get(&key) {
-            let mut version_chain = version_chain_lock.value().write().await;
-            let mut expired_something = false;
-            if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| {
-                v.expirer_txid == 0
-                    && ctx.tx_status_manager.get_status(v.creator_txid)
-                        == Some(TransactionStatus::Committed)
-            }) {
-                latest_version.expirer_txid = txid;
-                expired_something = true;
-
-                old_size = key.len() as u64 + memory::estimate_db_value_size(&latest_version.value).await;
-                old_value_for_index = match &latest_version.value {
-                    DbValue::Json(v) => Some(v.clone()),
-                    DbValue::JsonB(b) => serde_json::from_slice(&b).ok(),
-                    _ => None,
-                };
-            }
-
-            if expired_something {
-                ctx.memory.decrease_memory(old_size);
-                if ctx.memory.is_enabled() {
-                    ctx.memory.forget_key(&key).await;
-                }
-                if let Some(ref old_val) = old_value_for_index {
-                    ctx.index_manager
-                        .remove_key_from_indexes(&key, old_val)
-                        .await;
-                }
-                deleted_count += 1;
-            }
-        }
-
-        ctx.tx_status_manager.commit(txid);
-    }
-    Response::Integer(deleted_count)
+let executor = StorageExecutor::new(ctx.clone().into(), transaction_handle);
+    return executor.delete(keys).await;
 }
 
-pub fn json_path_to_pointer(path: &str) -> String {
-    if path == "." || path.is_empty() {
-        return "".to_string();
-    }
-    let p = path.strip_prefix('.').unwrap_or(path);
-    format!("/{}", p.replace('.', "/"))
-}
+
 
 async fn handle_json_set(
     command: Command,
@@ -399,7 +171,11 @@ async fn handle_json_set(
             String::from_utf8_lossy(&command.args[3]).to_string(),
         )
     } else {
-        return Response::Error(format!("JSON.SET requires 2 or 3 arguments, got {}. Args: {:?}", command.args.len() - 1, command.args.iter().skip(1).map(|a| String::from_utf8_lossy(a).to_string()).collect::<Vec<String>>()));
+        return Response::Error(format!(
+            "JSON.SET requires 2 or 3 arguments, got {}. Args: {:?}",
+            command.args.len() - 1,
+            command.args.iter().skip(1).map(|a| String::from_utf8_lossy(a).to_string()).collect::<Vec<String>>()
+        ));
     };
 
     let mut parts = full_path.splitn(2, '.');
@@ -414,156 +190,8 @@ async fn handle_json_set(
         Err(_) => return Response::Error("Value is not valid JSON".to_string()),
     };
 
-    // --- TRANSACTION LOGIC FIRST ---
-    let mut tx_guard = transaction_handle.write().await;
-    if let Some(tx) = tx_guard.as_mut() {
-        let log_entry = LogEntry::JsonSet {
-            path: full_path.clone(),
-            value: value_str.to_string(),
-        };
-        tx.log_entries.push(log_entry);
-
-        let current_db_val = get_visible_db_value(&key, ctx, Some(tx)).await;
-
-        let mut current_val = match current_db_val {
-            Some(DbValue::Json(v)) => v.clone(),
-            Some(DbValue::JsonB(b)) => serde_json::from_slice(&b).unwrap_or(json!({})),
-            Some(_) => {
-                return Response::Error("WRONGTYPE Operation against a non-JSON value".to_string())
-            }
-            _ => json!({}),
-        };
-
-        let pointer = if path == "." || path.is_empty() { "".to_string() } else { json_path_to_pointer(&path) };
-        if pointer.is_empty() {
-            current_val = value;
-        } else if let Some(target) = current_val.pointer_mut(&pointer) {
-            *target = value;
-        } else {
-            let mut current = &mut current_val;
-            for part in path.split('.') {
-                if part.is_empty() { continue; }
-                if current.is_object() {
-                    current = current.as_object_mut().unwrap().entry(part).or_insert(json!({}));
-                }
-                else {
-                    return Response::Error("Path creation failed: part is not an object".to_string());
-                }
-            }
-            *current = value;
-        }
-
-        let new_value_bytes = match serde_json::to_vec(&current_val) {
-            Ok(b) => b,
-            Err(_) => return Response::Error("Failed to serialize new JSON value".to_string()),
-        };
-
-        tx.writes
-            .insert(key, Some(DbValue::JsonB(new_value_bytes)));
-
-        return Response::Ok;
-    }
-    drop(tx_guard);
-    
-    // --- Non-transactional JSON.SET ---
-    let txid = ctx.tx_id_manager.new_txid();
-    ctx.tx_status_manager.begin(txid);
-
-    let mut version_chain_lock = ctx.db.entry(key.clone()).or_default();
-    let mut version_chain = version_chain_lock.value_mut().write().await;
-
-    let mut old_size = 0;
-    let mut old_val_for_index = json!({});
-
-    let mut current_val = if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| {
-        v.expirer_txid == 0
-            && ctx.tx_status_manager.get_status(v.creator_txid) == Some(TransactionStatus::Committed)
-    }) {
-        latest_version.expirer_txid = txid;
-        old_size = key.len() as u64 + memory::estimate_db_value_size(&latest_version.value).await;
-        match &latest_version.value {
-            DbValue::Json(v) => {
-                old_val_for_index = v.clone();
-                v.clone()
-            }
-            DbValue::JsonB(b) => {
-                let v: Value = serde_json::from_slice(b).unwrap_or_default();
-                old_val_for_index = v.clone();
-                v
-            }
-            _ => return Response::Error("WRONGTYPE Operation against a non-JSON value".to_string()),
-        }
-    } else {
-        json!({})
-    };
-
-    let pointer = if path == "." || path.is_empty() { "".to_string() } else { json_path_to_pointer(&path) };
-    if pointer.is_empty() {
-        current_val = value;
-    } else if let Some(target) = current_val.pointer_mut(&pointer) {
-        *target = value;
-    } else {
-        let mut current = &mut current_val;
-        for part in path.split('.') {
-            if part.is_empty() { continue; }
-            if current.is_object() {
-                current = current.as_object_mut().unwrap().entry(part).or_insert(json!({}));
-            }
-            else {
-                return Response::Error("Path creation failed: part is not an object".to_string());
-            }
-        }
-        *current = value;
-    }
-
-    let new_value_bytes = match serde_json::to_vec(&current_val) {
-        Ok(b) => b,
-        Err(_) => return Response::Error("Failed to serialize new JSON value".to_string()),
-    };
-
-    let log_entry = LogEntry::SetJsonB {
-        key: key.clone(),
-        value: new_value_bytes.clone(),
-    };
-
-    if ctx.memory.is_enabled() {
-        let new_size = key.len() as u64 + new_value_bytes.len() as u64;
-        let needed = new_size.saturating_sub(old_size);
-        if let Err(e) = ctx.memory.ensure_memory_for(needed, ctx).await {
-            ctx.tx_status_manager.abort(txid);
-            return Response::Error(e.to_string());
-        }
-    }
-
-    let ack_response = log_to_wal(log_entry, ctx).await;
-    if !matches!(ack_response, Response::Ok) {
-        ctx.tx_status_manager.abort(txid);
-        return ack_response;
-    }
-
-    let new_version = VersionedValue {
-        value: DbValue::JsonB(new_value_bytes.clone()),
-        creator_txid: txid,
-        expirer_txid: 0,
-    };
-    version_chain.push(new_version);
-
-    let new_size = key.len() as u64 + new_value_bytes.len() as u64;
-    ctx.memory.decrease_memory(old_size);
-    ctx.memory.increase_memory(new_size);
-    if ctx.memory.is_enabled() {
-        ctx.memory.track_access(&key).await;
-    }
-
-    ctx.index_manager
-        .remove_key_from_indexes(&key, &old_val_for_index)
-        .await;
-    ctx.index_manager
-        .add_key_to_indexes(&key, &current_val)
-        .await;
-
-    ctx.tx_status_manager.commit(txid);
-    Response::Ok
+    let executor = StorageExecutor::new(ctx.clone().into(), transaction_handle);
+    executor.json_set(key, path, value).await
 }
 
 async fn handle_json_get(
@@ -685,175 +313,8 @@ async fn handle_json_del(
     };
     let inner_path = parts.next().unwrap_or("");
 
-    let mut tx_guard = transaction_handle.write().await;
-    if let Some(tx) = tx_guard.as_mut() {
-        let log_entry = if inner_path.is_empty() || inner_path == "." {
-            LogEntry::Delete { key: key.clone() }
-        } else {
-            LogEntry::JsonDelete { path: path.clone() }
-        };
-        tx.log_entries.push(log_entry);
-
-        if inner_path.is_empty() || inner_path == "." {
-            tx.writes.insert(key.clone(), None);
-        } else {
-            let current_db_val = get_visible_db_value(&key, ctx, Some(tx)).await;
-
-            let mut current_val = match current_db_val {
-                Some(DbValue::Json(v)) => v.clone(),
-                Some(DbValue::JsonB(b)) => serde_json::from_slice(&b).unwrap_or(json!({})),
-                Some(_) => {
-                    return Response::Error(
-                        "WRONGTYPE Operation against a non-JSON value".to_string(),
-                    )
-                }
-                _ => json!({}), // Key doesn't exist, so deletion is a no-op
-            };
-
-            let mut pointer_parts: Vec<&str> = inner_path.split('.').collect();
-            let final_key = pointer_parts.pop().unwrap();
-            let parent_pointer = json_path_to_pointer(&pointer_parts.join("."));
-            let mut modified = false;
-
-            if let Some(target) = current_val.pointer_mut(&parent_pointer) {
-                if let Some(obj) = target.as_object_mut() {
-                    if obj.remove(final_key).is_some() {
-                        modified = true;
-                    }
-                }
-            }
-
-            if modified {
-                let new_value_bytes = match serde_json::to_vec(&current_val) {
-                    Ok(b) => b,
-                    Err(_) => {
-                        return Response::Error("Failed to serialize new JSON value".to_string())
-                    }
-                };
-                tx.writes
-                    .insert(key.clone(), Some(DbValue::JsonB(new_value_bytes)));
-            }
-        }
-
-        return Response::Integer(1); // Assuming success, though can't confirm deletion
-    }
-    drop(tx_guard);
-
-    // --- Non-transactional JSON.DEL ---
-    let txid = ctx.tx_id_manager.new_txid();
-    ctx.tx_status_manager.begin(txid);
-
-    let mut version_chain_lock = ctx.db.entry(key.clone()).or_default();
-    let mut version_chain = version_chain_lock.value_mut().write().await;
-
-    let old_size;
-    let old_val_for_index;
-    let mut modified = false;
-
-    let new_val = if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| {
-        v.expirer_txid == 0
-            && ctx.tx_status_manager.get_status(v.creator_txid) == Some(TransactionStatus::Committed)
-    }) {
-        old_size = key.len() as u64 + memory::estimate_db_value_size(&latest_version.value).await;
-        let current_val = match &latest_version.value {
-            DbValue::Json(v) => {
-                old_val_for_index = v.clone();
-                v.clone()
-            }
-            DbValue::JsonB(b) => {
-                let v: Value = serde_json::from_slice(b).unwrap_or_default();
-                old_val_for_index = v.clone();
-                v
-            }
-            _ => return Response::Error("WRONGTYPE Operation against a non-JSON value".to_string()),
-        };
-
-        if inner_path.is_empty() || inner_path == "." {
-            latest_version.expirer_txid = txid;
-            modified = true;
-            current_val // This value will not be used, but we need to satisfy the if let
-        } else {
-            let mut temp_val = current_val;
-            let mut pointer_parts: Vec<&str> = inner_path.split('.').collect();
-            let final_key = pointer_parts.pop().unwrap();
-            let parent_pointer = json_path_to_pointer(&pointer_parts.join("."));
-
-            if let Some(target) = temp_val.pointer_mut(&parent_pointer) {
-                if let Some(obj) = target.as_object_mut() {
-                    if obj.remove(final_key).is_some() {
-                        latest_version.expirer_txid = txid;
-                        modified = true;
-                    }
-                }
-            }
-            temp_val
-        }
-    } else {
-        // Key does not exist
-        ctx.tx_status_manager.abort(txid);
-        return Response::Integer(0);
-    };
-
-    if !modified {
-        ctx.tx_status_manager.abort(txid);
-        return Response::Integer(0);
-    }
-
-    if inner_path.is_empty() || inner_path == "." {
-        let log_entry = LogEntry::Delete { key: key.clone() };
-        let ack_response = log_to_wal(log_entry, ctx).await;
-        if !matches!(ack_response, Response::Ok) {
-            // This is bad, we modified in-memory but WAL failed.
-            // A robust system would need to revert the in-memory change.
-            ctx.tx_status_manager.abort(txid);
-            return ack_response;
-        }
-        ctx.memory.decrease_memory(old_size);
-        if ctx.memory.is_enabled() {
-            ctx.memory.forget_key(&key).await;
-        }
-        ctx.index_manager
-            .remove_key_from_indexes(&key, &old_val_for_index)
-            .await;
-    } else {
-        let new_value_bytes = match serde_json::to_vec(&new_val) {
-            Ok(b) => b,
-            Err(_) => return Response::Error("Failed to serialize new JSON value".to_string()),
-        };
-
-        let log_entry = LogEntry::SetJsonB {
-            key: key.clone(),
-            value: new_value_bytes.clone(),
-        };
-        let ack_response = log_to_wal(log_entry, ctx).await;
-        if !matches!(ack_response, Response::Ok) {
-            ctx.tx_status_manager.abort(txid);
-            return ack_response;
-        }
-
-        let new_version = VersionedValue {
-            value: DbValue::JsonB(new_value_bytes.clone()),
-            creator_txid: txid,
-            expirer_txid: 0,
-        };
-        version_chain.push(new_version);
-
-        let new_size = key.len() as u64 + new_value_bytes.len() as u64;
-        ctx.memory.decrease_memory(old_size);
-        ctx.memory.increase_memory(new_size);
-        if ctx.memory.is_enabled() {
-            ctx.memory.track_access(&key).await;
-        }
-        ctx.index_manager
-            .remove_key_from_indexes(&key, &old_val_for_index)
-            .await;
-        ctx.index_manager
-            .add_key_to_indexes(&key, &new_val)
-            .await;
-    }
-
-    ctx.tx_status_manager.commit(txid);
-    Response::Integer(1)
+    let executor = StorageExecutor::new(ctx.clone().into(), transaction_handle);
+    executor.json_del(key, inner_path).await
 }
 
 async fn handle_lpush(
@@ -870,99 +331,8 @@ async fn handle_lpush(
     };
     let values: Vec<Vec<u8>> = command.args[2..].to_vec();
 
-    let log_entry = LogEntry::LPush {
-        key: key.clone(),
-        values: values.clone(),
-    };
-
-    let mut tx_guard = transaction_handle.write().await;
-    if let Some(tx) = tx_guard.as_mut() {
-        tx.log_entries.push(log_entry);
-
-        let current_db_val = get_visible_db_value(&key, ctx, Some(tx)).await;
-
-        let mut current_list = match current_db_val {
-            Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
-            Some(_) => {
-                return Response::Error("WRONGTYPE Operation against a non-list value".to_string())
-            }
-            _ => VecDeque::new(),
-        };
-
-        for v in values.into_iter().rev() {
-            current_list.push_front(v);
-        }
-
-        let new_len = current_list.len() as i64;
-        tx.writes
-            .insert(key, Some(DbValue::List(RwLock::new(current_list))));
-
-        return Response::Integer(new_len);
-    }
-    drop(tx_guard);
-
-    // Non-transactional LPUSH
-    let txid = ctx.tx_id_manager.new_txid();
-    ctx.tx_status_manager.begin(txid);
-
-    let ack_response = log_to_wal(log_entry, ctx).await;
-    if !matches!(ack_response, Response::Ok) {
-        ctx.tx_status_manager.abort(txid);
-        return ack_response;
-    }
-
-    let mut version_chain_lock = ctx.db.entry(key.clone()).or_default();
-    let mut version_chain = version_chain_lock.value_mut().write().await;
-
-    let mut old_size = 0;
-    let mut new_list = if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| {
-        v.expirer_txid == 0
-            && ctx.tx_status_manager.get_status(v.creator_txid) == Some(TransactionStatus::Committed)
-    }) {
-        latest_version.expirer_txid = txid;
-        old_size = key.len() as u64 + memory::estimate_db_value_size(&latest_version.value).await;
-        match &latest_version.value {
-            DbValue::List(list_lock) => list_lock.read().await.clone(),
-            _ => return Response::Error("WRONGTYPE Operation against a non-list value".to_string()),
-        }
-    } else {
-        VecDeque::new()
-    };
-
-    for v in values {
-        new_list.push_front(v);
-    }
-
-    let new_len = new_list.len() as i64;
-    let new_db_value = DbValue::List(RwLock::new(new_list));
-    let new_size = key.len() as u64 + memory::estimate_db_value_size(&new_db_value).await;
-
-    if ctx.memory.is_enabled() {
-        let needed = new_size.saturating_sub(old_size);
-        if let Err(e) = ctx.memory.ensure_memory_for(needed, ctx).await {
-            // This is tricky. The WAL entry is written. A real DB would need a compensating WAL entry.
-            // For now, we abort the txid and return an error.
-            ctx.tx_status_manager.abort(txid);
-            return Response::Error(e.to_string());
-        }
-    }
-
-    let new_version = VersionedValue {
-        value: new_db_value,
-        creator_txid: txid,
-        expirer_txid: 0,
-    };
-    version_chain.push(new_version);
-
-    ctx.memory.decrease_memory(old_size);
-    ctx.memory.increase_memory(new_size);
-    if ctx.memory.is_enabled() {
-        ctx.memory.track_access(&key).await;
-    }
-
-    ctx.tx_status_manager.commit(txid);
-
-    Response::Integer(new_len)
+    let executor = StorageExecutor::new(ctx.clone().into(), transaction_handle);
+    executor.lpush(key, values).await
 }
 
 async fn handle_rpush(
@@ -979,97 +349,8 @@ async fn handle_rpush(
     };
     let values: Vec<Vec<u8>> = command.args[2..].to_vec();
 
-    let log_entry = LogEntry::RPush {
-        key: key.clone(),
-        values: values.clone(),
-    };
-
-    let mut tx_guard = transaction_handle.write().await;
-    if let Some(tx) = tx_guard.as_mut() {
-        tx.log_entries.push(log_entry);
-
-        let current_db_val = get_visible_db_value(&key, ctx, Some(tx)).await;
-
-        let mut current_list = match current_db_val {
-            Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
-            Some(_) => {
-                return Response::Error("WRONGTYPE Operation against a non-list value".to_string())
-            }
-            _ => VecDeque::new(),
-        };
-
-        for v in values {
-            current_list.push_back(v);
-        }
-
-        let new_len = current_list.len() as i64;
-        tx.writes
-            .insert(key, Some(DbValue::List(RwLock::new(current_list))));
-
-        return Response::Integer(new_len);
-    }
-    drop(tx_guard);
-
-    // Non-transactional RPUSH
-    let txid = ctx.tx_id_manager.new_txid();
-    ctx.tx_status_manager.begin(txid);
-
-    let ack_response = log_to_wal(log_entry, ctx).await;
-    if !matches!(ack_response, Response::Ok) {
-        ctx.tx_status_manager.abort(txid);
-        return ack_response;
-    }
-
-    let mut version_chain_lock = ctx.db.entry(key.clone()).or_default();
-    let mut version_chain = version_chain_lock.value_mut().write().await;
-
-    let mut old_size = 0;
-    let mut new_list = if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| {
-        v.expirer_txid == 0
-            && ctx.tx_status_manager.get_status(v.creator_txid) == Some(TransactionStatus::Committed)
-    }) {
-        latest_version.expirer_txid = txid;
-        old_size = key.len() as u64 + memory::estimate_db_value_size(&latest_version.value).await;
-        match &latest_version.value {
-            DbValue::List(list_lock) => list_lock.read().await.clone(),
-            _ => return Response::Error("WRONGTYPE Operation against a non-list value".to_string()),
-        }
-    } else {
-        VecDeque::new()
-    };
-
-    for v in values {
-        new_list.push_back(v);
-    }
-
-    let new_len = new_list.len() as i64;
-    let new_db_value = DbValue::List(RwLock::new(new_list));
-    let new_size = key.len() as u64 + memory::estimate_db_value_size(&new_db_value).await;
-
-    if ctx.memory.is_enabled() {
-        let needed = new_size.saturating_sub(old_size);
-        if let Err(e) = ctx.memory.ensure_memory_for(needed, ctx).await {
-            ctx.tx_status_manager.abort(txid);
-            return Response::Error(e.to_string());
-        }
-    }
-
-    let new_version = VersionedValue {
-        value: new_db_value,
-        creator_txid: txid,
-        expirer_txid: 0,
-    };
-    version_chain.push(new_version);
-
-    ctx.memory.decrease_memory(old_size);
-    ctx.memory.increase_memory(new_size);
-    if ctx.memory.is_enabled() {
-        ctx.memory.track_access(&key).await;
-    }
-
-    ctx.tx_status_manager.commit(txid);
-
-    Response::Integer(new_len)
+    let executor = StorageExecutor::new(ctx.clone().into(), transaction_handle);
+    executor.rpush(key, values).await
 }
 
 async fn handle_lpop(
@@ -1094,122 +375,20 @@ async fn handle_lpop(
         1
     };
 
-    let log_entry = LogEntry::LPop {
-        key: key.clone(),
-        count,
-    };
+    let executor = StorageExecutor::new(ctx.clone().into(), transaction_handle);
+    let mut response = executor.lpop(key, count).await;
 
-    let mut tx_guard = transaction_handle.write().await;
-    if let Some(tx) = tx_guard.as_mut() {
-        tx.log_entries.push(log_entry);
-
-        let current_db_val = get_visible_db_value(&key, ctx, Some(tx)).await;
-
-        let mut current_list = match current_db_val {
-            Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
-            Some(_) => {
-                return Response::Error("WRONGTYPE Operation against a non-list value".to_string())
-            }
-            _ => VecDeque::new(),
-        };
-
-        let mut popped = Vec::new();
-        for _ in 0..count {
-            if let Some(val) = current_list.pop_front() {
-                popped.push(val);
-            } else {
-                break;
-            }
-        }
-
-        tx.writes
-            .insert(key, Some(DbValue::List(RwLock::new(current_list))));
-
-        if popped.is_empty() {
-            return Response::Nil;
-        } else if !was_count_provided {
-            return Response::Bytes(popped.into_iter().next().unwrap());
-        } else {
-            return Response::MultiBytes(popped);
-        }
-    }
-    drop(tx_guard);
-
-    // Non-transactional LPOP
-    let txid = ctx.tx_id_manager.new_txid();
-    ctx.tx_status_manager.begin(txid);
-
-    let ack_response = log_to_wal(log_entry, ctx).await;
-    if !matches!(ack_response, Response::Ok) {
-        ctx.tx_status_manager.abort(txid);
-        return ack_response;
-    }
-
-    let mut version_chain_lock = ctx.db.entry(key.clone()).or_default();
-    let mut version_chain = version_chain_lock.value_mut().write().await;
-
-    let mut old_size = 0;
-    let mut popped = Vec::new();
-    let mut list_exists = false;
-
-    let mut new_list = if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| {
-        v.expirer_txid == 0
-            && ctx.tx_status_manager.get_status(v.creator_txid) == Some(TransactionStatus::Committed)
-    }) {
-        latest_version.expirer_txid = txid;
-        list_exists = true;
-        old_size = key.len() as u64 + memory::estimate_db_value_size(&latest_version.value).await;
-        match &latest_version.value {
-            DbValue::List(list_lock) => list_lock.read().await.clone(),
-            _ => return Response::Error("WRONGTYPE Operation against a non-list value".to_string()),
-        }
-    } else {
-        VecDeque::new()
-    };
-
-    if list_exists {
-        for _ in 0..count {
-            if let Some(val) = new_list.pop_front() {
-                popped.push(val);
-            } else {
-                break;
+    // The executor returns a MultiBytes response. We need to adjust it if only one item was requested without a count.
+    if !was_count_provided {
+        if let Response::MultiBytes(ref mut vals) = response {
+            if vals.len() == 1 {
+                return Response::Bytes(vals.remove(0));
+            } else if vals.is_empty() {
+                return Response::Nil;
             }
         }
     }
-
-    let new_db_value = DbValue::List(RwLock::new(new_list));
-    let new_size = key.len() as u64 + memory::estimate_db_value_size(&new_db_value).await;
-
-    if ctx.memory.is_enabled() {
-        let needed = new_size.saturating_sub(old_size);
-        if let Err(e) = ctx.memory.ensure_memory_for(needed, ctx).await {
-            ctx.tx_status_manager.abort(txid);
-            return Response::Error(e.to_string());
-        }
-    }
-
-    let new_version = VersionedValue {
-        value: new_db_value,
-        creator_txid: txid,
-        expirer_txid: 0,
-    };
-    version_chain.push(new_version);
-
-    ctx.memory.decrease_memory(old_size);
-    ctx.memory.increase_memory(new_size);
-    if ctx.memory.is_enabled() {
-        ctx.memory.track_access(&key).await;
-    }
-
-    ctx.tx_status_manager.commit(txid);
-
-    if popped.is_empty() {
-        Response::Nil
-    } else if !was_count_provided {
-        Response::Bytes(popped.into_iter().next().unwrap())
-    } else {
-        Response::MultiBytes(popped)
-    }
+    response
 }
 
 async fn handle_rpop(
@@ -1234,121 +413,20 @@ async fn handle_rpop(
         1
     };
 
-            let log_entry = LogEntry::RPop {
-                key: key.clone(),
-                count,
-            };
-    
-            let mut tx_guard = transaction_handle.write().await;
-            if let Some(tx) = tx_guard.as_mut() {
-                tx.log_entries.push(log_entry);
-    
-                let current_db_val = get_visible_db_value(&key, ctx, Some(tx)).await;
-        let mut current_list = match current_db_val {
-            Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
-            Some(_) => {
-                return Response::Error("WRONGTYPE Operation against a non-list value".to_string())
-            }
-            _ => VecDeque::new(),
-        };
+    let executor = StorageExecutor::new(ctx.clone().into(), transaction_handle);
+    let mut response = executor.rpop(key, count).await;
 
-        let mut popped = Vec::new();
-        for _ in 0..count {
-            if let Some(val) = current_list.pop_back() {
-                popped.push(val);
-            } else {
-                break;
-            }
-        }
-
-        tx.writes
-            .insert(key, Some(DbValue::List(RwLock::new(current_list))));
-
-        if popped.is_empty() {
-            return Response::Nil;
-        } else if !was_count_provided {
-            return Response::Bytes(popped.into_iter().next().unwrap());
-        } else {
-            return Response::MultiBytes(popped);
-        }
-    }
-    drop(tx_guard);
-
-    // Non-transactional RPOP
-    let txid = ctx.tx_id_manager.new_txid();
-    ctx.tx_status_manager.begin(txid);
-
-    let ack_response = log_to_wal(log_entry, ctx).await;
-    if !matches!(ack_response, Response::Ok) {
-        ctx.tx_status_manager.abort(txid);
-        return ack_response;
-    }
-
-    let mut version_chain_lock = ctx.db.entry(key.clone()).or_default();
-    let mut version_chain = version_chain_lock.value_mut().write().await;
-
-    let mut old_size = 0;
-    let mut popped = Vec::new();
-    let mut list_exists = false;
-
-    let mut new_list = if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| {
-        v.expirer_txid == 0
-            && ctx.tx_status_manager.get_status(v.creator_txid) == Some(TransactionStatus::Committed)
-    }) {
-        latest_version.expirer_txid = txid;
-        list_exists = true;
-        old_size = key.len() as u64 + memory::estimate_db_value_size(&latest_version.value).await;
-        match &latest_version.value {
-            DbValue::List(list_lock) => list_lock.read().await.clone(),
-            _ => return Response::Error("WRONGTYPE Operation against a non-list value".to_string()),
-        }
-    } else {
-        VecDeque::new()
-    };
-
-    if list_exists {
-        for _ in 0..count {
-            if let Some(val) = new_list.pop_back() {
-                popped.push(val);
-            } else {
-                break;
+    // The executor returns a MultiBytes response. We need to adjust it if only one item was requested without a count.
+    if !was_count_provided {
+        if let Response::MultiBytes(ref mut vals) = response {
+            if vals.len() == 1 {
+                return Response::Bytes(vals.remove(0));
+            } else if vals.is_empty() {
+                return Response::Nil;
             }
         }
     }
-
-    let new_db_value = DbValue::List(RwLock::new(new_list));
-    let new_size = key.len() as u64 + memory::estimate_db_value_size(&new_db_value).await;
-
-    if ctx.memory.is_enabled() {
-        let needed = new_size.saturating_sub(old_size);
-        if let Err(e) = ctx.memory.ensure_memory_for(needed, ctx).await {
-            ctx.tx_status_manager.abort(txid);
-            return Response::Error(e.to_string());
-        }
-    }
-
-    let new_version = VersionedValue {
-        value: new_db_value,
-        creator_txid: txid,
-        expirer_txid: 0,
-    };
-    version_chain.push(new_version);
-
-    ctx.memory.decrease_memory(old_size);
-    ctx.memory.increase_memory(new_size);
-    if ctx.memory.is_enabled() {
-        ctx.memory.track_access(&key).await;
-    }
-
-    ctx.tx_status_manager.commit(txid);
-
-    if popped.is_empty() {
-        Response::Nil
-    } else if !was_count_provided {
-        Response::Bytes(popped.into_iter().next().unwrap())
-    } else {
-        Response::MultiBytes(popped)
-    }
+    response
 }
 
 async fn handle_llen(
@@ -1444,112 +522,8 @@ async fn handle_sadd(
     };
     let members: Vec<Vec<u8>> = command.args[2..].to_vec();
 
-    let log_entry = LogEntry::SAdd {
-        key: key.clone(),
-        members: members.clone(),
-    };
-
-    let mut tx_guard = transaction_handle.write().await;
-    if let Some(tx) = tx_guard.as_mut() {
-        tx.log_entries.push(log_entry);
-
-        let current_db_val = get_visible_db_value(&key, ctx, Some(tx)).await;
-
-        let mut current_set = match current_db_val {
-            Some(DbValue::Set(set_lock)) => set_lock.read().await.clone(),
-            Some(_) => {
-                return Response::Error("WRONGTYPE Operation against a non-set value".to_string())
-            }
-            _ => HashSet::new(),
-        };
-
-        let mut added_count = 0;
-        for m in members {
-            if current_set.insert(m) {
-                added_count += 1;
-            }
-        }
-
-        tx.writes
-            .insert(key, Some(DbValue::Set(RwLock::new(current_set))));
-
-        return Response::Integer(added_count);
-    }
-    drop(tx_guard);
-
-    // Non-transactional SADD
-    let txid = ctx.tx_id_manager.new_txid();
-    ctx.tx_status_manager.begin(txid);
-
-    let existing_value = get_visible_db_value(&key, ctx, None).await;
-
-    let mut old_size = 0;
-    let mut new_set = match existing_value {
-        Some(DbValue::Set(set_lock)) => {
-            let s = set_lock.read().await;
-            old_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::Set(RwLock::new(s.clone()))).await;
-            s.clone()
-        },
-        Some(_) => {
-            ctx.tx_status_manager.abort(txid);
-            return Response::Error("WRONGTYPE Operation against a non-set value".to_string());
-        }
-        None => HashSet::new(),
-    };
-
-    let ack_response = log_to_wal(log_entry, ctx).await;
-    if !matches!(ack_response, Response::Ok) {
-        ctx.tx_status_manager.abort(txid);
-        return ack_response;
-    }
-
-    let mut version_chain_lock = ctx.db.entry(key.clone()).or_default();
-    let mut version_chain = version_chain_lock.value_mut().write().await;
-
-    // Expire the previous version if it existed
-    if old_size > 0 {
-        if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| {
-            v.expirer_txid == 0
-                && ctx.tx_status_manager.get_status(v.creator_txid) == Some(TransactionStatus::Committed)
-        }) {
-            latest_version.expirer_txid = txid;
-        }
-    }
-
-    let mut added_count = 0;
-    for m in members {
-        if new_set.insert(m) {
-            added_count += 1;
-        }
-    }
-
-    let new_db_value = DbValue::Set(RwLock::new(new_set));
-    let new_size = key.len() as u64 + memory::estimate_db_value_size(&new_db_value).await;
-
-    if ctx.memory.is_enabled() {
-        let needed = new_size.saturating_sub(old_size);
-        if let Err(e) = ctx.memory.ensure_memory_for(needed, ctx).await {
-            ctx.tx_status_manager.abort(txid);
-            return Response::Error(e.to_string());
-        }
-    }
-
-    let new_version = VersionedValue {
-        value: new_db_value,
-        creator_txid: txid,
-        expirer_txid: 0,
-    };
-    version_chain.push(new_version);
-
-    ctx.memory.decrease_memory(old_size);
-    ctx.memory.increase_memory(new_size);
-    if ctx.memory.is_enabled() {
-        ctx.memory.track_access(&key).await;
-    }
-
-    ctx.tx_status_manager.commit(txid);
-
-    Response::Integer(added_count)
+    let executor = StorageExecutor::new(ctx.clone().into(), transaction_handle);
+    executor.sadd(key, members).await
 }
 
 async fn handle_srem(
@@ -1566,102 +540,8 @@ async fn handle_srem(
     };
     let members: Vec<Vec<u8>> = command.args[2..].to_vec();
 
-    let log_entry = LogEntry::SRem {
-        key: key.clone(),
-        members: members.clone(),
-    };
-
-    let mut tx_guard = transaction_handle.write().await;
-    if let Some(tx) = tx_guard.as_mut() {
-        tx.log_entries.push(log_entry);
-
-        let current_db_val = get_visible_db_value(&key, ctx, Some(tx)).await;
-
-        let mut current_set = match current_db_val {
-            Some(DbValue::Set(set_lock)) => set_lock.read().await.clone(),
-            Some(_) => {
-                return Response::Error("WRONGTYPE Operation against a non-set value".to_string())
-            }
-            _ => HashSet::new(),
-        };
-
-        let mut removed_count = 0;
-        for m in members {
-            if current_set.remove(&m) {
-                removed_count += 1;
-            }
-        }
-
-        tx.writes
-            .insert(key, Some(DbValue::Set(RwLock::new(current_set))));
-
-        return Response::Integer(removed_count);
-    }
-    drop(tx_guard);
-
-    // Non-transactional SREM
-    let txid = ctx.tx_id_manager.new_txid();
-    ctx.tx_status_manager.begin(txid);
-
-    let ack_response = log_to_wal(log_entry, ctx).await;
-    if !matches!(ack_response, Response::Ok) {
-        ctx.tx_status_manager.abort(txid);
-        return ack_response;
-    }
-
-    let mut version_chain_lock = ctx.db.entry(key.clone()).or_default();
-    let mut version_chain = version_chain_lock.value_mut().write().await;
-
-    let mut old_size = 0;
-    let mut removed_count = 0;
-
-    let mut new_set = if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| {
-        v.expirer_txid == 0
-            && ctx.tx_status_manager.get_status(v.creator_txid) == Some(TransactionStatus::Committed)
-    }) {
-        latest_version.expirer_txid = txid;
-        old_size = key.len() as u64 + memory::estimate_db_value_size(&latest_version.value).await;
-        match &latest_version.value {
-            DbValue::Set(set_lock) => set_lock.read().await.clone(),
-            _ => return Response::Error("WRONGTYPE Operation against a non-set value".to_string()),
-        }
-    } else {
-        HashSet::new()
-    };
-
-    for m in members {
-        if new_set.remove(&m) {
-            removed_count += 1;
-        }
-    }
-
-    let new_db_value = DbValue::Set(RwLock::new(new_set));
-    let new_size = key.len() as u64 + memory::estimate_db_value_size(&new_db_value).await;
-
-    if ctx.memory.is_enabled() {
-        let needed = new_size.saturating_sub(old_size);
-        if let Err(e) = ctx.memory.ensure_memory_for(needed, ctx).await {
-            ctx.tx_status_manager.abort(txid);
-            return Response::Error(e.to_string());
-        }
-    }
-
-    let new_version = VersionedValue {
-        value: new_db_value,
-        creator_txid: txid,
-        expirer_txid: 0,
-    };
-    version_chain.push(new_version);
-
-    ctx.memory.decrease_memory(old_size);
-    ctx.memory.increase_memory(new_size);
-    if ctx.memory.is_enabled() {
-        ctx.memory.track_access(&key).await;
-    }
-
-    ctx.tx_status_manager.commit(txid);
-
-    Response::Integer(removed_count)
+    let executor = StorageExecutor::new(ctx.clone().into(), transaction_handle);
+    executor.srem(key, members).await
 }
 
 async fn handle_smembers(

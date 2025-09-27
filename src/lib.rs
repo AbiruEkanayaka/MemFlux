@@ -15,6 +15,7 @@ pub mod memory;
 pub mod persistence;
 pub mod protocol;
 pub mod query_engine;
+pub mod storage_executor;
 pub mod schema;
 pub mod transaction;
 pub mod types;
@@ -283,20 +284,29 @@ impl MemFluxDB {
                 }
                 types::Response::MultiBytes(multi_bytes)
             } else {
-                if let Some(result) = stream.next().await {
+                let mut final_response = types::Response::Ok; // Default to OK
+                let mut encountered_error = None;
+
+                while let Some(result) = stream.next().await {
                     match result {
                         Ok(value) => {
-                            if let Some(count) = value.get("rows_affected").and_then(|v| v.as_i64())
-                            {
-                                types::Response::Integer(count)
+                            if let Some(count) = value.get("rows_affected").and_then(|v| v.as_i64()) {
+                                final_response = types::Response::Integer(count);
                             } else {
-                                types::Response::Ok
+                                final_response = types::Response::Ok; // Or some other success indicator
                             }
                         }
-                        Err(e) => types::Response::Error(format!("Execution Error: {}", e)),
+                        Err(e) => {
+                            encountered_error = Some(types::Response::Error(format!("Execution Error: {}", e)));
+                            break; // Stop processing on first error
+                        }
                     }
+                }
+
+                if let Some(err_resp) = encountered_error {
+                    err_resp
                 } else {
-                    types::Response::Error("Command executed with no result".to_string())
+                    final_response
                 }
             }
         } else {

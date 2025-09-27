@@ -1,3 +1,4 @@
+
 use crate::transaction::{Transaction, TransactionHandle};
 use anyhow::{anyhow, Result};
 use async_stream::try_stream;
@@ -8,10 +9,10 @@ use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
-use uuid::Uuid;
+
 
 use super::ast::{AlterTableAction, TableConstraint};
-use super::logical_plan::{cast_value_to_type, Expression, JoinType, LogicalOperator, LogicalPlan, OnConflictAction, Operator};
+use super::logical_plan::{cast_value_to_type, Expression, JoinType, LogicalOperator, LogicalPlan, Operator};
 use super::physical_plan::PhysicalPlan;
 use crate::schema::{ColumnDefinition, DataType, VirtualSchema, SCHEMA_PREFIX, VIEW_PREFIX};
 use crate::types::{AppContext, Command, DbValue, LogEntry, LogRequest, PersistenceRequest, Response, SchemaCache, ViewDefinition};
@@ -219,9 +220,9 @@ pub fn execute<'a>(
                 for key in keys_to_process {
                     let visible_value: Option<DbValue> =
                         if let Some(tx) = tx_opt {
-                            crate::commands::get_visible_db_value(&key, &ctx, Some(tx)).await
+                            crate::storage_executor::get_visible_db_value(&key, &ctx, Some(tx)).await
                         } else {
-                            crate::commands::get_visible_db_value(&key, &ctx, None).await
+                            crate::storage_executor::get_visible_db_value(&key, &ctx, None).await
                         };
 
                     if let Some(db_value) = visible_value {
@@ -262,9 +263,9 @@ pub fn execute<'a>(
 
                             let visible_value: Option<DbValue> =
                                 if let Some(tx) = tx_opt {
-                                    crate::commands::get_visible_db_value(db_key, &ctx, Some(tx)).await
+                                    crate::storage_executor::get_visible_db_value(db_key, &ctx, Some(tx)).await
                                 } else {
-                                    crate::commands::get_visible_db_value(db_key, &ctx, None).await
+                                    crate::storage_executor::get_visible_db_value(db_key, &ctx, None).await
                                 };
                             // --- End Visibility Check ---
 
@@ -692,219 +693,18 @@ pub fn execute<'a>(
                 yield json!({"status": "View dropped"});
             }
             PhysicalPlan::Insert { table_name, columns, source, source_column_names, on_conflict, returning } => {
-                let schema = ctx.schema_cache.get(&table_name);
-                let mut total_rows_affected = 0;
-                let mut returned_rows = Vec::new();
-
                 let source_rows: Vec<Row> = execute(*source, ctx.clone(), outer_row, _working_tables, transaction_handle.clone()).try_collect().await?;
 
-                let in_transaction = if let Some(handle) = &transaction_handle {
-                    let mut tx_guard = handle.write().await;
-                    if let Some(tx) = tx_guard.as_mut() {
-                        for source_row in source_rows.clone() {
-                            // ... (logic to build row_data) ...
-                            let pk = Uuid::new_v4().to_string(); // Simplified for brevity
-                            let key = format!("{}:{}", table_name, pk);
-
-                            // Transactional conflict check
-                            let key_exists = tx.writes.contains_key(&key) || ctx.db.contains_key(&key);
-
-                            if key_exists {
-                                // Handle ON CONFLICT within transaction
-                            } else {
-                                let value_bytes = serde_json::to_vec(&source_row)?;
-                                let log_entry = LogEntry::SetJsonB { key: key.clone(), value: value_bytes.clone() };
-                                tx.log_entries.push(log_entry);
-                                tx.writes.insert(key, Some(DbValue::JsonB(value_bytes)));
-                                total_rows_affected += 1;
-                                if !returning.is_empty() {
-                                    returned_rows.push(source_row);
-                                }
-                            }
-                        }
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-
-                if !in_transaction {
-                    for source_row in source_rows {
-                        let source_row_obj = source_row.as_object().ok_or_else(|| anyhow!("INSERT source did not produce an object"))?;
-                        let insert_columns = if columns.is_empty() {
-                            if let Some(s) = &schema {
-                                if !s.column_order.is_empty() { s.column_order.clone() } else { s.columns.keys().cloned().collect::<Vec<String>>() }
-                            } else {
-                                Err(anyhow!("Cannot INSERT without column list into a table with no schema"))?
-                            }
-                        } else {
-                            columns.clone()
-                        };
-                        if insert_columns.len() != source_column_names.len() {
-                            Err(anyhow!("INSERT has mismatch between number of columns ({}) and values from source ({})", insert_columns.len(), source_column_names.len()))?;
-                        }
-                        let mut row_data = json!({});
-                        for (i, target_col_name) in insert_columns.iter().enumerate() {
-                            let source_col_name = &source_column_names[i];
-                            let mut val = source_row_obj.get(source_col_name).cloned().unwrap_or(Value::Null);
-                            if let Some(s) = &schema {
-                                if let Some(col_def) = s.columns.get(target_col_name) {
-                                    val = cast_value_to_type(val, &col_def.data_type)?;
-                                }
-                            }
-                            row_data[target_col_name] = val;
-                        }
-                        if let Some(s) = &schema {
-                            for (col_name, col_def) in &s.columns {
-                                if !row_data.get(col_name).is_some() {
-                                    if let Some(default_expr) = &col_def.default {
-                                        let mut val = default_expr.evaluate_with_context(&json!({}), None, ctx.clone(), transaction_handle.clone()).await?;
-                                        val = cast_value_to_type(val, &col_def.data_type)?;
-                                        row_data[col_name.clone()] = val;
-                                    }
-                                }
-                            }
-                        }
-                        if let Some(s) = &schema {
-                            // NOT NULL and CHECK constraints
-                            for (col_name, col_def) in &s.columns {
-                                let val = row_data.get(col_name).unwrap_or(&Value::Null);
-                                if !col_def.nullable && val.is_null() {
-                                    Err(anyhow!("NULL value in column '{}' violates not-null constraint", col_name))?;
-                                }
-                            }
-                            for constraint in &s.constraints {
-                                if let TableConstraint::Check { name: _, expression } = constraint {
-                                    let check_row = json!({ table_name.clone(): row_data.clone() });
-                                    if !super::logical_plan::simple_expr_to_expression(expression.clone(), &ctx.schema_cache, &ctx.view_cache, &ctx.function_registry, None)?.evaluate_with_context(&check_row, None, ctx.clone(), transaction_handle.clone()).await?.as_bool().unwrap_or(false)
-                                    {
-                                        Err(anyhow!("CHECK constraint failed for table '{}'", table_name))?;
-                                    }
-                                }
-                            }
-                        }
-
-                        // FOREIGN KEY constraints
-                        check_foreign_key_constraints(&table_name, &row_data, &ctx, transaction_handle.clone()).await?;
-
-                        let pk_col = if let Some(s) = &schema { s.constraints.iter().filter_map(|c| if let TableConstraint::PrimaryKey { columns, .. } = c { columns.first().cloned() } else { None }).next().unwrap_or_else(|| "id".to_string()) } else { "id".to_string() };
-                        let pk = match row_data.get(&pk_col) { Some(Value::String(s)) => s.clone(), Some(Value::Number(n)) => n.to_string(), _ => Uuid::new_v4().to_string() };
-                        let key = format!("{}:{}", table_name, pk);
-
-                        // UNIQUE constraints
-                        if let Some(s) = &schema {
-                            for constraint in &s.constraints {
-                                if let TableConstraint::Unique { name: constraint_name_opt, columns } = constraint {
-                                    if columns.len() == 1 { // Only single-column unique constraints are handled here
-                                        let col_name = &columns[0];
-                                        if let Some(val) = row_data.get(col_name) {
-                                            let index_name = constraint_name_opt.clone().unwrap_or_else(|| format!("unique_{}_{}", table_name, col_name));
-                                            if let Some(internal_name_entry) = ctx.index_manager.name_to_internal_name.get(&index_name) {
-                                                let internal_name = internal_name_entry.value();
-                                                if let Some(index) = ctx.index_manager.indexes.get(internal_name) {
-                                                    let index_key = serde_json::to_string(val)?;
-                                                    let index_data = index.read().await;
-                                                    if index_data.contains_key(&index_key) {
-                                                        Err(anyhow!("UNIQUE constraint '{}' failed for column '{}'", index_name, col_name))?;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if ctx.db.contains_key(&key) {
-                            if let Some((_target, action)) = &on_conflict {
-                                match action {
-                                    OnConflictAction::DoNothing => continue,
-                                    OnConflictAction::DoUpdate(set_clauses) => {
-                                        let old_val = if let Some(entry) = ctx.db.get(&key) {
-                                            let version_chain = entry.value().read().await;
-                                            if let Some(latest_version) = version_chain.last() {
-                                                match &latest_version.value {
-                                                    DbValue::JsonB(b) => serde_json::from_slice(b)?,
-                                                    _ => json!({}),
-                                                }
-                                            } else {
-                                                json!({})
-                                            }
-                                        } else {
-                                            continue
-                                        };
-                                        let mut new_val = old_val.clone();
-                                        let excluded_row = json!({ "excluded": row_data.clone() });
-                                        for (col, expr) in set_clauses {
-                                            let val = expr.evaluate_with_context(&excluded_row, Some(&old_val), ctx.clone(), transaction_handle.clone()).await?;
-                                            new_val[col] = val;
-                                        }
-                                        let new_val_bytes = serde_json::to_vec(&new_val)?;
-                                        let log_entry = LogEntry::SetJsonB { key: key.clone(), value: new_val_bytes.clone() };
-                                        log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
-                                        ctx.index_manager.remove_key_from_indexes(&key, &old_val).await;
-                                        ctx.index_manager.add_key_to_indexes(&key, &new_val).await;
-
-                                        let txid = ctx.tx_id_manager.new_txid();
-                                        ctx.tx_status_manager.begin(txid);
-
-                                        let mut version_chain_lock = ctx.db.entry(key.clone()).or_default();
-                                        let mut version_chain = version_chain_lock.value_mut().write().await;
-
-                                        if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| {
-                                            v.expirer_txid == 0
-                                                && ctx.tx_status_manager.get_status(v.creator_txid)
-                                                    == Some(crate::types::TransactionStatus::Committed)
-                                        }) {
-                                            latest_version.expirer_txid = txid;
-                                        }
-
-                                        let new_version = crate::types::VersionedValue {
-                                            value: DbValue::JsonB(new_val_bytes.clone()),
-                                            creator_txid: txid,
-                                            expirer_txid: 0,
-                                        };
-                                        version_chain.push(new_version);
-
-                                        ctx.tx_status_manager.commit(txid);
-
-                                        total_rows_affected += 1;
-                                        if !returning.is_empty() { returned_rows.push(new_val); }
-                                        continue;
-                                    }
-                                }
-                            } else {
-                                Err(anyhow!("PRIMARY KEY constraint failed for table '{}'. Key '{}' already exists.", table_name, key))?;
-                            }
-                        }
-                        let value_bytes = serde_json::to_vec(&row_data)?;
-                        let log_entry = LogEntry::SetJsonB { key: key.clone(), value: value_bytes.clone() };
-                        log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
-                        ctx.index_manager.add_key_to_indexes(&key, &row_data).await;
-                        let txid = ctx.tx_id_manager.new_txid();
-                        ctx.tx_status_manager.begin(txid);
-                        let new_version = crate::types::VersionedValue { value: DbValue::JsonB(value_bytes), creator_txid: txid, expirer_txid: 0 };
-                        
-                        let mut version_chain_lock = ctx.db.entry(key.clone()).or_default();
-                        let mut version_chain = version_chain_lock.value_mut().write().await;
-                        version_chain.push(new_version);
-
-                        ctx.tx_status_manager.commit(txid);
-                        total_rows_affected += 1;
-                        if !returning.is_empty() { returned_rows.push(row_data); }
-                    }
-                }
+                let executor = crate::storage_executor::StorageExecutor::new(ctx.clone(), transaction_handle.clone().expect("Transaction handle must be present for INSERT"));
+                let inserted_rows = executor.insert_rows(&table_name, &columns, source_rows.clone(), &source_column_names, &on_conflict).await?;
 
                 if !returning.is_empty() {
-                    for returned_row in returned_rows {
+                    for returned_row in inserted_rows {
                         let proj_row = project_row(&returned_row, &returning, ctx.clone(), outer_row, _working_tables, transaction_handle.clone()).await?;
                         yield proj_row;
                     }
-                }
-                else {
-                    yield json!({"rows_affected": total_rows_affected});
+                } else {
+                    yield json!({ "rows_affected": inserted_rows.len() as u64 });
                 }
             }
             PhysicalPlan::Delete { table_name, from, returning } => {
@@ -922,59 +722,8 @@ pub fn execute<'a>(
                     }
                 }
 
-                let mut deleted_count = 0;
-
-                let in_transaction = if let Some(handle) = &transaction_handle {
-                    let mut tx_guard = handle.write().await;
-                    if let Some(tx) = tx_guard.as_mut() {
-                        for row in &rows_to_delete {
-                            let table_part = match row.get(&table_name) {
-                                Some(part) => part,
-                                None => continue,
-                            };
-                            let key = match table_part.get("_key").and_then(|k| k.as_str()) {
-                                Some(k) => k.to_string(),
-                                None => continue,
-                            };
-
-                            let log_entry = LogEntry::Delete { key: key.clone() };
-                            tx.log_entries.push(log_entry);
-                            tx.writes.insert(key, None);
-                            deleted_count += 1;
-                        }
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-
-                if !in_transaction {
-                    for row in &rows_to_delete {
-                        let table_part = match row.get(&table_name) {
-                            Some(part) => part,
-                            None => continue,
-                        };
-
-                        let key = match table_part.get("_key").and_then(|k| k.as_str()) {
-                            Some(k) => k.to_string(),
-                            None => continue,
-                        };
-
-                        // Remove from indexes BEFORE removing from DB
-                        ctx.index_manager
-                            .remove_key_from_indexes(&key, table_part)
-                            .await;
-
-                        let log_entry = LogEntry::Delete { key: key.clone() };
-                        log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
-                        if ctx.db.remove(&key).is_some() {
-                            deleted_count += 1;
-                        }
-                    }
-                }
-
+                let executor = crate::storage_executor::StorageExecutor::new(ctx.clone(), transaction_handle.clone().unwrap());
+                let deleted_count = executor.delete_rows(&table_name, rows_to_delete.clone()).await?;
 
                 if !returning.is_empty() {
                     for returned_row in rows_to_delete {
@@ -986,179 +735,35 @@ pub fn execute<'a>(
                         }
                     }
                 } else {
-                    yield json!({"rows_affected": deleted_count});
+                    yield json!({ "rows_affected": deleted_count });
                 }
             }
             PhysicalPlan::Update { table_name, from, set, returning } => {
-                let schema = ctx.schema_cache.get(&table_name);
                 let stream = execute(*from, ctx.clone(), outer_row, _working_tables, transaction_handle.clone());
                 let rows_to_update: Vec<Row> = stream.try_collect().await?;
 
-                let mut updated_count = 0;
-                let mut returned_rows = Vec::new();
-
-                let in_transaction = if let Some(handle) = &transaction_handle {
-                    let mut tx_guard = handle.write().await;
-                    if let Some(tx) = tx_guard.as_mut() {
-                        for row in rows_to_update.clone() {
-                            let table_part = match row.get(&table_name) {
-                                Some(part) => part,
-                                None => continue,
-                            };
-                            let key = match table_part.get("_key").and_then(|k| k.as_str()) {
-                                Some(k) => k.to_string(),
-                                None => continue,
-                            };
-
-                            let mut new_val = table_part.clone();
-                            for (col, expr) in &set {
-                                let mut val = expr.evaluate_with_context(&row, outer_row, ctx.clone(), transaction_handle.clone()).await?;
-                                if let Some(s) = &schema {
-                                    if let Some(col_def) = s.columns.get(col) {
-                                        val = cast_value_to_type(val, &col_def.data_type)?;
-                                    }
-                                }
-                                new_val[col] = val;
-                            }
-
-                            let new_val_bytes = serde_json::to_vec(&new_val)?;
-                            let log_entry = LogEntry::SetJsonB { key: key.clone(), value: new_val_bytes.clone() };
-                            tx.log_entries.push(log_entry);
-                            tx.writes.insert(key, Some(DbValue::JsonB(new_val_bytes)));
-                            updated_count += 1;
-                            if !returning.is_empty() {
-                                returned_rows.push(new_val);
-                            }
+                for row in &rows_to_update {
+                    if let Some(table_part) = row.get(&table_name) {
+                        let mut new_val = table_part.clone();
+                        for (col, expr) in &set {
+                            let val = expr.evaluate_with_context(row, None, ctx.clone(), transaction_handle.clone()).await?;
+                            new_val[col] = val;
                         }
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-
-                if !in_transaction {
-                    for row in rows_to_update {
-                        let table_part = match row.get(&table_name) {
-                            Some(part) => part,
-                            None => continue, // This row from the join doesn't have the target table, skip.
-                        };
-
-                        let key = match table_part.get("_key").and_then(|k| k.as_str()) {
-                            Some(k) => k.to_string(),
-                            None => continue, // No key found for this row, cannot update.
-                        };
-
-                        // --- Read and Prepare Phase ---
-                        let (old_val_for_index, new_val) = {
-                            let version_chain_lock = ctx.db.entry(key.clone()).or_default();
-                            let version_chain = version_chain_lock.value().read().await;
-
-                            let mut old_val = json!({});
-                            let mut found_visible = false;
-                            for version in version_chain.iter().rev() {
-                                if ctx.tx_status_manager.get_status(version.creator_txid)
-                                    == Some(crate::types::TransactionStatus::Committed)
-                                {
-                                    if version.expirer_txid == 0
-                                        || ctx
-                                            .tx_status_manager
-                                            .get_status(version.expirer_txid)
-                                            != Some(crate::types::TransactionStatus::Committed)
-                                    {
-                                        old_val = match &version.value {
-                                            DbValue::Json(v) => v.clone(),
-                                            DbValue::JsonB(b) => {
-                                                serde_json::from_slice(b).unwrap_or_default()
-                                            }
-                                            _ => Err(anyhow!(
-                                                "WRONGTYPE Operation against a non-JSON value"
-                                            ))?,
-                                        };
-                                        found_visible = true;
-                                    }
-                                    break;
-                                }
-                            }
-
-                            if !found_visible {
-                                continue; // Row to update is not visible, skip.
-                            }
-
-                            let mut new_val = old_val.clone();
-                            for (col, expr) in &set {
-                                let mut val = expr
-                                    .evaluate_with_context(
-                                        &row, outer_row, ctx.clone(), transaction_handle.clone(),
-                                    )
-                                    .await?;
-
-                                if let Some(schema) = &schema {
-                                    if let Some(col_def) = schema.columns.get(col) {
-                                        if !col_def.nullable && val.is_null() {
-                                            Err(anyhow!(
-                                                "NULL value in column '{}' violates not-null constraint",
-                                                col
-                                            ))?;
-                                        }
-                                        val = cast_value_to_type(val, &col_def.data_type)?;
-                                    }
-                                }
-                                new_val[col] = val;
-                            }
-                            (old_val, new_val)
-                        };
-
-                        apply_on_update_actions(
-                            &table_name, &old_val_for_index, &new_val, &ctx, transaction_handle.clone(),
-                        )
-                        .await?;
-
-                        // --- Log Phase ---
-                        let new_val_bytes = serde_json::to_vec(&new_val)?;
-                        let log_entry =
-                            LogEntry::SetJsonB { key: key.clone(), value: new_val_bytes.clone() };
-                        log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
-
-                        // --- Write and Commit Phase ---
-                        let txid = ctx.tx_id_manager.new_txid();
-                        ctx.tx_status_manager.begin(txid);
-
-                        let mut version_chain_lock = ctx.db.entry(key.clone()).or_default();
-                        let mut version_chain = version_chain_lock.value_mut().write().await;
-
-                        if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| {
-                            v.expirer_txid == 0
-                                && ctx.tx_status_manager.get_status(v.creator_txid)
-                                    == Some(crate::types::TransactionStatus::Committed)
-                        }) {
-                            latest_version.expirer_txid = txid;
-                        }
-
-                        let new_version = crate::types::VersionedValue {
-                            value: DbValue::JsonB(new_val_bytes.clone()),
-                            creator_txid: txid,
-                            expirer_txid: 0,
-                        };
-                        version_chain.push(new_version);
-
-                        ctx.tx_status_manager.commit(txid);
-                        updated_count += 1;
-
-                        if !returning.is_empty() {
-                            returned_rows.push(new_val);
-                        }
+                        apply_on_update_actions(&table_name, table_part, &new_val, &ctx, transaction_handle.clone()).await?;
                     }
                 }
 
+                let executor = crate::storage_executor::StorageExecutor::new(ctx.clone(), transaction_handle.clone().unwrap());
+                let updated_rows = executor.update_rows(&table_name, rows_to_update.clone(), &set).await?;
+
                 if !returning.is_empty() {
-                    for returned_row in returned_rows {
-                        let proj_row = project_row(&returned_row, &returning, ctx.clone(), outer_row, _working_tables, transaction_handle.clone()).await?;
+                    for returned_row in updated_rows {
+                        let wrapped_row = json!({ table_name.clone(): returned_row });
+                        let proj_row = project_row(&wrapped_row, &returning, ctx.clone(), outer_row, _working_tables, transaction_handle.clone()).await?;
                         yield proj_row;
                     }
                 } else {
-                    yield json!({"rows_affected": updated_count});
+                    yield json!({ "rows_affected": updated_rows.len() as u64 });
                 }
             }
             PhysicalPlan::AlterTable { table_name, action } => {
@@ -1210,21 +815,15 @@ pub fn execute<'a>(
                             .collect();
 
                         for key in keys_to_check {
-                            if let Some(entry) = ctx.db.get(&key) {
-                                let version_chain = entry.value().read().await;
-                                if let Some(latest_version) = version_chain.last() {
-                                    if ctx.tx_status_manager.get_status(latest_version.creator_txid) != Some(crate::types::TransactionStatus::Committed) {
-                                        continue;
-                                    }
-                                    let val: Value = match &latest_version.value {
-                                        DbValue::Json(v) => v.clone(),
-                                        DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
-                                        _ => continue,
-                                    };
-                                    if let Some(col_val) = val.get(&column_name) {
-                                        if col_val.is_null() {
-                                            Err(anyhow!("Cannot add NOT NULL constraint on column '{}' because it contains null values.", column_name))?;
-                                        }
+                            if let Some(db_value) = crate::storage_executor::get_visible_db_value(&key, &ctx, None).await {
+                                let val: Value = match db_value {
+                                    DbValue::Json(v) => v,
+                                    DbValue::JsonB(b) => serde_json::from_slice(&b).unwrap_or_default(),
+                                    _ => continue,
+                                };
+                                if let Some(col_val) = val.get(&column_name) {
+                                    if col_val.is_null() {
+                                        Err(anyhow!("Cannot add NOT NULL constraint on column '{}' because it contains null values.", column_name))?;
                                     }
                                 }
                             }
@@ -2205,179 +1804,31 @@ async fn apply_on_delete_actions(
                             let on_delete_action = fk.on_delete.as_deref().unwrap_or("NO ACTION").to_uppercase();
                             match on_delete_action.as_str() {
                                 "CASCADE" => {
-                                    for child_row in results {
-                                        let child_key = child_row.as_object()
-                                            .and_then(|obj| obj.values().next())
-                                            .and_then(|table_obj| table_obj.get("_key"))
-                                            .and_then(|k| k.as_str())
-                                            .map(|s| s.to_string())
-                                            .ok_or_else(|| anyhow!("Could not get child key for CASCADE delete"))?;
-
-                                        let log_entry = LogEntry::Delete { key: child_key.clone() };
-
-                                        let mut committed_non_tx = false;
-                                        if let Some(handle) = &transaction_handle {
-                                            let mut tx_guard = handle.write().await;
-                                            if let Some(tx) = tx_guard.as_mut() {
-                                                tx.log_entries.push(log_entry);
-                                                tx.writes.insert(child_key.clone(), None);
-                                            } else {
-                                                // Non-transactional cascade
-                                                let txid = ctx.tx_id_manager.new_txid();
-                                                ctx.tx_status_manager.begin(txid);
-                                                log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
-                                                if let Some(entry) = ctx.db.get(&child_key) {
-                                                    let mut version_chain = entry.value().write().await;
-                                                    if let Some(v) = version_chain.last_mut() {
-                                                        v.expirer_txid = txid;
-                                                    }
-                                                }
-                                                ctx.tx_status_manager.commit(txid);
-                                                committed_non_tx = true;
-                                            }
-                                        } else {
-                                            // Non-transactional cascade
-                                            let txid = ctx.tx_id_manager.new_txid();
-                                            ctx.tx_status_manager.begin(txid);
-                                            log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
-                                            if let Some(entry) = ctx.db.get(&child_key) {
-                                                let mut version_chain = entry.value().write().await;
-                                                if let Some(v) = version_chain.last_mut() {
-                                                    v.expirer_txid = txid;
-                                                }
-                                            }
-                                            ctx.tx_status_manager.commit(txid);
-                                            committed_non_tx = true;
-                                        }
-
-                                        if committed_non_tx {
-                                            if let Some(entry) = ctx.db.remove(&child_key) {
-                                                let version_chain = entry.1.read().await;
-                                                if let Some(latest_version) = version_chain.last() {
-                                                    let size = crate::memory::estimate_db_value_size(&latest_version.value).await;
-                                                    ctx.memory.decrease_memory(size + child_key.len() as u64);
-                                                    ctx.memory.forget_key(&child_key).await;
-                                                    if let DbValue::JsonB(b) = &latest_version.value {
-                                                        if let Ok(val) = serde_json::from_slice::<Value>(b) {
-                                                            ctx.index_manager.remove_key_from_indexes(&child_key, &val).await;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+                                    let executor = crate::storage_executor::StorageExecutor::new(ctx.clone(), transaction_handle.clone().unwrap());
+                                    executor.delete_rows(&child_schema.table_name, results).await?;
                                 }
                                 "SET NULL" => {
-                                    for child_row in results {
-                                        let child_key = child_row.as_object()
-                                            .and_then(|obj| obj.values().next())
-                                            .and_then(|table_obj| table_obj.get("_key"))
-                                            .and_then(|k| k.as_str())
-                                            .map(|s| s.to_string())
-                                            .ok_or_else(|| anyhow!("Could not get child key for SET NULL update"))?;
-
-                                        let old_child_val_for_index = if let Some(version_chain_lock) = ctx.db.get(&child_key) {
-                                            let version_chain = version_chain_lock.read().await;
-                                            if let Some(latest_version) = version_chain.iter().rev().find(|v| ctx.tx_status_manager.get_status(v.creator_txid) == Some(crate::types::TransactionStatus::Committed)) {
-                                                match &latest_version.value {
-                                                    DbValue::Json(j) => j.clone(),
-                                                    DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
-                                                    _ => Value::Null,
-                                                }
-                                            } else {
-                                                Value::Null
-                                            }
-                                        } else {
-                                            Value::Null
-                                        };
-
-                                        let mut new_child_val = old_child_val_for_index.clone();
-                                        for col_name in &fk.columns {
-                                            new_child_val[col_name] = Value::Null;
-                                        }
-
-                                        let new_val_bytes = serde_json::to_vec(&new_child_val)?;
-                                        let log_entry = LogEntry::SetJsonB { key: child_key.clone(), value: new_val_bytes.clone() };
-
-                                        let mut committed_non_tx = false;
-                                        if let Some(handle) = &transaction_handle {
-                                            let mut tx_guard = handle.write().await;
-                                            if let Some(tx) = tx_guard.as_mut() {
-                                                tx.log_entries.push(log_entry);
-                                                tx.writes.insert(child_key.clone(), Some(DbValue::JsonB(new_val_bytes.clone())));
-                                            } else {
-                                                log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
-                                                committed_non_tx = true;
-                                            }
-                                        } else {
-                                            log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
-                                            committed_non_tx = true;
-                                        }
-
-                                        if committed_non_tx {
-                                            ctx.index_manager.remove_key_from_indexes(&child_key, &old_child_val_for_index).await;
-                                            ctx.index_manager.add_key_to_indexes(&child_key, &new_child_val).await;
-                                            let new_version = crate::types::VersionedValue {
-                                                value: DbValue::JsonB(new_val_bytes),
-                                                creator_txid: 0, // Or a proper txid
-                                                expirer_txid: 0,
-                                            };
-                                            ctx.db.insert(child_key, RwLock::new(vec![new_version]));
-                                        }
+                                    let mut set_clauses = Vec::new();
+                                    for col_name in &fk.columns {
+                                        set_clauses.push((col_name.clone(), Expression::Literal(Value::Null)));
                                     }
+                                    let executor = crate::storage_executor::StorageExecutor::new(ctx.clone(), transaction_handle.clone().unwrap());
+                                    executor.update_rows(&child_schema.table_name, results, &set_clauses).await?;
                                 }
                                 "SET DEFAULT" => {
-                                    for child_row in results {
-                                        let child_key = child_row.as_object()
-                                            .and_then(|obj| obj.values().next())
-                                            .and_then(|table_obj| table_obj.get("_key"))
-                                            .and_then(|k| k.as_str())
-                                            .map(|s| s.to_string())
-                                            .ok_or_else(|| anyhow!("Could not get child key for SET DEFAULT update"))?;
+                                    let mut set_clauses = Vec::new();
+                                    for col_name in &fk.columns {
+                                        let col_def = child_schema.columns.get(col_name)
+                                            .ok_or_else(|| anyhow!("Column '{}' not found in child table '{}' for SET DEFAULT", col_name, child_schema.table_name))?;
 
-                                        let old_child_val_for_index = if let Some(version_chain_lock) = ctx.db.get(&child_key) {
-                                            let version_chain = version_chain_lock.read().await;
-                                            if let Some(latest_version) = version_chain.iter().rev().find(|v| ctx.tx_status_manager.get_status(v.creator_txid) == Some(crate::types::TransactionStatus::Committed)) {
-                                                match &latest_version.value {
-                                                    DbValue::Json(j) => j.clone(),
-                                                    DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
-                                                    _ => Value::Null,
-                                                }
-                                            } else {
-                                                Value::Null
-                                            }
+                                        if let Some(default_expr) = &col_def.default {
+                                            set_clauses.push((col_name.clone(), default_expr.clone()));
                                         } else {
-                                            Value::Null
-                                        };
-
-                                        let mut new_child_val = old_child_val_for_index.clone();
-                                        for col_name in &fk.columns {
-                                            let col_def = child_schema.columns.get(col_name)
-                                                .ok_or_else(|| anyhow!("Column '{}' not found in child table '{}' for SET DEFAULT", col_name, child_schema.table_name))?;
-
-                                            if let Some(default_expr) = &col_def.default {
-                                                let mut default_val = default_expr.evaluate_with_context(&json!({}), None, ctx.clone(), transaction_handle.clone()).await?;
-                                                default_val = cast_value_to_type(default_val, &col_def.data_type)?;
-                                                new_child_val[col_name] = default_val;
-                                            } else {
-                                                return Err(anyhow!("Cannot SET DEFAULT because column '{}' in table '{}' has no default value", col_name, child_schema.table_name));
-                                            }
+                                            return Err(anyhow!("Cannot SET DEFAULT because column '{}' in table '{}' has no default value", col_name, child_schema.table_name));
                                         }
-
-                                        let new_val_bytes = serde_json::to_vec(&new_child_val)?;
-                                        let log_entry = LogEntry::SetJsonB { key: child_key.clone(), value: new_val_bytes.clone() };
-                                        log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
-
-                                        ctx.index_manager.remove_key_from_indexes(&child_key, &old_child_val_for_index).await;
-                                        ctx.index_manager.add_key_to_indexes(&child_key, &new_child_val).await;
-
-                                        let new_version = crate::types::VersionedValue {
-                                            value: DbValue::JsonB(new_val_bytes),
-                                            creator_txid: 0, // Or a proper txid
-                                            expirer_txid: 0,
-                                        };
-                                        ctx.db.insert(child_key, RwLock::new(vec![new_version]));
                                     }
+                                    let executor = crate::storage_executor::StorageExecutor::new(ctx.clone(), transaction_handle.clone().unwrap());
+                                    executor.update_rows(&child_schema.table_name, results, &set_clauses).await?;
                                 }
                                 _ => { // RESTRICT or NO ACTION
                                     return Err(anyhow!(
@@ -2414,6 +1865,17 @@ async fn apply_on_update_actions(
                         .iter()
                         .map(|col_name| old_parent_row_data.get(col_name).cloned().unwrap_or(Value::Null))
                         .collect();
+
+                    let new_parent_key_values: Vec<Value> = fk
+                        .references_columns
+                        .iter()
+                        .map(|col_name| new_parent_row_data.get(col_name).cloned().unwrap_or(Value::Null))
+                        .collect();
+
+                    // If the key didn't change, no action is needed.
+                    if old_parent_key_values == new_parent_key_values {
+                        continue;
+                    }
 
                     if old_parent_key_values.iter().any(|v| v.is_null()) {
                         continue; // Cannot match on NULL
@@ -2454,150 +1916,35 @@ async fn apply_on_update_actions(
                             let on_update_action = fk.on_update.as_deref().unwrap_or("NO ACTION").to_uppercase();
                             match on_update_action.as_str() {
                                 "CASCADE" => {
-                                    let new_parent_pk_values: HashMap<String, Value> = fk.references_columns.iter()
-                                        .zip(fk.columns.iter())
-                                        .filter_map(|(ref_col, fk_col)| {
-                                            new_parent_row_data.get(ref_col).map(|v| (fk_col.clone(), v.clone()))
-                                        })
-                                        .collect();
-
-                                    for child_row in results {
-                                        let child_key = child_row.as_object()
-                                            .and_then(|obj| obj.values().next())
-                                            .and_then(|table_obj| table_obj.get("_key"))
-                                            .and_then(|k| k.as_str())
-                                                                                    .map(|s| s.to_string())
-                                                                                    .ok_or_else(|| anyhow!("Could not get child key for CASCADE update"))?;
-                                            
-                                                                                    let old_child_val_for_index = if let Some(version_chain_lock) = ctx.db.get(&child_key) {
-                                                                                        let version_chain = version_chain_lock.read().await;
-                                                                                        if let Some(latest_version) = version_chain.iter().rev().find(|v| ctx.tx_status_manager.get_status(v.creator_txid) == Some(crate::types::TransactionStatus::Committed)) {
-                                                                                            match &latest_version.value {
-                                                                                                DbValue::Json(j) => j.clone(),
-                                                                                                DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
-                                                                                                _ => Value::Null,
-                                                                                            }
-                                                                                        } else {
-                                                                                            Value::Null
-                                                                                        }
-                                                                                    } else {
-                                                                                        Value::Null
-                                                                                    };
-                                        let mut new_child_val = old_child_val_for_index.clone();
-                                        for (col_name, new_val) in &new_parent_pk_values {
-                                            new_child_val[col_name] = new_val.clone();
-                                        }
-                                        let new_val_bytes = serde_json::to_vec(&new_child_val)?;
-                                        let log_entry = LogEntry::SetJsonB { key: child_key.clone(), value: new_val_bytes.clone() };
-                                        log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
-
-                                        ctx.index_manager.remove_key_from_indexes(&child_key, &old_child_val_for_index).await;
-                                        ctx.index_manager.add_key_to_indexes(&child_key, &new_child_val).await;
-
-                                        let new_version = crate::types::VersionedValue {
-                                            value: DbValue::JsonB(new_val_bytes),
-                                            creator_txid: 0, // Or a proper txid
-                                            expirer_txid: 0,
-                                        };
-                                        ctx.db.insert(child_key, RwLock::new(vec![new_version]));
+                                    let mut set_clauses = Vec::new();
+                                    for (i, col_name) in fk.columns.iter().enumerate() {
+                                        set_clauses.push((col_name.clone(), Expression::Literal(new_parent_key_values[i].clone())));
                                     }
+                                    let executor = crate::storage_executor::StorageExecutor::new(ctx.clone(), transaction_handle.clone().unwrap());
+                                    executor.update_rows(&child_schema.table_name, results, &set_clauses).await?;
                                 }
                                 "SET NULL" => {
-                                    for child_row in results {
-                                        let child_key = child_row.as_object()
-                                            .and_then(|obj| obj.values().next())
-                                            .and_then(|table_obj| table_obj.get("_key"))
-                                            .and_then(|k| k.as_str())
-                                            .map(|s| s.to_string())
-                                            .ok_or_else(|| anyhow!("Could not get child key for SET NULL update"))?;
-
-                                        let old_child_val_for_index = if let Some(version_chain_lock) = ctx.db.get(&child_key) {
-                                            let version_chain = version_chain_lock.read().await;
-                                            if let Some(latest_version) = version_chain.iter().rev().find(|v| ctx.tx_status_manager.get_status(v.creator_txid) == Some(crate::types::TransactionStatus::Committed)) {
-                                                match &latest_version.value {
-                                                    DbValue::Json(j) => j.clone(),
-                                                    DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
-                                                    _ => Value::Null,
-                                                }
-                                            } else {
-                                                Value::Null
-                                            }
-                                        } else {
-                                            Value::Null
-                                        };
-
-                                        let mut new_child_val = old_child_val_for_index.clone();
-                                        for col_name in &fk.columns {
-                                            new_child_val[col_name] = Value::Null;
-                                        }
-
-                                        let new_val_bytes = serde_json::to_vec(&new_child_val)?;
-                                        let log_entry = LogEntry::SetJsonB { key: child_key.clone(), value: new_val_bytes.clone() };
-                                        log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
-
-                                        ctx.index_manager.remove_key_from_indexes(&child_key, &old_child_val_for_index).await;
-                                        ctx.index_manager.add_key_to_indexes(&child_key, &new_child_val).await;
-
-                                        let new_version = crate::types::VersionedValue {
-                                            value: DbValue::JsonB(new_val_bytes),
-                                            creator_txid: 0, // Or a proper txid
-                                            expirer_txid: 0,
-                                        };
-                                        ctx.db.insert(child_key, RwLock::new(vec![new_version]));
+                                    let mut set_clauses = Vec::new();
+                                    for col_name in &fk.columns {
+                                        set_clauses.push((col_name.clone(), Expression::Literal(Value::Null)));
                                     }
+                                    let executor = crate::storage_executor::StorageExecutor::new(ctx.clone(), transaction_handle.clone().unwrap());
+                                    executor.update_rows(&child_schema.table_name, results, &set_clauses).await?;
                                 }
                                 "SET DEFAULT" => {
-                                    for child_row in results {
-                                        let child_key = child_row.as_object()
-                                            .and_then(|obj| obj.values().next())
-                                            .and_then(|table_obj| table_obj.get("_key"))
-                                            .and_then(|k| k.as_str())
-                                            .map(|s| s.to_string())
-                                            .ok_or_else(|| anyhow!("Could not get child key for SET DEFAULT update"))?;
+                                    let mut set_clauses = Vec::new();
+                                    for col_name in &fk.columns {
+                                        let col_def = child_schema.columns.get(col_name)
+                                            .ok_or_else(|| anyhow!("Column '{}' not found in child table '{}' for SET DEFAULT", col_name, child_schema.table_name))?;
 
-                                        let old_child_val_for_index = if let Some(version_chain_lock) = ctx.db.get(&child_key) {
-                                            let version_chain = version_chain_lock.read().await;
-                                            if let Some(latest_version) = version_chain.iter().rev().find(|v| ctx.tx_status_manager.get_status(v.creator_txid) == Some(crate::types::TransactionStatus::Committed)) {
-                                                match &latest_version.value {
-                                                    DbValue::Json(j) => j.clone(),
-                                                    DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
-                                                    _ => Value::Null,
-                                                }
-                                            } else {
-                                                Value::Null
-                                            }
+                                        if let Some(default_expr) = &col_def.default {
+                                            set_clauses.push((col_name.clone(), default_expr.clone()));
                                         } else {
-                                            Value::Null
-                                        };
-
-                                        let mut new_child_val = old_child_val_for_index.clone();
-                                        for col_name in &fk.columns {
-                                            let col_def = child_schema.columns.get(col_name)
-                                                .ok_or_else(|| anyhow!("Column '{}' not found in child table '{}' for SET DEFAULT", col_name, child_schema.table_name))?;
-
-                                            if let Some(default_expr) = &col_def.default {
-                                                let mut default_val = default_expr.evaluate_with_context(&json!({}), None, ctx.clone(), transaction_handle.clone()).await?;
-                                                default_val = cast_value_to_type(default_val, &col_def.data_type)?;
-                                                new_child_val[col_name] = default_val;
-                                            } else {
-                                                return Err(anyhow!("Cannot SET DEFAULT because column '{}' in table '{}' has no default value", col_name, child_schema.table_name));
-                                            }
+                                            return Err(anyhow!("Cannot SET DEFAULT because column '{}' in table '{}' has no default value", col_name, child_schema.table_name));
                                         }
-
-                                        let new_val_bytes = serde_json::to_vec(&new_child_val)?;
-                                        let log_entry = LogEntry::SetJsonB { key: child_key.clone(), value: new_val_bytes.clone() };
-                                        log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
-
-                                        ctx.index_manager.remove_key_from_indexes(&child_key, &old_child_val_for_index).await;
-                                        ctx.index_manager.add_key_to_indexes(&child_key, &new_child_val).await;
-
-                                        let new_version = crate::types::VersionedValue {
-                                            value: DbValue::JsonB(new_val_bytes),
-                                            creator_txid: 0, // Or a proper txid
-                                            expirer_txid: 0,
-                                        };
-                                        ctx.db.insert(child_key, RwLock::new(vec![new_version]));
                                     }
+                                    let executor = crate::storage_executor::StorageExecutor::new(ctx.clone(), transaction_handle.clone().unwrap());
+                                    executor.update_rows(&child_schema.table_name, results, &set_clauses).await?;
                                 }
                                 _ => { // RESTRICT or NO ACTION
                                     return Err(anyhow!(
@@ -2615,3 +1962,4 @@ async fn apply_on_update_actions(
     }
     Ok(())
 }
+

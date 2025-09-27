@@ -136,5 +136,4 @@ def test_transactions(sock, reader, ffi_path=None):
     finally:
         if cursor1: cursor1.close()
         if cursor2: cursor2.close()
-        if conn1 and ffi_path: conn1.close()
         if conn2: conn2.close()
