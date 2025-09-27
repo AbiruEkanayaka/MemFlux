@@ -49,6 +49,9 @@ pub async fn process_command(
         "BEGIN" => handle_begin(command, ctx, transaction_handle).await,
         "COMMIT" => handle_commit(command, ctx, transaction_handle).await,
         "ROLLBACK" => handle_rollback(command, ctx, transaction_handle).await,
+        "SAVEPOINT" => handle_savepoint(command, ctx, transaction_handle).await,
+        "ROLLBACK_TO_SAVEPOINT" => handle_rollback_to_savepoint(command, ctx, transaction_handle).await,
+        "RELEASE_SAVEPOINT" => handle_release_savepoint(command, ctx, transaction_handle).await,
         "VACUUM" => handle_vacuum(ctx).await,
         _ => Response::Error(format!("Unknown command: {}", command.name)),
     }
@@ -1055,6 +1058,93 @@ async fn handle_rollback(
         ctx.tx_status_manager.abort(tx.txid);
         println!("Transaction {} rolled back.", tx.id);
         Response::Ok
+    } else {
+        Response::Error("No transaction in progress".to_string())
+    }
+}
+
+async fn handle_savepoint(
+    command: Command,
+    _ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
+    if command.args.len() != 2 {
+        return Response::Error("SAVEPOINT requires a name".to_string());
+    }
+    let savepoint_name = match String::from_utf8(command.args[1].clone()) {
+        Ok(n) => n,
+        Err(_) => return Response::Error("Invalid savepoint name".to_string()),
+    };
+
+    let mut tx_guard = transaction_handle.write().await;
+    if let Some(tx) = tx_guard.as_mut() {
+        if tx.savepoints.contains_key(&savepoint_name) {
+            return Response::Error(format!("Savepoint '{}' already exists", savepoint_name));
+        }
+        tx.savepoints.insert(
+            savepoint_name.clone(),
+            (tx.log_entries.clone(), tx.writes.clone()),
+        );
+        tx.log_entries.push(LogEntry::Savepoint { name: savepoint_name.clone() });
+        println!("Savepoint '{}' created for transaction {}.", savepoint_name, tx.id);
+        Response::Ok
+    } else {
+        Response::Error("No transaction in progress".to_string())
+    }
+}
+
+async fn handle_rollback_to_savepoint(
+    command: Command,
+    _ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
+    if command.args.len() != 2 {
+        return Response::Error("ROLLBACK TO SAVEPOINT requires a name".to_string());
+    }
+    let savepoint_name = match String::from_utf8(command.args[1].clone()) {
+        Ok(n) => n,
+        Err(_) => return Response::Error("Invalid savepoint name".to_string()),
+    };
+
+    let mut tx_guard = transaction_handle.write().await;
+    if let Some(tx) = tx_guard.as_mut() {
+        if let Some((saved_log_entries, saved_writes)) = tx.savepoints.get(&savepoint_name) {
+            // Revert log_entries and writes to the savepoint state
+            tx.log_entries = saved_log_entries.clone();
+            tx.writes = saved_writes.clone();
+            tx.log_entries.push(LogEntry::RollbackToSavepoint { name: savepoint_name.clone() });
+            println!("Transaction {} rolled back to savepoint '{}'.", tx.id, savepoint_name);
+            Response::Ok
+        } else {
+            Response::Error(format!("Savepoint '{}' not found", savepoint_name))
+        }
+    } else {
+        Response::Error("No transaction in progress".to_string())
+    }
+}
+
+async fn handle_release_savepoint(
+    command: Command,
+    _ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
+    if command.args.len() != 2 {
+        return Response::Error("RELEASE SAVEPOINT requires a name".to_string());
+    }
+    let savepoint_name = match String::from_utf8(command.args[1].clone()) {
+        Ok(n) => n,
+        Err(_) => return Response::Error("Invalid savepoint name".to_string()),
+    };
+
+    let mut tx_guard = transaction_handle.write().await;
+    if let Some(tx) = tx_guard.as_mut() {
+        if tx.savepoints.remove(&savepoint_name).is_some() {
+            tx.log_entries.push(LogEntry::ReleaseSavepoint { name: savepoint_name.clone() });
+            println!("Savepoint '{}' released for transaction {}.", savepoint_name, tx.id);
+            Response::Ok
+        } else {
+            Response::Error(format!("Savepoint '{}' not found", savepoint_name))
+        }
     } else {
         Response::Error("No transaction in progress".to_string())
     }

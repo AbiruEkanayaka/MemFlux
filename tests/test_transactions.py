@@ -115,21 +115,59 @@ def test_transactions(sock, reader, ffi_path=None):
         assert_eq(c1.send(["ROLLBACK"]), "+OK", f"{c1.name}: ROLLBACK outer transaction") # Clean up
         print("[PASS] Nested transaction tests complete.")
 
-        # --- 5. Test COMMIT/ROLLBACK without active transaction ---
-        print("\n-- Phase 5: COMMIT/ROLLBACK without active transaction --")
+        # --- 5. Test Savepoints ---
+        print("\n-- Phase 5: Savepoints --")
+        c1.send(["FLUSHDB"])
+        assert_eq(c1.send(["BEGIN"]), "+OK", f"{c1.name}: BEGIN transaction for savepoints")
+        assert_eq(c1.send(["SET", "sp_key1", "value1"]), "+OK", f"{c1.name}: SET sp_key1")
+        assert_eq(c1.send(["SAVEPOINT", "sp1"]), "+OK", f"{c1.name}: SAVEPOINT sp1")
+        assert_eq(c1.send(["SET", "sp_key2", "value2"]), "+OK", f"{c1.name}: SET sp_key2")
+        assert_eq(c1.send(["SAVEPOINT", "sp2"]), "+OK", f"{c1.name}: SAVEPOINT sp2")
+        assert_eq(c1.send(["SET", "sp_key3", "value3"]), "+OK", f"{c1.name}: SET sp_key3")
+
+        # Verify values before rollback
+        assert_eq(c1.get_value("sp_key1"), "value1", f"{c1.name}: sp_key1 visible before rollback")
+        assert_eq(c1.get_value("sp_key2"), "value2", f"{c1.name}: sp_key2 visible before rollback")
+        assert_eq(c1.get_value("sp_key3"), "value3", f"{c1.name}: sp_key3 visible before rollback")
+
+        # ROLLBACK TO SAVEPOINT sp2
+        assert_eq(c1.send(["ROLLBACK_TO_SAVEPOINT", "sp2"]), "+OK", f"{c1.name}: ROLLBACK TO SAVEPOINT sp2")
+        assert_eq(c1.get_value("sp_key1"), "value1", f"{c1.name}: sp_key1 visible after rollback to sp2")
+        assert_eq(c1.get_value("sp_key2"), "value2", f"{c1.name}: sp_key2 visible after rollback to sp2")
+        assert_eq(c1.get_value("sp_key3"), "$-1", f"{c1.name}: sp_key3 NOT visible after rollback to sp2")
+
+        # RELEASE SAVEPOINT sp1
+        assert_eq(c1.send(["RELEASE_SAVEPOINT", "sp1"]), "+OK", f"{c1.name}: RELEASE SAVEPOINT sp1")
+        assert_eq(c1.send(["RELEASE_SAVEPOINT", "sp1"]).startswith("-ERR"), True, f"{c1.name}: RELEASE non-existent savepoint should fail")
+
+        # Commit the transaction
+        assert_eq(c1.send(["COMMIT"]), "+OK", f"{c1.name}: COMMIT transaction after savepoints")
+        assert_eq(c2.get_value("sp_key1"), "value1", f"{c2.name}: sp_key1 visible after commit")
+        assert_eq(c2.get_value("sp_key2"), "value2", f"{c2.name}: sp_key2 visible after commit")
+        assert_eq(c2.get_value("sp_key3"), "$-1", f"{c2.name}: sp_key3 NOT visible after commit")
+
+        # Test error cases
+        assert_eq(c1.send(["SAVEPOINT", "sp_no_tx"]).startswith("-ERR"), True, f"{c1.name}: SAVEPOINT without active transaction should fail")
+        assert_eq(c1.send(["ROLLBACK_TO_SAVEPOINT", "sp_no_tx"]).startswith("-ERR"), True, f"{c1.name}: ROLLBACK TO SAVEPOINT without active transaction should fail")
+        assert_eq(c1.send(["RELEASE_SAVEPOINT", "sp_no_tx"]).startswith("-ERR"), True, f"{c1.name}: RELEASE SAVEPOINT without active transaction should fail")
+
+        print("[PASS] Savepoint tests complete.")
+
+        # --- 6. Test COMMIT/ROLLBACK without active transaction ---
+        print("\n-- Phase 6: COMMIT/ROLLBACK without active transaction --")
         assert_eq(c1.send(["COMMIT"]).startswith("-ERR"), True, f"{c1.name}: COMMIT without active transaction should fail")
         assert_eq(c1.send(["ROLLBACK"]).startswith("-ERR"), True, f"{c1.name}: ROLLBACK without active transaction should fail")
         print("[PASS] COMMIT/ROLLBACK without active transaction tests complete.")
 
-        # --- 6. Test DML operations outside a transaction (auto-commit) ---
-        print("\n-- Phase 6: DML outside transaction (auto-commit) --")
+        # --- 7. Test DML operations outside a transaction (auto-commit) ---
+        print("\n-- Phase 7: DML outside transaction (auto-commit) --")
         c1.send(["FLUSHDB"])
         assert_eq(c1.send(["SET", "auto_key", "auto_value"]), "+OK", f"{c1.name}: SET auto_key outside transaction")
         assert_eq(c2.get_value("auto_key"), "auto_value", f"{c2.name}: auto_key should be immediately visible (auto-commit)")
         print("[PASS] DML outside transaction tests complete.")
 
-        # --- 7. Cleanup ---
-        print("\n-- Phase 7: Cleanup --")
+        # --- 8. Cleanup ---
+        print("\n-- Phase 8: Cleanup --")
         c1.send(["WIPEDB"])
         print("[PASS] Cleanup complete.")
 

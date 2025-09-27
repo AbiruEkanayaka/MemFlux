@@ -1,6 +1,7 @@
 use crate::types::{
     DbValue, LogEntry, Snapshot, TransactionIdManager, TransactionStatus, TransactionStatusManager, TxId,
 };
+use std::collections::HashMap;
 use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -19,6 +20,7 @@ pub struct Transaction {
     pub writes: DashMap<String, Option<DbValue>>,
     /// A cache of data read from the main database to ensure repeatable reads within the transaction.
     pub read_cache: DashMap<String, Option<DbValue>>,
+    pub savepoints: HashMap<String, (Vec<LogEntry>, DashMap<String, Option<DbValue>>)>,
 }
 
 impl Transaction {
@@ -37,6 +39,7 @@ impl Transaction {
             log_entries: Vec::new(),
             writes: DashMap::new(),
             read_cache: DashMap::new(),
+            savepoints: HashMap::new(),
         }
     }
 }

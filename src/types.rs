@@ -279,6 +279,9 @@ pub enum LogEntry {
     BeginTransaction { id: Uuid },
     CommitTransaction { id: Uuid },
     RollbackTransaction { id: Uuid },
+    Savepoint { name: String },
+    RollbackToSavepoint { name: String },
+    ReleaseSavepoint { name: String },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
