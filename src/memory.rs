@@ -296,6 +296,31 @@ impl MemoryManager {
         self.max_memory_bytes
     }
 
+    pub async fn reset(&self) {
+        self.estimated_memory.store(0, Ordering::Relaxed);
+        match self.policy {
+            EvictionPolicy::LRU => {
+                self.lru_keys.write().await.clear();
+            }
+            EvictionPolicy::LFU => {
+                self.lfu_freqs.write().await.clear();
+                self.lfu_freq_keys.write().await.clear();
+                *self.lfu_min_freq.write().await = 0;
+            }
+            EvictionPolicy::LFRU => {
+                self.lfru_probationary.write().await.clear();
+                self.lfru_protected.write().await.clear();
+            }
+            EvictionPolicy::ARC => {
+                let capacity = self.arc_cache.read().await.capacity;
+                *self.arc_cache.write().await = ArcCache::new(capacity);
+            }
+            EvictionPolicy::Random => {
+                self.random_keys.write().await.clear();
+            }
+        }
+    }
+
     /// Restores an evicted key back into the cache tracking structures.
     pub async fn restore_evicted_key(&self, key: String, old_freq: Option<u64>) {
         match self.policy {

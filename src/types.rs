@@ -53,6 +53,10 @@ impl TransactionIdManager {
     pub fn get_current_txid(&self) -> TxId {
         self.next_txid.load(Ordering::Relaxed)
     }
+
+    pub fn reset(&self) {
+        self.next_txid.store(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -91,6 +95,10 @@ impl TransactionStatusManager {
             .filter(|entry| *entry.value() == TransactionStatus::Active)
             .map(|entry| *entry.key())
             .collect()
+    }
+
+    pub fn reset(&self) {
+        self.statuses.clear();
     }
 }
 

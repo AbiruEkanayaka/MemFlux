@@ -130,7 +130,7 @@ def test_transactions(sock, reader, ffi_path=None):
 
         # --- 7. Cleanup ---
         print("\n-- Phase 7: Cleanup --")
-        c1.send(["FLUSHDB"])
+        c1.send(["WIPEDB"])
         print("[PASS] Cleanup complete.")
 
     finally:

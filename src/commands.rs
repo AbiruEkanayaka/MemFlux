@@ -40,6 +40,7 @@ pub async fn process_command(
         "SISMEMBER" => handle_sismember(command, ctx, transaction_handle).await,
         "KEYS" => handle_keys(command, ctx, transaction_handle).await,
         "FLUSHDB" => handle_flushdb(command, ctx).await,
+        "WIPEDB" => handle_wipedb(command, ctx, transaction_handle).await,
         "SAVE" => handle_save(command, ctx).await,
         "MEMUSAGE" => handle_memory_usage(command, ctx).await,
         "CREATEINDEX" => handle_createindex(command, ctx).await,
@@ -1832,11 +1833,56 @@ async fn handle_flushdb(command: Command, ctx: &AppContext) -> Response {
     // We don't log this; it's a meta-operation that implies starting fresh.
     // A snapshot will be triggered on next write anyway.
     ctx.db.clear();
-    ctx.index_manager.indexes.clear();
-    ctx.index_manager.prefix_to_indexes.clear();
+    ctx.index_manager.clear();
     ctx.json_cache.clear();
     ctx.schema_cache.clear();
+    ctx.view_cache.clear();
     println!("Database flushed.");
+    Response::Ok
+}
+
+async fn handle_wipedb(
+    command: Command,
+    ctx: &AppContext,
+    transaction_handle: TransactionHandle,
+) -> Response {
+    if command.args.len() != 1 {
+        return Response::Error("WIPEDB takes no arguments".to_string());
+    }
+
+    // It's a very destructive command, so let's prevent it from being used inside a transaction.
+    let tx_guard = transaction_handle.read().await;
+    if tx_guard.is_some() {
+        return Response::Error(
+            "WIPEDB cannot be run inside a transaction. Please COMMIT or ROLLBACK first."
+                .to_string(),
+        );
+    }
+    drop(tx_guard);
+
+    // This is a dangerous command. In a real system, we might want a confirmation
+    // or specific privileges. For now, we just clear everything.
+    // This is a meta-operation and is not logged to the WAL.
+
+    // 1. Clear main data store
+    ctx.db.clear();
+
+    // 2. Clear all caches
+    ctx.json_cache.clear();
+    ctx.schema_cache.clear();
+    ctx.view_cache.clear();
+
+    // 3. Reset index manager
+    ctx.index_manager.clear();
+
+    // 4. Reset memory manager
+    ctx.memory.reset().await;
+
+    // 5. Reset transaction managers
+    ctx.tx_id_manager.reset();
+    ctx.tx_status_manager.reset();
+
+    println!("Database wiped completely.");
     Response::Ok
 }
 

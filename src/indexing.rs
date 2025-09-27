@@ -19,6 +19,12 @@ pub struct IndexManager {
 }
 
 impl IndexManager {
+    pub fn clear(&self) {
+        self.indexes.clear();
+        self.prefix_to_indexes.clear();
+        self.name_to_internal_name.clear();
+    }
+
     pub fn get_indexes_for_key(&self, key: &str) -> Vec<(String, String)> {
         let mut applicable = Vec::new();
         for item in self.prefix_to_indexes.iter() {
