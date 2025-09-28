@@ -1,10 +1,10 @@
-
 use crate::transaction::{Transaction, TransactionHandle};
+use std::sync::atomic::Ordering;
 use anyhow::{anyhow, Result};
 use async_stream::try_stream;
 use futures::stream::{Stream, StreamExt, TryStreamExt};
 use serde_json::{json, Value};
-use std::cmp::Ordering;
+
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -91,15 +91,15 @@ fn compare_typed_values(
     val_a: &Value,
     val_b: &Value,
     target_type: &Option<DataType>,
-) -> Ordering {
+) -> std::cmp::Ordering {
     if val_a.is_null() && val_b.is_null() {
-        return Ordering::Equal;
+        return std::cmp::Ordering::Equal;
     }
     if val_a.is_null() {
-        return Ordering::Less;
+        return std::cmp::Ordering::Less;
     } // NULLS FIRST
     if val_b.is_null() {
-        return Ordering::Greater;
+        return std::cmp::Ordering::Greater;
     }
 
     if let Some(data_type) = target_type {
@@ -119,7 +119,7 @@ fn compare_typed_values(
                     .or_else(|| val_b.as_str().and_then(|s| s.parse::<f64>().ok()));
 
                 if let (Some(a), Some(b)) = (a_num, b_num) {
-                    return a.partial_cmp(&b).unwrap_or(Ordering::Equal);
+                    return a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal);
                 }
             }
             _ => {} // For Text and Boolean, default comparison is fine.
@@ -132,7 +132,7 @@ fn compare_typed_values(
             .as_f64()
             .unwrap()
             .partial_cmp(&n_b.as_f64().unwrap())
-            .unwrap_or(Ordering::Equal),
+            .unwrap_or(std::cmp::Ordering::Equal),
         (Value::String(s_a), Value::String(s_b)) => s_a.cmp(s_b),
         (Value::Bool(b_a), Value::Bool(b_b)) => b_a.cmp(b_b),
         _ => val_a.to_string().cmp(&val_b.to_string()),
@@ -495,11 +495,11 @@ pub fn execute<'a>(
                         let ord = compare_typed_values(val_a, val_b, &target_type);
 
                         let ord = if *asc { ord } else { ord.reverse() };
-                        if ord != Ordering::Equal {
+                        if ord != std::cmp::Ordering::Equal {
                             return ord;
                         }
                     }
-                    Ordering::Equal
+                    std::cmp::Ordering::Equal
                 });
 
                 for (_, row) in sort_data {
@@ -1451,8 +1451,9 @@ pub fn execute<'a>(
                     if tx_guard.is_some() {
                         Err(anyhow!("Transaction already in progress"))?;
                     }
-                    let new_tx = Transaction::new(&ctx.tx_id_manager, &ctx.tx_status_manager);
-                    println!("Transaction {} started.", new_tx.id);
+                    let new_tx = Arc::new(Transaction::new(&ctx.tx_id_manager, &ctx.tx_status_manager));
+                    println!("Transaction {} ({}) started.", new_tx.id, new_tx.txid);
+                    ctx.active_transactions.insert(new_tx.txid, new_tx.clone());
                     *tx_guard = Some(new_tx);
                     yield json!({"status": "Transaction started"});
                 } else {
@@ -1468,135 +1469,83 @@ pub fn execute<'a>(
                                     None => Err(anyhow!("No transaction in progress"))?,
                                 }
                             };
-            
-                            if ctx.config.durability == crate::config::DurabilityLevel::None && ctx.config.persistence {
-                                // --- Apply changes to in-memory DB FIRST ---
-                                for write_item in tx.writes.iter() {
-                                    let key = write_item.key();
-                                    let new_value_opt = write_item.value();
-            
-                                    let mut version_chain_lock = ctx.db.entry(key.clone()).or_default();
-                                    let mut version_chain = version_chain_lock.value_mut().write().await;
-            
-                                    // Find the version that was visible to this transaction and expire it.
-                                    for version in version_chain.iter_mut().rev() {
-                                        if tx.snapshot.is_visible(version, &ctx.tx_status_manager) {
-                                            if version.expirer_txid == 0 {
-                                                version.expirer_txid = tx.txid;
-                                            }
-                                            break; // Only expire the most recent visible version
-                                        }
-                                    }
-            
-                                    // Add the new version if it's an insert or update
-                                    if let Some(new_db_value) = new_value_opt {
-                                        let new_version = crate::types::VersionedValue {
-                                            value: new_db_value.clone(),
-                                            creator_txid: tx.txid,
-                                            expirer_txid: 0,
-                                        };
-                                        version_chain.push(new_version);
-                                    }
+
+                            ctx.active_transactions.remove(&tx.txid);
+
+                            if ctx.config.isolation_level == crate::config::IsolationLevel::Serializable {
+                                if tx.ssi_in_conflict.load(Ordering::Relaxed) {
+                                    ctx.tx_status_manager.abort(tx.txid);
+                                    println!("Transaction {} ({}) aborted due to serialization conflict.", tx.id, tx.txid);
+                                    Err(anyhow!("ABORT: Serialization failure, please retry transaction"))?;
                                 }
-            
-                                // --- Mark transaction as committed ---
-                                ctx.tx_status_manager.commit(tx.txid);
-            
-                                // --- Log to WAL in background ---
-                                let logger = ctx.logger.clone();
-                                let log_entries = tx.log_entries; // move
-                                let tx_id = tx.id;
-                                tokio::spawn(async move {
-                                    if !log_entries.is_empty() {
-                                        for entry in log_entries {
-                                            let (ack_tx, _ack_rx) = oneshot::channel();
-                                            let log_req = LogRequest {
-                                                entry,
-                                                ack: ack_tx,
-                                                durability: crate::config::DurabilityLevel::None,
-                                            };
-                                            if logger.send(PersistenceRequest::Log(log_req)).await.is_err() {
-                                                eprintln!("Error sending to persistence engine for committed tx {}", tx_id);
-                                            }
+                            }
+
+                            if ctx.config.persistence {
+                                let log_entries = tx.log_entries.read().await;
+                                if !log_entries.is_empty() {
+                                    for (i, entry) in log_entries.iter().enumerate() {
+                                        let is_last = i == log_entries.len() - 1;
+                                        let durability = if is_last { ctx.config.durability.clone() } else { crate::config::DurabilityLevel::None };
+                                        let (ack_tx, ack_rx) = oneshot::channel();
+                                        if ctx.logger.send(PersistenceRequest::Log(LogRequest { entry: entry.clone(), ack: ack_tx, durability })).await.is_err() {
+                                            ctx.tx_status_manager.abort(tx.txid);
+                                            Err(anyhow!("Persistence engine is down, commit failed. Transaction rolled back."))?;
                                         }
-                                    }
-                                });
-            
-                                println!("Transaction {} committed.", tx.id);
-                                yield json!({ "status": "Transaction committed" });
-            
-                            } else {
-                                // Original logic for Fsync/Full
-                                // --- Write to WAL first ---
-                                if ctx.config.persistence {
-                                    let num_entries = tx.log_entries.len();
-                                    if num_entries > 0 {
-                                        for (i, entry) in tx.log_entries.iter().enumerate() {
-                                            // For the final entry, use the configured durability. For all others, use None.
-                                            let durability = if i == num_entries - 1 {
-                                                ctx.config.durability.clone()
-                                            } else {
-                                                crate::config::DurabilityLevel::None
-                                            };
-            
-                                            let (ack_tx, ack_rx) = oneshot::channel();
-                                            if ctx.logger.send(PersistenceRequest::Log(LogRequest { entry: entry.clone(), ack: ack_tx, durability })).await.is_err() {
-                                                ctx.tx_status_manager.abort(tx.txid);
-                                                Err(anyhow!("Persistence engine is down, commit failed. Transaction rolled back."))?;
-                                            }
-            
-                                            // Only wait for the ACK on the final, durable write.
-                                            if i == num_entries - 1 {
-                                                match ack_rx.await {
-                                                    Ok(Ok(())) => {} // Success
-                                                    Ok(Err(e)) => {
-                                                        ctx.tx_status_manager.abort(tx.txid);
-                                                        Err(anyhow!("WAL write error during commit: {}. Transaction rolled back.", e))?;
-                                                    }
-                                                    Err(_) => {
-                                                        ctx.tx_status_manager.abort(tx.txid);
-                                                        Err(anyhow!("Persistence engine dropped ACK channel during commit. Transaction rolled back."))?;
-                                                    }
+                                        if is_last {
+                                            match ack_rx.await {
+                                                Ok(Ok(())) => {}
+                                                Ok(Err(e)) => {
+                                                    ctx.tx_status_manager.abort(tx.txid);
+                                                    Err(anyhow!("WAL write error during commit: {}. Transaction rolled back.", e))?;
+                                                }
+                                                Err(_) => {
+                                                    ctx.tx_status_manager.abort(tx.txid);
+                                                    Err(anyhow!("Persistence engine dropped ACK channel during commit. Transaction rolled back."))?;
                                                 }
                                             }
                                         }
                                     }
                                 }
-            
-                                // --- Apply changes to in-memory DB ---
+                            }
+
+                            if ctx.config.isolation_level == crate::config::IsolationLevel::Serializable {
                                 for write_item in tx.writes.iter() {
-                                    let key = write_item.key();
-                                    let new_value_opt = write_item.value();
-            
-                                    let mut version_chain_lock = ctx.db.entry(key.clone()).or_default();
-                                    let mut version_chain = version_chain_lock.value_mut().write().await;
-            
-                                    // Find the version that was visible to this transaction and expire it.
-                                    for version in version_chain.iter_mut().rev() {
-                                        if tx.snapshot.is_visible(version, &ctx.tx_status_manager) {
-                                            if version.expirer_txid == 0 {
-                                                version.expirer_txid = tx.txid;
-                                            }
-                                            break; // Only expire the most recent visible version
+                                    let written_key = write_item.key();
+                                    for other_tx_entry in ctx.active_transactions.iter() {
+                                        let other_tx = other_tx_entry.value();
+                                        if tx.snapshot.xip.contains(&other_tx.txid) && other_tx.reads.contains_key(written_key) {
+                                            other_tx.ssi_in_conflict.store(true, Ordering::Relaxed);
                                         }
                                     }
-            
-                                    // Add the new version if it's an insert or update
-                                    if let Some(new_db_value) = new_value_opt {
-                                        let new_version = crate::types::VersionedValue {
-                                            value: new_db_value.clone(),
-                                            creator_txid: tx.txid,
-                                            expirer_txid: 0,
-                                        };
-                                        version_chain.push(new_version);
+                                }
+                            }
+
+                            for write_item in tx.writes.iter() {
+                                let key = write_item.key();
+                                let new_value_opt = write_item.value();
+                                let mut version_chain_lock = ctx.db.entry(key.clone()).or_default();
+                                let mut version_chain = version_chain_lock.value_mut().write().await;
+                                for version in version_chain.iter_mut().rev() {
+                                    if tx.snapshot.is_visible(version, &ctx.tx_status_manager) {
+                                        if version.expirer_txid == 0 {
+                                            version.expirer_txid = tx.txid;
+                                        }
+                                        break;
                                     }
                                 }
-            
-                                // --- Mark transaction as committed ---
-                                ctx.tx_status_manager.commit(tx.txid);
-                                println!("Transaction {} committed.", tx.id);
-                                yield json!({ "status": "Transaction committed" });
+                                if let Some(new_db_value) = new_value_opt {
+                                    let new_version = crate::types::VersionedValue {
+                                        value: new_db_value.clone(),
+                                        creator_txid: tx.txid,
+                                        expirer_txid: 0,
+                                    };
+                                    version_chain.push(new_version);
+                                }
                             }
+
+                            ctx.tx_status_manager.commit(tx.txid);
+                            println!("Transaction {} ({}) committed.", tx.id, tx.txid);
+                            yield json!({ "status": "Transaction committed" });
                         } else {
                             Err(anyhow!("Transaction handle not provided for COMMIT"))?;
                         }
@@ -1605,7 +1554,8 @@ pub fn execute<'a>(
                     let mut tx_guard = handle.write().await;
                     if let Some(tx) = tx_guard.take() {
                         ctx.tx_status_manager.abort(tx.txid);
-                        println!("Transaction {} rolled back.", tx.id);
+                        ctx.active_transactions.remove(&tx.txid);
+                        println!("Transaction {} ({}) rolled back.", tx.id, tx.txid);
                         yield json!({"status": "Transaction rolled back"});
                     } else {
                         Err(anyhow!("No transaction in progress"))?;
@@ -1673,78 +1623,7 @@ async fn run_agg_fn<'a>(
     Ok(result)
 }
 
-/// Checks if inserting or updating a row in a child table violates any foreign key constraints.
-async fn check_foreign_key_constraints(
-    table_name: &str,
-    row_data: &Value,
-    ctx: &Arc<AppContext>,
-    transaction_handle: Option<TransactionHandle>,
-) -> Result<()> {
-    if let Some(schema) = ctx.schema_cache.get(table_name) {
-        for constraint in &schema.constraints {
-            if let TableConstraint::ForeignKey(fk) = constraint {
-                let child_key_values: Vec<Value> = fk
-                    .columns
-                    .iter()
-                    .map(|col_name| row_data.get(col_name).cloned().unwrap_or(Value::Null))
-                    .collect();
 
-                // If any part of the foreign key is NULL, the constraint is satisfied (MATCH SIMPLE)
-                if child_key_values.iter().any(|v| v.is_null()) {
-                    continue;
-                }
-
-                // Build a filter expression to find the parent row
-                let mut filter_expr: Option<Expression> = None;
-                for (i, col_name) in fk.references_columns.iter().enumerate() {
-                    let condition = Expression::BinaryOp {
-                        left: Box::new(Expression::Column(col_name.clone())),
-                        op: Operator::Eq,
-                        right: Box::new(Expression::Literal(child_key_values[i].clone())),
-                    };
-                    if let Some(existing_expr) = filter_expr {
-                        filter_expr = Some(Expression::LogicalOp {
-                            left: Box::new(existing_expr),
-                            op: LogicalOperator::And,
-                            right: Box::new(condition),
-                        });
-                    } else {
-                        filter_expr = Some(condition);
-                    }
-                }
-
-                if let Some(predicate) = filter_expr {
-                    let scan_plan = LogicalPlan::TableScan {
-                        table_name: fk.references_table.clone(),
-                    };
-                    let filter_plan = LogicalPlan::Filter {
-                        input: Box::new(scan_plan),
-                        predicate,
-                    };
-                    let limit_plan = LogicalPlan::Limit {
-                        input: Box::new(filter_plan),
-                        limit: Some(1),
-                        offset: None,
-                    };
-
-                    let physical_plan =
-                        super::physical_plan::logical_to_physical_plan(limit_plan, &ctx.index_manager)?;
-
-                    let results: Vec<Value> = execute(physical_plan, ctx.clone(), None, None, transaction_handle.clone()).try_collect().await?;
-
-                    if results.is_empty() {
-                        return Err(anyhow!(
-                            "Insert or update on table '{}' violates foreign key constraint. A matching key was not found in table '{}'.",
-                            table_name,
-                            fk.references_table,
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
 
 
 
@@ -1962,4 +1841,3 @@ async fn apply_on_update_actions(
     }
     Ok(())
 }
-

@@ -108,6 +108,10 @@ impl MemFluxDB {
                 "Maxmemory policy is enabled ({}MB) with \'{:?}\' eviction policy.",
                 config.maxmemory_mb, config.eviction_policy
             );
+            println!(
+                "Default transaction isolation level: {:?}.",
+                config.isolation_level
+            );
         }
         println!("Calculating initial memory usage...");
         let mut initial_mem: u64 = 0;
@@ -153,6 +157,7 @@ impl MemFluxDB {
             memory: memory_manager,
             tx_id_manager,
             tx_status_manager,
+            active_transactions: Arc::new(DashMap::new()),
         });
 
         if app_context.memory.is_enabled()

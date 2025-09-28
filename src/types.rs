@@ -14,6 +14,7 @@ use crate::indexing::IndexManager;
 use crate::memory::MemoryManager;
 use crate::query_engine::ast::SelectStatement;
 use crate::schema::VirtualSchema;
+use crate::transaction::Transaction;
 
 // --- Core Data Structures ---
 
@@ -357,6 +358,7 @@ pub struct AppContext {
     pub memory: Arc<MemoryManager>,
     pub tx_id_manager: Arc<TransactionIdManager>,
     pub tx_status_manager: Arc<TransactionStatusManager>,
+    pub active_transactions: Arc<DashMap<TxId, Arc<Transaction>>>,
 }
 
 pub struct Command {

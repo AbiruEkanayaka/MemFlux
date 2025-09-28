@@ -33,6 +33,19 @@ impl Default for EvictionPolicy {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum IsolationLevel {
+    Serializable,
+    Snapshot,
+}
+
+impl Default for IsolationLevel {
+    fn default() -> Self {
+        IsolationLevel::Serializable
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
     pub host: String,
@@ -52,6 +65,8 @@ pub struct Config {
     pub maxmemory_mb: u64,
     #[serde(default)]
     pub eviction_policy: EvictionPolicy,
+    #[serde(default)]
+    pub isolation_level: IsolationLevel,
     #[serde(default)]
     pub encrypt: bool,
     #[serde(default = "default_cert_file")]
@@ -75,6 +90,8 @@ pub struct FFIConfig {
     #[serde(default)]
     pub eviction_policy: EvictionPolicy,
     #[serde(default)]
+    pub isolation_level: IsolationLevel,
+    #[serde(default)]
     pub durability: DurabilityLevel,
 }
 
@@ -92,6 +109,7 @@ impl From<FFIConfig> for Config {
             wal_size_threshold_mb: ffi_config.wal_size_threshold_mb,
             maxmemory_mb: ffi_config.maxmemory_mb,
             eviction_policy: ffi_config.eviction_policy,
+            isolation_level: ffi_config.isolation_level,
             durability: ffi_config.durability,
             encrypt: false,
             cert_file: "".to_string(),
@@ -135,6 +153,7 @@ impl Default for Config {
             wal_size_threshold_mb: 128,
             maxmemory_mb: default_maxmemory_mb(),
             eviction_policy: EvictionPolicy::default(),
+            isolation_level: IsolationLevel::default(),
             encrypt: false,
             cert_file: default_cert_file(),
             key_file: default_key_file(),

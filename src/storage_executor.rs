@@ -53,7 +53,7 @@ pub fn json_path_to_pointer(path: &str) -> String {
 pub async fn get_visible_db_value<'a>(
     key: &str,
     ctx: &'a AppContext,
-    tx: Option<&Transaction>,
+    tx: Option<&Arc<Transaction>>,
 ) -> Option<DbValue> {
     if let Some(tx) = tx {
         if let Some(entry) = tx.writes.get(key) {
@@ -62,9 +62,15 @@ pub async fn get_visible_db_value<'a>(
         if let Some(version_chain_lock) = ctx.db.get(key) {
             let version_chain = version_chain_lock.read().await;
             for version in version_chain.iter().rev() {
-                if tx.snapshot.is_visible(version, &ctx.tx_status_manager) {
+                if tx.snapshot
+                    .is_visible(version, &ctx.tx_status_manager)
+                {
                     if ctx.memory.is_enabled() {
                         ctx.memory.track_access(key).await;
+                    }
+                    // For SSI, track the version of the key that was read.
+                    if ctx.config.isolation_level == crate::config::IsolationLevel::Serializable {
+                        tx.reads.insert(key.to_string(), version.creator_txid);
                     }
                     return Some(version.value.clone());
                 }
@@ -104,7 +110,7 @@ impl StorageExecutor {
         let log_entry = LogEntry::SetBytes { key: key.clone(), value: value.clone() };
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
-            tx.log_entries.push(log_entry);
+            tx.log_entries.write().await.push(log_entry);
             tx.writes.insert(key.clone(), Some(DbValue::Bytes(value.clone())));
             return Response::Ok;
         }
@@ -153,7 +159,7 @@ impl StorageExecutor {
         if let Some(tx) = tx_guard.as_mut() {
             let mut deleted_count = 0;
             for key in keys {
-                tx.log_entries.push(LogEntry::Delete { key: key.clone() });
+                tx.log_entries.write().await.push(LogEntry::Delete { key: key.clone() });
                 tx.writes.insert(key, None);
                 deleted_count += 1;
             }
@@ -205,7 +211,7 @@ impl StorageExecutor {
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
             let log_entry = LogEntry::JsonSet { path: format!("{}.{}", key, path), value: value.to_string() };
-            tx.log_entries.push(log_entry);
+            tx.log_entries.write().await.push(log_entry);
             let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
             let mut current_val = match current_db_val {
                 Some(DbValue::Json(v)) => v.clone(),
@@ -308,7 +314,7 @@ impl StorageExecutor {
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
             let log_entry = if path.is_empty() || path == "." { LogEntry::Delete { key: key.clone() } } else { LogEntry::JsonDelete { path: format!("{}.{}", key, path) } };
-            tx.log_entries.push(log_entry);
+            tx.log_entries.write().await.push(log_entry);
             if path.is_empty() || path == "." {
                 tx.writes.insert(key.clone(), None);
             } else {
@@ -415,7 +421,7 @@ impl StorageExecutor {
         let log_entry = LogEntry::LPush { key: key.clone(), values: values.clone() };
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
-            tx.log_entries.push(log_entry);
+            tx.log_entries.write().await.push(log_entry);
             let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
             let mut current_list = match current_db_val {
                 Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
@@ -470,7 +476,7 @@ impl StorageExecutor {
         let log_entry = LogEntry::RPush { key: key.clone(), values: values.clone() };
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
-            tx.log_entries.push(log_entry);
+            tx.log_entries.write().await.push(log_entry);
             let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
             let mut current_list = match current_db_val {
                 Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
@@ -525,7 +531,7 @@ impl StorageExecutor {
         let log_entry = LogEntry::LPop { key: key.clone(), count };
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
-            tx.log_entries.push(log_entry);
+            tx.log_entries.write().await.push(log_entry);
             let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
             let mut current_list = match current_db_val {
                 Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
@@ -583,7 +589,7 @@ impl StorageExecutor {
         let log_entry = LogEntry::RPop { key: key.clone(), count };
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
-            tx.log_entries.push(log_entry);
+            tx.log_entries.write().await.push(log_entry);
             let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
             let mut current_list = match current_db_val {
                 Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
@@ -641,7 +647,7 @@ impl StorageExecutor {
         let log_entry = LogEntry::SAdd { key: key.clone(), members: members.clone() };
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
-            tx.log_entries.push(log_entry);
+            tx.log_entries.write().await.push(log_entry);
             let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
             let mut current_set = match current_db_val {
                 Some(DbValue::Set(set_lock)) => set_lock.read().await.clone(),
@@ -703,7 +709,7 @@ impl StorageExecutor {
         let log_entry = LogEntry::SRem { key: key.clone(), members: members.clone() };
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
-            tx.log_entries.push(log_entry);
+            tx.log_entries.write().await.push(log_entry);
             let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
             let mut current_set = match current_db_val {
                 Some(DbValue::Set(set_lock)) => set_lock.read().await.clone(),
@@ -762,7 +768,7 @@ impl StorageExecutor {
                 let table_part = match row.get(table_name) { Some(part) => part, None => continue };
                 let key = match table_part.get("_key").and_then(|k| k.as_str()) { Some(k) => k.to_string(), None => continue };
                 let log_entry = LogEntry::Delete { key: key.clone() };
-                tx.log_entries.push(log_entry);
+                tx.log_entries.write().await.push(log_entry);
                 tx.writes.insert(key, None);
                 deleted_count += 1;
             }
@@ -822,7 +828,7 @@ impl StorageExecutor {
                 }
                 let new_val_bytes = serde_json::to_vec(&new_val)?;
                 let log_entry = LogEntry::SetJsonB { key: key.clone(), value: new_val_bytes.clone() };
-                tx.log_entries.push(log_entry);
+                tx.log_entries.write().await.push(log_entry);
                             tx.writes.insert(key, Some(DbValue::JsonB(new_val_bytes)));
                             updated_rows.push(new_val);
                         }
@@ -955,7 +961,7 @@ impl StorageExecutor {
 
                                 let value_bytes = serde_json::to_vec(&new_val)?;
                                 let log_entry = LogEntry::SetJsonB { key: key.clone(), value: value_bytes.clone() };
-                                tx.log_entries.push(log_entry);
+                                tx.log_entries.write().await.push(log_entry);
                                 tx.writes.insert(key, Some(DbValue::JsonB(value_bytes)));
                                 
                                 inserted_rows.push(new_val);
@@ -969,7 +975,7 @@ impl StorageExecutor {
 
                 let value_bytes = serde_json::to_vec(&row_data)?;
                 let log_entry = LogEntry::SetJsonB { key: key.clone(), value: value_bytes.clone() };
-                tx.log_entries.push(log_entry);
+                tx.log_entries.write().await.push(log_entry);
                 tx.writes.insert(key, Some(DbValue::JsonB(value_bytes)));
                 inserted_rows.push(row_data);
             }

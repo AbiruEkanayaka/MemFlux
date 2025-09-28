@@ -1,5 +1,6 @@
 
 use crate::storage_executor::{get_visible_db_value, json_path_to_pointer, StorageExecutor};
+use crate::config::DurabilityLevel;
 use crate::transaction::{Transaction, TransactionHandle};
 use crate::types::*;
 use crate::vacuum;
@@ -955,8 +956,9 @@ async fn handle_begin(
     if tx_guard.is_some() {
         return Response::Error("Transaction already in progress".to_string());
     }
-    let new_tx = Transaction::new(&ctx.tx_id_manager, &ctx.tx_status_manager);
-    println!("Transaction {} started.", new_tx.id);
+    let new_tx = Arc::new(Transaction::new(&ctx.tx_id_manager, &ctx.tx_status_manager));
+    println!("Transaction {} ({}) started.", new_tx.id, new_tx.txid);
+    ctx.active_transactions.insert(new_tx.txid, new_tx.clone());
     *tx_guard = Some(new_tx);
     Response::Ok
 }
@@ -966,52 +968,75 @@ async fn handle_commit(
     ctx: &AppContext,
     transaction_handle: TransactionHandle,
 ) -> Response {
-    let mut tx_guard = transaction_handle.write().await;
-    let tx = match tx_guard.take() {
-        Some(tx) => tx,
-        None => return Response::Error("No transaction in progress".to_string()),
+    let tx = {
+        let mut tx_guard = transaction_handle.write().await;
+        match tx_guard.take() {
+            Some(tx) => tx,
+            None => return Response::Error("No transaction in progress".to_string()),
+        }
     };
+
+    // Remove from active transactions before commit checks
+    ctx.active_transactions.remove(&tx.txid);
+
+    if ctx.config.isolation_level == crate::config::IsolationLevel::Serializable {
+        // SSI: Check for incoming conflicts. If a key we read was changed by a
+        // concurrent transaction that has already committed, we must abort.
+        if tx.ssi_in_conflict.load(std::sync::atomic::Ordering::Relaxed) {
+            ctx.tx_status_manager.abort(tx.txid);
+            println!("Transaction {} ({}) aborted due to serialization conflict.", tx.id, tx.txid);
+            return Response::Error("ABORT: Serialization failure, please retry transaction".to_string());
+        }
+    }
 
     // --- Persistence ---
     if ctx.config.persistence {
-        let log_entry = LogEntry::CommitTransaction { id: tx.id };
-        let (ack_tx, ack_rx) = oneshot::channel();
-        let log_req = LogRequest {
-            entry: log_entry,
-            ack: ack_tx,
-            durability: ctx.config.durability.clone(),
-        };
+        let log_entries = tx.log_entries.read().await;
+        if !log_entries.is_empty() {
+            // In a real high-throughput scenario, you'd batch these.
+            // For now, we log them and only wait on the final commit marker.
+            for (i, entry) in log_entries.iter().enumerate() {
+                let is_last = i == log_entries.len() - 1;
+                let durability = if is_last { ctx.config.durability.clone() } else { DurabilityLevel::None };
+                let (ack_tx, ack_rx) = oneshot::channel();
+                let log_req = LogRequest { entry: entry.clone(), ack: ack_tx, durability };
 
-        if ctx.logger.send(PersistenceRequest::Log(log_req)).await.is_err() {
-            // Rollback if the persistence layer is down
-            ctx.tx_status_manager.abort(tx.txid);
-            *tx_guard = None; // Ensure the transaction is gone
-            return Response::Error(
-                "Persistence engine is down, commit failed. Transaction rolled back.".to_string(),
-            );
-        }
+                if ctx.logger.send(PersistenceRequest::Log(log_req)).await.is_err() {
+                    ctx.tx_status_manager.abort(tx.txid);
+                    return Response::Error("Persistence engine is down, commit failed. Transaction rolled back.".to_string());
+                }
 
-        match ack_rx.await {
-            Ok(Ok(())) => { /* Continue to commit */ }
-            Ok(Err(e)) => {
-                ctx.tx_status_manager.abort(tx.txid);
-                *tx_guard = None;
-                return Response::Error(format!(
-                    "WAL write error during commit: {}. Transaction rolled back.",
-                    e
-                ));
-            }
-            Err(_) => {
-                ctx.tx_status_manager.abort(tx.txid);
-                *tx_guard = None;
-                return Response::Error(
-                    "Persistence engine dropped ACK channel during commit. Transaction rolled back."
-                        .to_string(),
-                );
+                if is_last {
+                     match ack_rx.await {
+                        Ok(Ok(())) => { /* Continue */ }
+                        Ok(Err(e)) => {
+                            ctx.tx_status_manager.abort(tx.txid);
+                            return Response::Error(format!("WAL write error during commit: {}. Transaction rolled back.", e));
+                        }
+                        Err(_) => {
+                            ctx.tx_status_manager.abort(tx.txid);
+                            return Response::Error("Persistence engine dropped ACK channel during commit. Transaction rolled back.".to_string());
+                        }
+                    }
+                }
             }
         }
     }
 
+    if ctx.config.isolation_level == crate::config::IsolationLevel::Serializable {
+        // SSI: Check for outgoing conflicts. Flag any concurrent transactions that have
+        // read data that we are now writing.
+        for write_item in tx.writes.iter() {
+            let written_key = write_item.key();
+            for other_tx_entry in ctx.active_transactions.iter() {
+                let other_tx = other_tx_entry.value();
+                // Check if other_tx is concurrent and has read the key we are writing.
+                if tx.snapshot.xip.contains(&other_tx.txid) && other_tx.reads.contains_key(written_key) {
+                    other_tx.ssi_in_conflict.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    }
 
     // --- Apply changes to in-memory DB ---
     for item in tx.writes.iter() {
@@ -1040,7 +1065,7 @@ async fn handle_commit(
 
     // --- Mark transaction as committed ---
     ctx.tx_status_manager.commit(tx.txid);
-    println!("Transaction {} committed.", tx.id);
+    println!("Transaction {} ({}) committed.", tx.id, tx.txid);
 
     Response::Ok
 }
@@ -1056,7 +1081,8 @@ async fn handle_rollback(
     let mut tx_guard = transaction_handle.write().await;
     if let Some(tx) = tx_guard.take() {
         ctx.tx_status_manager.abort(tx.txid);
-        println!("Transaction {} rolled back.", tx.id);
+        ctx.active_transactions.remove(&tx.txid);
+        println!("Transaction {} ({}) rolled back.", tx.id, tx.txid);
         Response::Ok
     } else {
         Response::Error("No transaction in progress".to_string())
@@ -1078,14 +1104,16 @@ async fn handle_savepoint(
 
     let mut tx_guard = transaction_handle.write().await;
     if let Some(tx) = tx_guard.as_mut() {
-        if tx.savepoints.contains_key(&savepoint_name) {
+        let mut savepoints = tx.savepoints.write().await;
+        if savepoints.contains_key(&savepoint_name) {
             return Response::Error(format!("Savepoint '{}' already exists", savepoint_name));
         }
-        tx.savepoints.insert(
+        let log_entries = tx.log_entries.read().await.clone();
+        savepoints.insert(
             savepoint_name.clone(),
-            (tx.log_entries.clone(), tx.writes.clone()),
+            (log_entries, tx.writes.clone()),
         );
-        tx.log_entries.push(LogEntry::Savepoint { name: savepoint_name.clone() });
+        tx.log_entries.write().await.push(LogEntry::Savepoint { name: savepoint_name.clone() });
         println!("Savepoint '{}' created for transaction {}.", savepoint_name, tx.id);
         Response::Ok
     } else {
@@ -1108,11 +1136,17 @@ async fn handle_rollback_to_savepoint(
 
     let mut tx_guard = transaction_handle.write().await;
     if let Some(tx) = tx_guard.as_mut() {
-        if let Some((saved_log_entries, saved_writes)) = tx.savepoints.get(&savepoint_name) {
+        let savepoints = tx.savepoints.read().await;
+        if let Some((saved_log_entries, saved_writes)) = savepoints.get(&savepoint_name) {
             // Revert log_entries and writes to the savepoint state
-            tx.log_entries = saved_log_entries.clone();
-            tx.writes = saved_writes.clone();
-            tx.log_entries.push(LogEntry::RollbackToSavepoint { name: savepoint_name.clone() });
+            let mut log_entries = tx.log_entries.write().await;
+            *log_entries = saved_log_entries.clone();
+            // This is a bit tricky with DashMap. A simple clear and extend is easiest.
+            tx.writes.clear();
+            for item in saved_writes.iter() {
+                tx.writes.insert(item.key().clone(), item.value().clone());
+            }
+            log_entries.push(LogEntry::RollbackToSavepoint { name: savepoint_name.clone() });
             println!("Transaction {} rolled back to savepoint '{}'.", tx.id, savepoint_name);
             Response::Ok
         } else {
@@ -1138,8 +1172,8 @@ async fn handle_release_savepoint(
 
     let mut tx_guard = transaction_handle.write().await;
     if let Some(tx) = tx_guard.as_mut() {
-        if tx.savepoints.remove(&savepoint_name).is_some() {
-            tx.log_entries.push(LogEntry::ReleaseSavepoint { name: savepoint_name.clone() });
+        if tx.savepoints.write().await.remove(&savepoint_name).is_some() {
+            tx.log_entries.write().await.push(LogEntry::ReleaseSavepoint { name: savepoint_name.clone() });
             println!("Savepoint '{}' released for transaction {}.", savepoint_name, tx.id);
             Response::Ok
         } else {
