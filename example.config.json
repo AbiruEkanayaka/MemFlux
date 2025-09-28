@@ -2,6 +2,8 @@
   "host": "127.0.0.1",
   "port": 8360,
   "requirepass": "",
+  "persistence": true,
+  "durability": "fsync",
   "wal_file": "memflux.wal",
   "wal_overflow_file": "memflux.wal.overflow",
   "snapshot_file": "memflux.snapshot",
@@ -9,6 +11,7 @@
   "wal_size_threshold_mb": 128,
   "maxmemory_mb": 0,
   "eviction_policy": "lru",
+  "isolation_level": "serializable",
   "encrypt": false,
   "cert_file": "memflux.crt",
   "key_file": "memflux.key"

@@ -103,6 +103,7 @@ This documentation is organized into the following sections:
 *   **[Commands](./commands.md):** Detailed reference for all non-SQL, Redis-style commands.
 *   **[Data Types](./types.md):** An overview of the core data types and the SQL type system.
 *   **[SQL Reference](./sql.md):** An introduction to the SQL engine and links to detailed sections.
+*   **[Transactions](./transactions.md):** A guide to using transactions, isolation levels, and the MVCC model.
 *   **[Python Library Guide](./python_library.md):** A guide for using MemFlux as an embedded library in Python.
 *   **[Persistence](./persistence.md):** An explanation of how data durability is achieved through WAL and snapshots.
 *   **[Indexing](./indexing.md):** Guide to creating and using indexes for JSON data.

@@ -8,7 +8,7 @@ The Foreign Function Interface (FFI) layer exposes the core MemFlux database eng
 
 The FFI layer acts as a bridge between the external C-style world and the internal, asynchronous Rust world of MemFlux.
 
-1.  **Opaque Handle:** The database instance (`Arc<MemFluxDB>`) is wrapped in a struct and returned to the C caller as an opaque pointer (`*mut MemFluxDBHandle`). The caller never interacts with the database instance directly, only through this handle.
+1.  **Opaque Handles:** The database instance (`Arc<MemFluxDB>`) is wrapped and returned as an opaque pointer (`*mut MemFluxDBSharedHandle`). To manage transactions, a separate `TransactionHandle` is created and returned as a `*mut MemFluxCursorHandle`. The caller never interacts with the database or transaction state directly, only through these handles.
 
 2.  **Synchronous API:** While MemFlux is internally asynchronous (using Tokio), the FFI presents a synchronous, blocking interface. This is a deliberate design choice to simplify integration with most programming languages, which typically expect blocking I/O calls.
 
@@ -18,18 +18,24 @@ The FFI layer acts as a bridge between the external C-style world and the intern
 
 ## Key FFI Functions
 
-*   `memflux_open(config_json: *const c_char) -> *mut MemFluxDBHandle`:
+*   `memflux_open(config_json: *const c_char) -> *mut MemFluxDBSharedHandle`:
     *   This is the entry point for creating a database instance.
-    *   It accepts a JSON string for configuration (`FFIConfig`), which is a subset of the main `config.json`.
+    *   It accepts a JSON string for configuration (`FFIConfig`).
     *   It calls `MemFluxDB::open_with_config` and blocks until the database is fully initialized.
-    *   Returns an opaque handle to the new database instance, or a null pointer on failure.
+    *   Returns an opaque handle to the shared database instance, or a null pointer on failure.
 
-*   `memflux_close(handle: *mut MemFluxDBHandle)`:
-    *   Safely closes the database instance.
-    *   It takes ownership of the handle, reconstructs the `Box<MemFluxDBHandle>`, and allows Rust's ownership system to drop it, which in turn gracefully shuts down the persistence engine.
+*   `memflux_close(handle: *mut MemFluxDBSharedHandle)`:
+    *   Safely closes the database instance and shuts down all background tasks.
 
-*   `memflux_exec(handle: *mut MemFluxDBHandle, command_str: *const c_char) -> *mut FFIResponse`:
-    *   Executes a command against the database.
+*   `memflux_cursor_open(handle: *mut MemFluxDBSharedHandle) -> *mut MemFluxCursorHandle`:
+    *   Creates a new transactional context (a cursor).
+    *   Returns an opaque handle to the cursor, which can be used for subsequent `memflux_exec` calls.
+
+*   `memflux_cursor_close(handle: *mut MemFluxCursorHandle)`:
+    *   Closes a cursor and cleans up its associated transaction state.
+
+*   `memflux_exec(db_handle: *mut MemFluxDBSharedHandle, cursor_handle: *mut MemFluxCursorHandle, command_str: *const c_char) -> *mut FFIResponse`:
+    *   Executes a command against the database within the context of the provided cursor.
     *   It parses the command string and calls the central `db.execute_command` method.
     *   It blocks until the command is complete and then converts the internal `Response` enum into a C-compatible `FFIResponse` struct.
 

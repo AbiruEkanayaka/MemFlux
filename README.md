@@ -28,15 +28,16 @@ Database is designed with a dual-purpose architecture: it can be run as a **stan
 *   **Integrated SQL Query Engine:** A powerful, built-from-scratch query engine that operates directly on your in-memory data. Supports:
     *   Complex `SELECT` queries with `JOIN`s, `GROUP BY`, aggregates (`COUNT`, `SUM`, `AVG`), `ORDER BY`, `LIMIT`, subqueries, and `CASE` statements.
     *   Common Table Expressions (CTEs) using the `WITH` clause, including `WITH RECURSIVE` for hierarchical or graph-based queries.
-    *   Data Manipulation Language (DML): `INSERT`, `UPDATE`, `DELETE`.
+    *   Data Manipulation Language (DML): `INSERT` (with `ON CONFLICT`), `UPDATE`, `DELETE`. All support a `RETURNING` clause.
     *   Data Definition Language (DDL): `CREATE/DROP/ALTER TABLE`, `CREATE/DROP VIEW`, and `CREATE SCHEMA` for managing virtual schemas and namespaces.
     *   Rich Data Types: `INTEGER`, `TEXT`, `TIMESTAMPTZ`, `NUMERIC`, `UUID`, `BYTEA`, arrays (`INTEGER[]`), and more.
     *   Advanced Constraints: `PRIMARY KEY`, `UNIQUE`, `CHECK`, and `FOREIGN KEY` with referential actions (`ON DELETE CASCADE`, `ON UPDATE SET NULL`, etc.).
     *   A rich function library (`LOWER`, `NOW()`, `DATE_PART`, `ABS()`, etc.).
+*   **Transactional Integrity with MVCC:** Provides ACID-like properties with Snapshot Isolation using a Multi-Version Concurrency Control (MVCC) architecture. This allows for non-blocking reads and safe, concurrent writes.
 *   **Dual-Mode Operation:**
     *   **Standalone Server:** Run as a TCP server with a Redis-compatible (RESP) protocol.
     *   **Embedded Library:** Integrate directly into your application via a C-compatible Foreign Function Interface (FFI) for zero-latency, in-process database operations.
-*   **Durable Persistence:** Durability is achieved through a Write-Ahead Log (WAL) and periodic snapshotting, ensuring your data is safe even if the server restarts.
+*   **Configurable Durability & Persistence:** Persistence can be enabled or disabled. When enabled, durability is achieved through a Write-Ahead Log (WAL) and periodic snapshotting, with configurable durability levels (`fsync`, `full`).
 *   **Secondary Indexing:** Create indexes on JSON fields to dramatically accelerate SQL query performance.
 *   **Configurable Memory Management:** Set a `maxmemory` limit and choose from multiple eviction policies (`LRU`, `LFU`, `ARC`, `LFRU`, `Random`) to control memory usage.
 *   **TLS Encryption:** Secure client connections with TLS when running in server mode.
@@ -143,11 +144,11 @@ For a more detailed guide, see the **[Python Library Guide](./docs/python_librar
 
 3.  **FFI Layer (`src/ffi.rs`):** A C-compatible Foreign Function Interface exposes the core library's functionality, allowing it to be loaded and used directly by other languages (like Python's `ctypes` module) for in-process execution.
 
-4.  **Persistence Engine:** To prevent data loss, every write operation is first serialized and written to a **Write-Ahead Log (WAL)** file (`memflux.wal`) on disk.
-    *   The client receives an "OK" confirmation only after the write has been committed to the WAL.
-    *   When the WAL file grows beyond a certain threshold, the server performs a **non-blocking snapshot**. It switches writes to a secondary overflow WAL (`memflux.wal.overflow`) while a background task writes the entire current database state to a new snapshot file (`memflux.snapshot`).
-    *   After the snapshot is successfully created, the original, now-inactive WAL is truncated. This two-file approach ensures that I/O-intensive snapshotting never blocks incoming write commands.
-    *   On startup, the server restores its state by loading the latest snapshot and then replaying any subsequent entries from the WAL files.
+4.  **Persistence Engine (MVCC):** To prevent data loss and enable transactions, MemFlux uses a Multi-Version Concurrency Control (MVCC) model combined with a Write-Ahead Log (WAL).
+    *   **Versioning:** Instead of overwriting data, every write operation creates a new version of a value, tagged with a transaction ID. A key now points to a chain of these versions.
+    *   **WAL:** Every data-modifying command is first serialized and written to the WAL file (`memflux.wal`) on disk. This ensures that no acknowledged write is ever lost.
+    *   **Snapshots & Compaction:** When the WAL file grows too large, a non-blocking snapshot of the current state of the database is written to disk. A background **vacuum** process cleans up old, no-longer-visible data versions to reclaim memory.
+    *   **Recovery:** On startup, the server restores the last snapshot and replays any subsequent entries from the WAL to bring the database to a consistent, up-to-date state.
 
 5.  **SQL Query Engine Pipeline:**
     *   **Parser:** The raw SQL string is tokenized and parsed into an **Abstract Syntax Tree (AST)**, which is a tree-like representation of the query structure.

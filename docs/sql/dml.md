@@ -8,8 +8,8 @@ Adds a new row (a new key-value pair) to a table.
 
 ### Syntax
 ```sql
-INSERT INTO table_name (column1, column2, ...)
-VALUES (value1, value2, ...)
+INSERT INTO table_name [(column1, column2, ...)]
+(VALUES (value1, value2, ...) | SELECT ...)
 [ON CONFLICT (target_column) DO UPDATE SET ... | ON CONFLICT DO NOTHING]
 [RETURNING column1, column2 | *];
 ```
@@ -92,7 +92,8 @@ The `RETURNING` clause can be used to return data from the rows that were update
 UPDATE users
 SET age = users_metadata.age
 FROM users_metadata
-WHERE users.id = users_metadata.user_id;
+WHERE users.id = users_metadata.user_id
+RETURNING users.id, users.age;
 ```
 
 ## `DELETE`
@@ -121,8 +122,9 @@ The `RETURNING` clause can be used to return data from the rows that were delete
 
 ### Example
 ```sql
--- Delete users who are marked for deletion in another table
+-- Delete users who are marked for deletion in another table and return their names
 DELETE FROM users
 USING users_to_delete
-WHERE users.id = users_to_delete.user_id;
+WHERE users.id = users_to_delete.user_id
+RETURNING users.name;
 ```

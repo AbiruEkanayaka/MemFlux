@@ -12,8 +12,27 @@ The Python wrapper (`memflux.py`) provides a familiar interface that loosely fol
 
 The main components are:
 *   `memflux.connect()`: A top-level function to connect to and initialize the database.
-*   `Connection` object: Represents the database connection.
-*   `Cursor` object: Used to execute commands and fetch results.
+*   `Connection` object: Represents the database connection. It is thread-safe.
+*   `Cursor` object: Represents a single transactional context. It is used to execute commands and fetch results. **Cursors should not be shared between threads.**
+
+## Transactions in Python
+
+Each `Cursor` object you create represents a separate transactional context.
+
+- **Auto-Commit (Default):** By default, each `.execute()` call on a cursor is treated as a single, atomic transaction. The operation is sent to the database and immediately committed. This is the simplest way to use the library.
+
+- **Explicit Transactions:** To execute multiple commands within a single transaction, you must use `BEGIN`, `COMMIT`, and `ROLLBACK` commands. This gives you control over the transaction boundaries.
+
+```python
+# Auto-commit mode
+cur.execute("SET key1 'value1'") # This is committed immediately
+
+# Explicit transaction
+cur.execute("BEGIN")
+cur.execute("SET key2 'value2'")
+cur.execute("SET key3 'value3'")
+cur.execute("ROLLBACK") # The changes to key2 and key3 are discarded
+```
 
 ## Quick Start Example
 

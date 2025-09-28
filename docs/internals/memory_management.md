@@ -67,3 +67,7 @@ ARC is a more advanced policy that balances between LRU and LFU. It is implement
 *   **Mechanism:**
     *   **`track_access`:** If a key is not in the vector, it's added.
     *   **`evict`:** A random index is chosen, and the key at that index is removed and returned.
+
+## Resetting the Manager
+
+The `MemoryManager` can be completely reset via the `reset()` method. This is called as part of the `WIPEDB` command. It clears all internal tracking structures (e.g., the LRU list, LFU frequencies) and resets the estimated memory counter to zero.

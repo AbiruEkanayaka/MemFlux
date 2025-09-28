@@ -92,7 +92,7 @@ CREATE TABLE products (
 ```
 
 ### `FOREIGN KEY` and Referential Actions
-Creates a link between two tables and constrains data based on columns in the other table. MemFlux supports `ON DELETE` and `ON UPDATE` actions.
+Creates a link between two tables and constrains data based on columns in the other table. MemFlux supports `ON DELETE` and `ON UPDATE` actions. These actions are fully transactional and integrated with the MVCC system, ensuring that cascading changes are applied atomically.
 
 **Supported Actions:**
 *   `CASCADE`: If a parent record is deleted/updated, the corresponding child records are also deleted/updated.
