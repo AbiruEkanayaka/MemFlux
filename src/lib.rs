@@ -65,8 +65,11 @@ impl MemFluxDB {
             println!("Database loaded with {} top-level keys.", db.len());
         }
 
+        let tx_id_manager = Arc::new(TransactionIdManager::new());
+        let tx_status_manager = Arc::new(TransactionStatusManager::new());
+
         let (logger, persistence_handle) = if config.persistence {
-            let (persistence_engine, logger) = PersistenceEngine::new(&config, db.clone());
+            let (persistence_engine, logger) = PersistenceEngine::new(&config, db.clone(), tx_status_manager.clone());
             let handle = tokio::spawn(async move {
                 if let Err(e) = persistence_engine.run().await {
                     eprintln!("Fatal error in persistence engine: {}", e);
@@ -119,7 +122,7 @@ impl MemFluxDB {
         for item in db.iter() {
             let key_size = item.key().len() as u64;
             let version_chain = item.value().read().await;
-            if let Some(version) = version_chain.first() {
+            if let Some(version) = version_chain.last() {
                 let value_size = memory::estimate_db_value_size(&version.value).await;
                 initial_mem += key_size + value_size;
             }
@@ -141,9 +144,6 @@ impl MemFluxDB {
         functions::register_numeric_functions(&mut function_registry);
         functions::register_datetime_functions(&mut function_registry);
         let function_registry = Arc::new(function_registry);
-
-        let tx_id_manager = Arc::new(TransactionIdManager::new());
-        let tx_status_manager = Arc::new(TransactionStatusManager::new());
 
         let app_context = Arc::new(AppContext {
             db,
@@ -322,35 +322,41 @@ impl MemFluxDB {
 
 /// Loads view definitions from the database.
 pub async fn load_views_from_db(db: &Db, view_cache: &ViewCache) -> Result<()> {
-    for item in db.iter() {
-        let key = item.key();
-        if key.starts_with(VIEW_PREFIX) {
-            let version_chain = item.value().read().await;
-            if let Some(latest_version) = version_chain.last() {
-                let view_def_result: std::result::Result<ViewDefinition, _> = match &latest_version.value {
-                    types::DbValue::Bytes(bytes) => serde_json::from_slice(bytes),
-                    _ => {
-                        eprintln!(
-                            "Warning: View key '{}' has non-Bytes value type. Skipping.",
-                            key
-                        );
-                        continue;
-                    }
-                };
+    let items_to_process: Vec<(String, types::VersionedValue)> = db
+        .iter()
+        .filter(|item| item.key().starts_with(VIEW_PREFIX))
+        .filter_map(|item| {
+            item.value()
+                .try_read()
+                .ok()
+                .and_then(|guard| guard.last().cloned())
+                .map(|version| (item.key().clone(), version))
+        })
+        .collect();
 
-                match view_def_result {
-                    Ok(view_def) => {
-                        if view_def.name.is_empty() {
-                            eprintln!("Warning: View with empty name in key '{}'. Skipping.", key);
-                            continue;
-                        }
-                        let view_name = view_def.name.clone();
-                        view_cache.insert(view_name, Arc::new(view_def));
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to parse view for key '{}': {}", key, e);
-                    }
+    for (key, latest_version) in items_to_process {
+        let view_def_result: std::result::Result<ViewDefinition, _> = match &latest_version.value {
+            types::DbValue::Bytes(bytes) => serde_json::from_slice(bytes),
+            _ => {
+                eprintln!(
+                    "Warning: View key '{}' has non-Bytes value type. Skipping.",
+                    key
+                );
+                continue;
+            }
+        };
+
+        match view_def_result {
+            Ok(view_def) => {
+                if view_def.name.is_empty() {
+                    eprintln!("Warning: View with empty name in key '{}'. Skipping.", key);
+                    continue;
                 }
+                let view_name = view_def.name.clone();
+                view_cache.insert(view_name, Arc::new(view_def));
+            }
+            Err(e) => {
+                eprintln!("Failed to parse view for key '{}': {}", key, e);
             }
         }
     }

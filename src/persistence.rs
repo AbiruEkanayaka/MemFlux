@@ -10,9 +10,10 @@ use tokio::task::{self, JoinHandle};
 
 use crate::config::Config;
 use crate::types::{
-    Db, DbValue, LogEntry, PersistenceRequest, SerializableDbValue, SnapshotEntry, VersionedValue,
+    Db, DbValue, LogEntry, PersistenceRequest, SerializableDbValue, SnapshotEntry, VersionedValue, TransactionStatusManager, TransactionStatus
 };
 use tokio::sync::RwLock;
+use std::sync::Arc;
 
 pub struct PersistenceEngine {
     receiver: mpsc::Receiver<PersistenceRequest>,
@@ -22,10 +23,11 @@ pub struct PersistenceEngine {
     snapshot_temp_path: String,
     wal_size_threshold_bytes: u64,
     db: Db,
+    tx_status_manager: Arc<TransactionStatusManager>,
 }
 
 impl PersistenceEngine {
-    pub fn new(config: &Config, db: Db) -> (Self, mpsc::Sender<PersistenceRequest>) {
+    pub fn new(config: &Config, db: Db, tx_status_manager: Arc<TransactionStatusManager>) -> (Self, mpsc::Sender<PersistenceRequest>) {
         let (tx, rx) = mpsc::channel(1024);
         let engine = PersistenceEngine {
             receiver: rx,
@@ -35,6 +37,7 @@ impl PersistenceEngine {
             snapshot_temp_path: config.snapshot_temp_file.clone(),
             wal_size_threshold_bytes: config.wal_size_threshold_mb * 1024 * 1024,
             db,
+            tx_status_manager,
         };
         (engine, tx)
     }
@@ -57,6 +60,7 @@ impl PersistenceEngine {
         snapshot_path: String,
         snapshot_temp_path: String,
         wal_to_compact: String,
+        tx_status_manager: Arc<TransactionStatusManager>,
     ) -> JoinHandle<Result<String>> {
         tokio::spawn(async move {
             let temp_path = snapshot_temp_path.clone();
@@ -89,15 +93,25 @@ impl PersistenceEngine {
                 for key in keys {
                     if let Some(item) = db_clone.get(&key) {
                         let version_chain = item.value().read().await;
-                        if let Some(latest_version) = version_chain.last() {
-                            let serializable_value =
-                                SerializableDbValue::from_db_value(&latest_version.value).await;
-                            let entry = SnapshotEntry {
-                                key: item.key().clone(),
-                                value: serializable_value,
-                            };
-                            if tx.send(entry).await.is_err() {
-                                break;
+                        for version in version_chain.iter().rev() {
+                            if tx_status_manager.get_status(version.creator_txid)
+                                == Some(TransactionStatus::Committed)
+                            {
+                                if version.expirer_txid == 0
+                                    || tx_status_manager.get_status(version.expirer_txid)
+                                        != Some(TransactionStatus::Committed)
+                                {
+                                    let serializable_value =
+                                        SerializableDbValue::from_db_value(&version.value).await;
+                                    let entry = SnapshotEntry {
+                                        key: item.key().clone(),
+                                        value: serializable_value,
+                                    };
+                                    if tx.send(entry).await.is_err() {
+                                        return;
+                                    }
+                                    break;
+                                }
                             }
                         }
                     }
@@ -253,11 +267,10 @@ impl PersistenceEngine {
 
                     let final_result = if write_result.is_ok() {
                         match highest_durability {
-                            crate::config::DurabilityLevel::Full => {
-                                file.sync_all().await
-                            }
-                            crate::config::DurabilityLevel::Fsync | crate::config::DurabilityLevel::None => {
-                                // For both Fsync and None, we acknowledge after the OS write.
+                            crate::config::DurabilityLevel::Full => file.sync_all().await,
+                            crate::config::DurabilityLevel::Fsync => file.sync_data().await,
+                            crate::config::DurabilityLevel::None => {
+                                // For None, we acknowledge after the OS write.
                                 // The background fsync loop will handle flushing to disk.
                                 let _ = fsync_notify_tx.try_send(());
                                 Ok(())
@@ -312,6 +325,7 @@ impl PersistenceEngine {
                             self.snapshot_path.clone(),
                             self.snapshot_temp_path.clone(),
                             wal_to_compact,
+                            self.tx_status_manager.clone(),
                         ));
                     }
                 }
@@ -327,6 +341,7 @@ impl PersistenceEngine {
                         self.snapshot_path.clone(),
                         self.snapshot_temp_path.clone(),
                         wal_to_compact,
+                        self.tx_status_manager.clone(),
                     ));
                 } else {
                     // This shouldn't happen, but as a safeguard, put it back.

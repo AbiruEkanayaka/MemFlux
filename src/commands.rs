@@ -219,45 +219,8 @@ async fn handle_json_get(
     let inner_path = parts.next().unwrap_or("");
 
     let tx_guard = transaction_handle.read().await;
-    if let Some(tx) = tx_guard.as_ref() {
-        // Transactional read
-        if let Some(entry) = tx.writes.get(key) {
-            return match entry.value() {
-                Some(val) => json_db_value_to_response(val, inner_path, key, ctx).await,
-                None => Response::Nil, // Deleted in this transaction
-            };
-        }
-
-        if let Some(version_chain_lock) = ctx.db.get(key) {
-            let version_chain = version_chain_lock.read().await;
-            for version in version_chain.iter().rev() {
-                if tx
-                    .snapshot
-                    .is_visible(version, &ctx.tx_status_manager)
-                {
-                    return json_db_value_to_response(&version.value, inner_path, key, ctx).await;
-                }
-            }
-        }
-        return Response::Nil;
-    }
-    drop(tx_guard);
-
-    // Non-transactional read
-    match ctx.db.get(key) {
-        Some(version_chain_lock) => {
-            let version_chain = version_chain_lock.read().await;
-            if let Some(latest_version) = version_chain.last() {
-                let status = ctx
-                    .tx_status_manager
-                    .get_status(latest_version.creator_txid);
-                if status == Some(TransactionStatus::Committed) {
-                    return json_db_value_to_response(&latest_version.value, inner_path, key, ctx)
-                        .await;
-                }
-            }
-            Response::Nil
-        }
+    match get_visible_db_value(key, ctx, tx_guard.as_ref()).await {
+        Some(db_value) => json_db_value_to_response(&db_value, inner_path, key, ctx).await,
         None => Response::Nil,
     }
 }
@@ -1080,6 +1043,14 @@ async fn handle_rollback(
     }
     let mut tx_guard = transaction_handle.write().await;
     if let Some(tx) = tx_guard.take() {
+        if ctx.memory.is_enabled() {
+            let reserved = tx.reserved_memory.load(std::sync::atomic::Ordering::Relaxed);
+            if reserved > 0 {
+                ctx.memory.decrease_memory(reserved as u64);
+            } else {
+                ctx.memory.increase_memory(-reserved as u64);
+            }
+        }
         ctx.tx_status_manager.abort(tx.txid);
         ctx.active_transactions.remove(&tx.txid);
         println!("Transaction {} ({}) rolled back.", tx.id, tx.txid);
@@ -1109,9 +1080,10 @@ async fn handle_savepoint(
             return Response::Error(format!("Savepoint '{}' already exists", savepoint_name));
         }
         let log_entries = tx.log_entries.read().await.clone();
+        let reserved_memory = tx.reserved_memory.load(std::sync::atomic::Ordering::Relaxed);
         savepoints.insert(
             savepoint_name.clone(),
-            (log_entries, tx.writes.clone()),
+            (log_entries, tx.writes.clone(), reserved_memory),
         );
         tx.log_entries.write().await.push(LogEntry::Savepoint { name: savepoint_name.clone() });
         println!("Savepoint '{}' created for transaction {}.", savepoint_name, tx.id);
@@ -1137,7 +1109,18 @@ async fn handle_rollback_to_savepoint(
     let mut tx_guard = transaction_handle.write().await;
     if let Some(tx) = tx_guard.as_mut() {
         let savepoints = tx.savepoints.read().await;
-        if let Some((saved_log_entries, saved_writes)) = savepoints.get(&savepoint_name) {
+        if let Some((saved_log_entries, saved_writes, saved_reserved_memory)) = savepoints.get(&savepoint_name) {
+            if _ctx.memory.is_enabled() {
+                let current_reserved_memory = tx.reserved_memory.load(std::sync::atomic::Ordering::Relaxed);
+                let diff = current_reserved_memory - saved_reserved_memory;
+                if diff > 0 {
+                    _ctx.memory.decrease_memory(diff as u64);
+                } else {
+                    _ctx.memory.increase_memory(-diff as u64);
+                }
+                tx.reserved_memory.store(*saved_reserved_memory, std::sync::atomic::Ordering::Relaxed);
+            }
+
             // Revert log_entries and writes to the savepoint state
             let mut log_entries = tx.log_entries.write().await;
             *log_entries = saved_log_entries.clone();

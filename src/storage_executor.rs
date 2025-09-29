@@ -110,6 +110,34 @@ impl StorageExecutor {
         let log_entry = LogEntry::SetBytes { key: key.clone(), value: value.clone() };
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
+            if self.ctx.memory.is_enabled() {
+                let old_db_value = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
+                let old_size = if let Some(ref v) = old_db_value {
+                    key.len() as u64 + memory::estimate_db_value_size(v).await
+                } else {
+                    0
+                };
+
+                let new_db_value = DbValue::Bytes(value.clone());
+                let new_size = key.len() as u64 + memory::estimate_db_value_size(&new_db_value).await;
+
+                let memory_change = new_size as i64 - old_size as i64;
+
+                if memory_change > 0 {
+                    if let Err(e) = self.ctx.memory.ensure_memory_for(memory_change as u64, &self.ctx).await {
+                        return Response::Error(e.to_string());
+                    }
+                }
+
+                if memory_change > 0 {
+                    self.ctx.memory.increase_memory(memory_change as u64);
+                } else {
+                    self.ctx.memory.decrease_memory(-memory_change as u64);
+                }
+
+                tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+            }
+
             tx.log_entries.write().await.push(log_entry);
             tx.writes.insert(key.clone(), Some(DbValue::Bytes(value.clone())));
             return Response::Ok;
@@ -159,6 +187,15 @@ impl StorageExecutor {
         if let Some(tx) = tx_guard.as_mut() {
             let mut deleted_count = 0;
             for key in keys {
+                if self.ctx.memory.is_enabled() {
+                    let old_db_value = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
+                    if let Some(v) = old_db_value {
+                        let old_size = key.len() as u64 + memory::estimate_db_value_size(&v).await;
+                        self.ctx.memory.decrease_memory(old_size);
+                        tx.reserved_memory.fetch_sub(old_size as i64, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+
                 tx.log_entries.write().await.push(LogEntry::Delete { key: key.clone() });
                 tx.writes.insert(key, None);
                 deleted_count += 1;
@@ -210,15 +247,66 @@ impl StorageExecutor {
     pub async fn json_set(&self, key: String, path: &str, value: Value) -> Response {
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
+            let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
+
+            if self.ctx.memory.is_enabled() {
+                let old_size = if let Some(ref v) = current_db_val {
+                    key.len() as u64 + memory::estimate_db_value_size(v).await
+                } else {
+                    0
+                };
+
+                let mut temp_val = match current_db_val {
+                    Some(DbValue::Json(v)) => v.clone(),
+                    Some(DbValue::JsonB(b)) => serde_json::from_slice(&b).unwrap_or(json!({})),
+                    _ => json!({}),
+                };
+                let pointer = if path == "." || path.is_empty() { "".to_string() } else { json_path_to_pointer(path) };
+                if pointer.is_empty() {
+                    temp_val = value.clone();
+                } else if let Some(target) = temp_val.pointer_mut(&pointer) {
+                    *target = value.clone();
+                } else {
+                    // Create path if it doesn't exist
+                    let mut current = &mut temp_val;
+                    for part in path.split('.') {
+                        if part.is_empty() { continue; }
+                        if current.is_object() {
+                            current = current.as_object_mut().unwrap().entry(part).or_insert(json!({}));
+                        } else {
+                            return Response::Error("Path creation failed: part is not an object".to_string());
+                        }
+                    }
+                    *current = value.clone();
+                }
+                let new_value_bytes = serde_json::to_vec(&temp_val).unwrap();
+                let new_size = key.len() as u64 + new_value_bytes.len() as u64;
+                let memory_change = new_size as i64 - old_size as i64;
+
+                if memory_change > 0 {
+                    if let Err(e) = self.ctx.memory.ensure_memory_for(memory_change as u64, &self.ctx).await {
+                        return Response::Error(e.to_string());
+                    }
+                }
+
+                if memory_change > 0 {
+                    self.ctx.memory.increase_memory(memory_change as u64);
+                } else {
+                    self.ctx.memory.decrease_memory(-memory_change as u64);
+                }
+                tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+            }
+
             let log_entry = LogEntry::JsonSet { path: format!("{}.{}", key, path), value: value.to_string() };
             tx.log_entries.write().await.push(log_entry);
-            let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
-            let mut current_val = match current_db_val {
+
+            let mut current_val = match get_visible_db_value(&key, &self.ctx, Some(tx)).await {
                 Some(DbValue::Json(v)) => v.clone(),
                 Some(DbValue::JsonB(b)) => serde_json::from_slice(&b).unwrap_or(json!({})),
                 Some(_) => return Response::Error("WRONGTYPE Operation against a non-JSON value".to_string()),
                 _ => json!({}),
             };
+
             let pointer = if path == "." || path.is_empty() { "".to_string() } else { json_path_to_pointer(path) };
             if pointer.is_empty() {
                 current_val = value;
@@ -315,16 +403,53 @@ impl StorageExecutor {
         if let Some(tx) = tx_guard.as_mut() {
             let log_entry = if path.is_empty() || path == "." { LogEntry::Delete { key: key.clone() } } else { LogEntry::JsonDelete { path: format!("{}.{}", key, path) } };
             tx.log_entries.write().await.push(log_entry);
+
+            let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
+            let mut current_val = match current_db_val {
+                Some(DbValue::Json(v)) => v.clone(),
+                Some(DbValue::JsonB(b)) => serde_json::from_slice(&b).unwrap_or(json!({})),
+                Some(_) => return Response::Error("WRONGTYPE Operation against a non-JSON value".to_string()),
+                None => return Response::Integer(0), // Key doesn't exist
+            };
+
+            if self.ctx.memory.is_enabled() {
+                let old_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::Json(current_val.clone())).await;
+                let mut new_size = old_size;
+                let mut modified = false;
+
+                if path.is_empty() || path == "." {
+                    new_size = 0;
+                    modified = true;
+                } else {
+                    let mut pointer_parts: Vec<&str> = path.split('.').collect();
+                    let final_key = pointer_parts.pop().unwrap();
+                    let parent_pointer = json_path_to_pointer(&pointer_parts.join("."));
+                    if let Some(target) = current_val.pointer_mut(&parent_pointer) {
+                        if let Some(obj) = target.as_object_mut() {
+                            if obj.remove(final_key).is_some() {
+                                modified = true;
+                                let new_value_bytes = serde_json::to_vec(&current_val).unwrap();
+                                new_size = key.len() as u64 + new_value_bytes.len() as u64;
+                            }
+                        }
+                    }
+                }
+
+                if modified {
+                    let memory_change = new_size as i64 - old_size as i64;
+                    if memory_change > 0 {
+                        self.ctx.memory.increase_memory(memory_change as u64);
+                    } else {
+                        self.ctx.memory.decrease_memory(-memory_change as u64);
+                    }
+                    tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+
             if path.is_empty() || path == "." {
                 tx.writes.insert(key.clone(), None);
+                return Response::Integer(1);
             } else {
-                let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
-                let mut current_val = match current_db_val {
-                    Some(DbValue::Json(v)) => v.clone(),
-                    Some(DbValue::JsonB(b)) => serde_json::from_slice(&b).unwrap_or(json!({})),
-                    Some(_) => return Response::Error("WRONGTYPE Operation against a non-JSON value".to_string()),
-                    _ => json!({}),
-                };
                 let mut pointer_parts: Vec<&str> = path.split('.').collect();
                 let final_key = pointer_parts.pop().unwrap();
                 let parent_pointer = json_path_to_pointer(&pointer_parts.join("."));
@@ -334,15 +459,17 @@ impl StorageExecutor {
                         if obj.remove(final_key).is_some() { modified = true; }
                     }
                 }
+
                 if modified {
                     let new_value_bytes = match serde_json::to_vec(&current_val) {
                         Ok(b) => b,
                         Err(_) => return Response::Error("Failed to serialize new JSON value".to_string()),
                     };
                     tx.writes.insert(key.clone(), Some(DbValue::JsonB(new_value_bytes)));
+                    return Response::Integer(1);
                 }
             }
-            return Response::Integer(1);
+            return Response::Integer(0);
         }
         drop(tx_guard);
         let txid = self.ctx.tx_id_manager.new_txid();
@@ -421,13 +548,33 @@ impl StorageExecutor {
         let log_entry = LogEntry::LPush { key: key.clone(), values: values.clone() };
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
-            tx.log_entries.write().await.push(log_entry);
             let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
             let mut current_list = match current_db_val {
                 Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
                 Some(_) => return Response::Error("WRONGTYPE Operation against a non-list value".to_string()),
                 _ => VecDeque::new(),
             };
+
+            if self.ctx.memory.is_enabled() {
+                let old_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::List(RwLock::new(current_list.clone()))).await;
+                
+                let mut temp_list = current_list.clone();
+                for v in values.iter().rev() { temp_list.push_front(v.clone()); }
+                let new_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::List(RwLock::new(temp_list))).await;
+                
+                let memory_change = new_size as i64 - old_size as i64;
+                if memory_change > 0 {
+                    if let Err(e) = self.ctx.memory.ensure_memory_for(memory_change as u64, &self.ctx).await {
+                        return Response::Error(e.to_string());
+                    }
+                    self.ctx.memory.increase_memory(memory_change as u64);
+                } else {
+                    self.ctx.memory.decrease_memory(-memory_change as u64);
+                }
+                tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            tx.log_entries.write().await.push(log_entry);
             for v in values.into_iter().rev() { current_list.push_front(v); }
             let new_len = current_list.len() as i64;
             tx.writes.insert(key, Some(DbValue::List(RwLock::new(current_list))));
@@ -476,13 +623,33 @@ impl StorageExecutor {
         let log_entry = LogEntry::RPush { key: key.clone(), values: values.clone() };
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
-            tx.log_entries.write().await.push(log_entry);
             let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
             let mut current_list = match current_db_val {
                 Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
                 Some(_) => return Response::Error("WRONGTYPE Operation against a non-list value".to_string()),
                 _ => VecDeque::new(),
             };
+
+            if self.ctx.memory.is_enabled() {
+                let old_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::List(RwLock::new(current_list.clone()))).await;
+                
+                let mut temp_list = current_list.clone();
+                for v in &values { temp_list.push_back(v.clone()); }
+                let new_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::List(RwLock::new(temp_list))).await;
+                
+                let memory_change = new_size as i64 - old_size as i64;
+                if memory_change > 0 {
+                    if let Err(e) = self.ctx.memory.ensure_memory_for(memory_change as u64, &self.ctx).await {
+                        return Response::Error(e.to_string());
+                    }
+                    self.ctx.memory.increase_memory(memory_change as u64);
+                } else {
+                    self.ctx.memory.decrease_memory(-memory_change as u64);
+                }
+                tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            tx.log_entries.write().await.push(log_entry);
             for v in values { current_list.push_back(v); }
             let new_len = current_list.len() as i64;
             tx.writes.insert(key, Some(DbValue::List(RwLock::new(current_list))));
@@ -531,13 +698,30 @@ impl StorageExecutor {
         let log_entry = LogEntry::LPop { key: key.clone(), count };
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
-            tx.log_entries.write().await.push(log_entry);
             let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
             let mut current_list = match current_db_val {
                 Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
                 Some(_) => return Response::Error("WRONGTYPE Operation against a non-list value".to_string()),
                 _ => VecDeque::new(),
             };
+
+            if current_list.is_empty() {
+                return Response::Nil;
+            }
+
+            if self.ctx.memory.is_enabled() {
+                let old_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::List(RwLock::new(current_list.clone()))).await;
+                
+                let mut temp_list = current_list.clone();
+                for _ in 0..count { if temp_list.pop_front().is_none() { break; } }
+                let new_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::List(RwLock::new(temp_list))).await;
+                
+                let memory_change = new_size as i64 - old_size as i64;
+                self.ctx.memory.decrease_memory(-memory_change as u64);
+                tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            tx.log_entries.write().await.push(log_entry);
             let mut popped = Vec::new();
             for _ in 0..count { if let Some(val) = current_list.pop_front() { popped.push(val); } else { break; } }
             tx.writes.insert(key, Some(DbValue::List(RwLock::new(current_list))));
@@ -589,13 +773,30 @@ impl StorageExecutor {
         let log_entry = LogEntry::RPop { key: key.clone(), count };
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
-            tx.log_entries.write().await.push(log_entry);
             let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
             let mut current_list = match current_db_val {
                 Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
                 Some(_) => return Response::Error("WRONGTYPE Operation against a non-list value".to_string()),
                 _ => VecDeque::new(),
             };
+
+            if current_list.is_empty() {
+                return Response::Nil;
+            }
+
+            if self.ctx.memory.is_enabled() {
+                let old_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::List(RwLock::new(current_list.clone()))).await;
+                
+                let mut temp_list = current_list.clone();
+                for _ in 0..count { if temp_list.pop_back().is_none() { break; } }
+                let new_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::List(RwLock::new(temp_list))).await;
+                
+                let memory_change = new_size as i64 - old_size as i64;
+                self.ctx.memory.decrease_memory(-memory_change as u64);
+                tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            tx.log_entries.write().await.push(log_entry);
             let mut popped = Vec::new();
             for _ in 0..count { if let Some(val) = current_list.pop_back() { popped.push(val); } else { break; } }
             tx.writes.insert(key, Some(DbValue::List(RwLock::new(current_list))));
@@ -647,13 +848,33 @@ impl StorageExecutor {
         let log_entry = LogEntry::SAdd { key: key.clone(), members: members.clone() };
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
-            tx.log_entries.write().await.push(log_entry);
             let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
             let mut current_set = match current_db_val {
                 Some(DbValue::Set(set_lock)) => set_lock.read().await.clone(),
                 Some(_) => return Response::Error("WRONGTYPE Operation against a non-set value".to_string()),
                 _ => HashSet::new(),
             };
+
+            if self.ctx.memory.is_enabled() {
+                let old_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::Set(RwLock::new(current_set.clone()))).await;
+                
+                let mut temp_set = current_set.clone();
+                for m in &members { temp_set.insert(m.clone()); }
+                let new_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::Set(RwLock::new(temp_set))).await;
+                
+                let memory_change = new_size as i64 - old_size as i64;
+                if memory_change > 0 {
+                    if let Err(e) = self.ctx.memory.ensure_memory_for(memory_change as u64, &self.ctx).await {
+                        return Response::Error(e.to_string());
+                    }
+                    self.ctx.memory.increase_memory(memory_change as u64);
+                } else {
+                    self.ctx.memory.decrease_memory(-memory_change as u64);
+                }
+                tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            tx.log_entries.write().await.push(log_entry);
             let mut added_count = 0;
             for m in members { if current_set.insert(m) { added_count += 1; } }
             tx.writes.insert(key, Some(DbValue::Set(RwLock::new(current_set))));
@@ -709,13 +930,30 @@ impl StorageExecutor {
         let log_entry = LogEntry::SRem { key: key.clone(), members: members.clone() };
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
-            tx.log_entries.write().await.push(log_entry);
             let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
             let mut current_set = match current_db_val {
                 Some(DbValue::Set(set_lock)) => set_lock.read().await.clone(),
                 Some(_) => return Response::Error("WRONGTYPE Operation against a non-set value".to_string()),
                 _ => HashSet::new(),
             };
+
+            if current_set.is_empty() {
+                return Response::Integer(0);
+            }
+
+            if self.ctx.memory.is_enabled() {
+                let old_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::Set(RwLock::new(current_set.clone()))).await;
+                
+                let mut temp_set = current_set.clone();
+                for m in &members { temp_set.remove(m); }
+                let new_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::Set(RwLock::new(temp_set))).await;
+                
+                let memory_change = new_size as i64 - old_size as i64;
+                self.ctx.memory.decrease_memory(-memory_change as u64);
+                tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            tx.log_entries.write().await.push(log_entry);
             let mut removed_count = 0;
             for m in members { if current_set.remove(&m) { removed_count += 1; } }
             tx.writes.insert(key, Some(DbValue::Set(RwLock::new(current_set))));

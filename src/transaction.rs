@@ -4,7 +4,7 @@ use crate::types::{
 use std::collections::HashMap;
 use dashmap::DashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicI64};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -25,7 +25,8 @@ pub struct Transaction {
     pub reads: DashMap<String, TxId>,
     /// For SSI: flag set by other transactions if they write to a key this transaction has read.
     pub ssi_in_conflict: AtomicBool,
-    pub savepoints: RwLock<HashMap<String, (Vec<LogEntry>, DashMap<String, Option<DbValue>>)>>,
+    pub savepoints: RwLock<HashMap<String, (Vec<LogEntry>, DashMap<String, Option<DbValue>>, i64)>>,
+    pub reserved_memory: AtomicI64,
 }
 
 impl Transaction {
@@ -47,6 +48,7 @@ impl Transaction {
             reads: DashMap::new(),
             ssi_in_conflict: AtomicBool::new(false),
             savepoints: RwLock::new(HashMap::new()),
+            reserved_memory: AtomicI64::new(0),
         }
     }
 }
