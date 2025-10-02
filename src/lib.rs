@@ -89,14 +89,14 @@ impl MemFluxDB {
         };
 
         let schema_cache = Arc::new(DashMap::new());
-        if let Err(e) = load_schemas_from_db(&db, &schema_cache).await {
+        if let Err(e) = load_schemas_from_db(&db, &schema_cache, &tx_status_manager).await {
             eprintln!("Warning: Could not load virtual schemas: {}.", e);
         } else if !schema_cache.is_empty() {
             println!("Loaded {} virtual schemas.", schema_cache.len());
         }
 
         let view_cache = Arc::new(DashMap::new());
-        if let Err(e) = load_views_from_db(&db, &view_cache).await {
+        if let Err(e) = load_views_from_db(&db, &view_cache, &tx_status_manager).await {
             eprintln!("Warning: Could not load views: {}.", e);
         } else if !view_cache.is_empty() {
             println!("Loaded {} views.", view_cache.len());
@@ -121,12 +121,15 @@ impl MemFluxDB {
         let mut keys = Vec::new();
         for item in db.iter() {
             let key_size = item.key().len() as u64;
-            let version_chain = item.value().read().await;
+            let version_chain_arc = item.value().clone();
+            let key = item.key().clone();
+            drop(item);
+            let version_chain = version_chain_arc.read().await;
             if let Some(version) = version_chain.last() {
                 let value_size = memory::estimate_db_value_size(&version.value).await;
                 initial_mem += key_size + value_size;
             }
-            keys.push(item.key().clone());
+            keys.push(key);
         }
         memory_manager.increase_memory(initial_mem);
         if memory_manager.is_enabled() {
@@ -315,13 +318,13 @@ impl MemFluxDB {
                 }
             }
         } else {
-            commands::process_command(command, &self.app_context, transaction_handle).await
+            commands::process_command(command, self.app_context.clone(), transaction_handle).await
         }
     }
 }
 
 /// Loads view definitions from the database.
-pub async fn load_views_from_db(db: &Db, view_cache: &ViewCache) -> Result<()> {
+pub async fn load_views_from_db(db: &Db, view_cache: &ViewCache, tx_status_manager: &TransactionStatusManager) -> Result<()> {
     let items_to_process: Vec<(String, types::VersionedValue)> = db
         .iter()
         .filter(|item| item.key().starts_with(VIEW_PREFIX))
@@ -329,7 +332,12 @@ pub async fn load_views_from_db(db: &Db, view_cache: &ViewCache) -> Result<()> {
             item.value()
                 .try_read()
                 .ok()
-                .and_then(|guard| guard.last().cloned())
+                .and_then(|guard| {
+                    guard.iter().rev().find(|version| {
+                        tx_status_manager.get_status(version.creator_txid) == Some(types::TransactionStatus::Committed) &&
+                        (version.expirer_txid == 0 || tx_status_manager.get_status(version.expirer_txid) != Some(types::TransactionStatus::Committed))
+                    }).cloned()
+                })
                 .map(|version| (item.key().clone(), version))
         })
         .collect();

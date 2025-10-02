@@ -599,7 +599,7 @@ pub fn execute<'a>(
                                     json_path.into_bytes(),
                                 ],
                             };
-                            if let Response::Error(e) = super::super::commands::handle_idx_create(create_index_command, &ctx).await {
+                            if let Response::Error(e) = super::super::commands::handle_idx_create(create_index_command, ctx.clone()).await {
                                 Err(anyhow!("Failed to create unique index: {}", e))?;
                             }
                         }
@@ -658,7 +658,7 @@ pub fn execute<'a>(
                 log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
 
                 let version = crate::types::VersionedValue { value: DbValue::Bytes(schema_bytes), creator_txid: 0, expirer_txid: 0 };
-                ctx.db.insert(schema_key, RwLock::new(vec![version]));
+                ctx.db.insert(schema_key, Arc::new(RwLock::new(vec![version])));
                 ctx.schema_cache.insert(table_name, Arc::new(schema));
                 yield json!({"status": "Table created"});
             }
@@ -866,7 +866,7 @@ pub fn execute<'a>(
                                                 creator_txid: 0, // Or a proper txid
                                                 expirer_txid: 0,
                                             };
-                                            ctx.db.insert(new_schema_key, RwLock::new(vec![new_version]));
+                                            ctx.db.insert(new_schema_key, Arc::new(RwLock::new(vec![new_version])));
                                             ctx.schema_cache.remove(&table_name);
                                             ctx.schema_cache.insert(new_table_name.clone(), Arc::new(schema));
                                         }
@@ -914,7 +914,9 @@ pub fn execute<'a>(
                         for key in keys_to_update {
                             let (new_bytes, should_update) = {
                                 let entry = match ctx.db.get(&key) { Some(e) => e, None => continue };
-                                let version_chain = entry.value().read().await;
+                                let version_chain_arc = entry.value().clone();
+                                drop(entry);
+                                let version_chain = version_chain_arc.read().await;
                                 let mut new_bytes_res = (vec![], false);
 
                                 if let Some(version) = version_chain.iter().rev().find(|v| {
@@ -942,8 +944,10 @@ pub fn execute<'a>(
                             let txid = ctx.tx_id_manager.new_txid();
                             ctx.tx_status_manager.begin(txid);
 
-                            if let Some(mut entry) = ctx.db.get_mut(&key) {
-                                let mut version_chain = entry.value_mut().write().await;
+                            if let Some(entry) = ctx.db.get(&key) {
+                                let version_chain_arc = entry.value().clone();
+                                drop(entry);
+                                let mut version_chain = version_chain_arc.write().await;
                                 if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == 0) {
                                     latest_version.expirer_txid = txid;
                                 }
@@ -981,7 +985,7 @@ pub fn execute<'a>(
                                     json_path.into_bytes(),
                                 ],
                             };
-                            if let Response::Error(e) = super::super::commands::handle_idx_create(create_index_command, &ctx).await {
+                            if let Response::Error(e) = super::super::commands::handle_idx_create(create_index_command, ctx.clone()).await {
                                 Err(anyhow!("Failed to create unique index: {}", e))?;
                             }
                         }
@@ -1021,7 +1025,7 @@ pub fn execute<'a>(
                                                 index_name.into_bytes(),
                                             ],
                                         };
-                                        if let Response::Error(e) = super::super::commands::handle_idx_drop(drop_index_command, &ctx).await {
+                                        if let Response::Error(e) = super::super::commands::handle_idx_drop(drop_index_command, ctx.clone()).await {
                                             eprintln!("Warning: Could not drop index for unique constraint '{}': {}", constraint_name, e);
                                         }
                                     }
@@ -1035,7 +1039,7 @@ pub fn execute<'a>(
                                             index_name.into_bytes(),
                                         ],
                                     };
-                                    if let Response::Error(e) = super::super::commands::handle_idx_drop(drop_index_command, &ctx).await {
+                                    if let Response::Error(e) = super::super::commands::handle_idx_drop(drop_index_command, ctx.clone()).await {
                                         eprintln!("Warning: Could not drop index for primary key constraint '{}': {}", constraint_name, e);
                                     }
                                 }
@@ -1051,7 +1055,9 @@ pub fn execute<'a>(
                         for key in keys_to_update {
                             let (new_bytes, should_update) = {
                                 let entry = match ctx.db.get(&key) { Some(e) => e, None => continue };
-                                let version_chain = entry.value().read().await;
+                                let version_chain_arc = entry.value().clone();
+                                drop(entry);
+                                let version_chain = version_chain_arc.read().await;
                                 let mut new_bytes_res = (vec![], false);
 
                                 if let Some(version) = version_chain.iter().rev().find(|v| {
@@ -1080,8 +1086,10 @@ pub fn execute<'a>(
                             let txid = ctx.tx_id_manager.new_txid();
                             ctx.tx_status_manager.begin(txid);
 
-                            if let Some(mut entry) = ctx.db.get_mut(&key) {
-                                let mut version_chain = entry.value_mut().write().await;
+                            if let Some(entry) = ctx.db.get(&key) {
+                                let version_chain_arc = entry.value().clone();
+                                drop(entry);
+                                let mut version_chain = version_chain_arc.write().await;
                                 if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == 0) {
                                     latest_version.expirer_txid = txid;
                                 }
@@ -1107,8 +1115,8 @@ pub fn execute<'a>(
                 let txid = ctx.tx_id_manager.new_txid();
                 ctx.tx_status_manager.begin(txid);
 
-                let mut version_chain_lock = ctx.db.entry(schema_key.clone()).or_default();
-                let mut version_chain = version_chain_lock.value_mut().write().await;
+                let version_chain_arc = ctx.db.entry(schema_key.clone()).or_default().clone();
+                let mut version_chain = version_chain_arc.write().await;
 
                 if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| {
                     v.expirer_txid == 0
@@ -1149,7 +1157,7 @@ pub fn execute<'a>(
                 log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
 
                 let version = crate::types::VersionedValue { value: DbValue::Bytes(view_bytes), creator_txid: 0, expirer_txid: 0 };
-                ctx.db.insert(view_key, RwLock::new(vec![version]));
+                ctx.db.insert(view_key, Arc::new(RwLock::new(vec![version])));
                 ctx.view_cache.insert(view_name, Arc::new(view_def));
 
                 yield json!({"status": "View created"});
@@ -1164,7 +1172,7 @@ pub fn execute<'a>(
                 log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
 
                 let version = crate::types::VersionedValue { value: DbValue::Bytes(vec![]), creator_txid: 0, expirer_txid: 0 };
-                ctx.db.insert(schema_list_key, RwLock::new(vec![version]));
+                ctx.db.insert(schema_list_key, Arc::new(RwLock::new(vec![version])));
 
                 yield json!({"status": "Schema created"});
             }
@@ -1243,7 +1251,7 @@ pub fn execute<'a>(
                 let log_entry = LogEntry::SetBytes { key: index_metadata_key.clone(), value: index_metadata_bytes.clone() };
                 log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
                 let version = crate::types::VersionedValue { value: DbValue::Bytes(index_metadata_bytes), creator_txid: 0, expirer_txid: 0 };
-                ctx.db.insert(index_metadata_key, RwLock::new(vec![version]));
+                ctx.db.insert(index_metadata_key, Arc::new(RwLock::new(vec![version])));
 
                 // Create the actual index data structure in IndexManager
                 let new_index = Arc::new(crate::indexing::Index::default());
@@ -1255,13 +1263,16 @@ pub fn execute<'a>(
 
                 for entry in ctx.db.iter() {
                     if entry.key().starts_with(&table_prefix) {
-                        let version_chain = entry.value().read().await;
+                        let version_chain_arc = entry.value().clone();
+                        let key = entry.key().clone();
+                        drop(entry);
+                        let version_chain = version_chain_arc.read().await;
                         if let Some(latest_version) = version_chain.last() {
                              if ctx.tx_status_manager.get_status(latest_version.creator_txid) != Some(crate::types::TransactionStatus::Committed) {
                                 continue;
                              }
 
-                            let row_key = entry.key().clone();
+                            let row_key = key.clone();
                             let val: Value = match &latest_version.value {
                                 DbValue::Json(v) => v.clone(),
                                 DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
@@ -1523,8 +1534,8 @@ pub fn execute<'a>(
                             for write_item in tx.writes.iter() {
                                 let key = write_item.key();
                                 let new_value_opt = write_item.value();
-                                let mut version_chain_lock = ctx.db.entry(key.clone()).or_default();
-                                let mut version_chain = version_chain_lock.value_mut().write().await;
+                                let version_chain_arc = ctx.db.entry(key.clone()).or_default().clone();
+                                let mut version_chain = version_chain_arc.write().await;
                                 for version in version_chain.iter_mut().rev() {
                                     if tx.snapshot.is_visible(version, &ctx.tx_status_manager) {
                                         if version.expirer_txid == 0 {

@@ -28,7 +28,9 @@ pub async fn vacuum(ctx: &AppContext) -> Result<(usize, usize)> {
     for key in keys {
         // Use get() and a write lock on the value to avoid locking the whole map segment.
         if let Some(entry) = ctx.db.get(&key) {
-            let mut version_chain = entry.value().write().await;
+            let version_chain_arc = entry.value().clone();
+            drop(entry);
+            let mut version_chain = version_chain_arc.write().await;
 
             let original_len = version_chain.len();
             if original_len == 0 {
@@ -63,10 +65,12 @@ pub async fn vacuum(ctx: &AppContext) -> Result<(usize, usize)> {
         }
     }
 
-    let keys_removed = keys_to_remove.len();
+    let mut keys_removed_count = 0;
     for key in keys_to_remove {
-        ctx.db.remove(&key);
+        if ctx.db.remove_if(&key, |_, v| v.try_read().map_or(false, |g| g.is_empty())).is_some() {
+            keys_removed_count += 1;
+        }
     }
 
-    Ok((versions_removed, keys_removed))
+    Ok((versions_removed, keys_removed_count))
 }

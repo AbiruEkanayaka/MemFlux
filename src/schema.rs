@@ -3,7 +3,7 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::types::{Db, DbValue, SchemaCache, VersionedValue};
+use crate::types::{Db, DbValue, SchemaCache, VersionedValue, TransactionStatusManager, TransactionStatus};
 use crate::query_engine::logical_plan::Expression;
 use crate::query_engine::ast::{TableConstraint};
 
@@ -180,7 +180,7 @@ pub struct VirtualSchema {
     pub constraints: Vec<TableConstraint>,
 }
 
-pub async fn load_schemas_from_db(db: &Db, schema_cache: &SchemaCache) -> Result<()> {
+pub async fn load_schemas_from_db(db: &Db, schema_cache: &SchemaCache, tx_status_manager: &TransactionStatusManager) -> Result<()> {
     let items_to_process: Vec<(String, VersionedValue)> = db
         .iter()
         .filter(|item| item.key().starts_with(SCHEMA_PREFIX))
@@ -188,7 +188,12 @@ pub async fn load_schemas_from_db(db: &Db, schema_cache: &SchemaCache) -> Result
             item.value()
                 .try_read()
                 .ok()
-                .and_then(|guard| guard.last().cloned())
+                .and_then(|guard| {
+                    guard.iter().rev().find(|version| {
+                        tx_status_manager.get_status(version.creator_txid) == Some(TransactionStatus::Committed) &&
+                        (version.expirer_txid == 0 || tx_status_manager.get_status(version.expirer_txid) != Some(TransactionStatus::Committed))
+                    }).cloned()
+                })
                 .map(|version| (item.key().clone(), version))
         })
         .collect();

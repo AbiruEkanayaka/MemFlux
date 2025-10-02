@@ -15,51 +15,51 @@ use crate::indexing::Index;
 
 pub async fn process_command(
     command: Command,
-    ctx: &AppContext,
+    ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     match command.name.as_str() {
         "PING" => Response::SimpleString("PONG".to_string()),
         "AUTH" => Response::Error("AUTH can only be used as the first command.".to_string()),
-        "GET" => handle_get(command, ctx, transaction_handle).await,
-        "SET" => handle_set(command, ctx, transaction_handle).await,
-        "DELETE" => handle_delete(command, ctx, transaction_handle).await,
-        "JSON.SET" => handle_json_set(command, ctx, transaction_handle).await,
-        "JSON.GET" => handle_json_get(command, ctx, transaction_handle).await,
-        "JSON.DEL" => handle_json_del(command, ctx, transaction_handle).await,
-        "LPUSH" => handle_lpush(command, ctx, transaction_handle).await,
-        "RPUSH" => handle_rpush(command, ctx, transaction_handle).await,
-        "LPOP" => handle_lpop(command, ctx, transaction_handle).await,
-        "RPOP" => handle_rpop(command, ctx, transaction_handle).await,
-        "LLEN" => handle_llen(command, ctx, transaction_handle).await,
-        "LRANGE" => handle_lrange(command, ctx, transaction_handle).await,
-        "SADD" => handle_sadd(command, ctx, transaction_handle).await,
-        "SREM" => handle_srem(command, ctx, transaction_handle).await,
-        "SMEMBERS" => handle_smembers(command, ctx, transaction_handle).await,
-        "SCARD" => handle_scard(command, ctx, transaction_handle).await,
-        "SISMEMBER" => handle_sismember(command, ctx, transaction_handle).await,
-        "KEYS" => handle_keys(command, ctx, transaction_handle).await,
-        "FLUSHDB" => handle_flushdb(command, ctx).await,
-        "WIPEDB" => handle_wipedb(command, ctx, transaction_handle).await,
-        "SAVE" => handle_save(command, ctx).await,
-        "MEMUSAGE" => handle_memory_usage(command, ctx).await,
-        "CREATEINDEX" => handle_createindex(command, ctx).await,
-        "IDX.CREATE" => handle_idx_create(command, ctx).await,
-        "IDX.DROP" => handle_idx_drop(command, ctx).await,
-        "IDX.LIST" => handle_idx_list(command, ctx).await,
-        "BEGIN" => handle_begin(command, ctx, transaction_handle).await,
-        "COMMIT" => handle_commit(command, ctx, transaction_handle).await,
-        "ROLLBACK" => handle_rollback(command, ctx, transaction_handle).await,
-        "SAVEPOINT" => handle_savepoint(command, ctx, transaction_handle).await,
-        "ROLLBACK_TO_SAVEPOINT" => handle_rollback_to_savepoint(command, ctx, transaction_handle).await,
-        "RELEASE_SAVEPOINT" => handle_release_savepoint(command, ctx, transaction_handle).await,
-        "VACUUM" => handle_vacuum(ctx).await,
+        "GET" => handle_get(command, ctx.clone(), transaction_handle).await,
+        "SET" => handle_set(command, ctx.clone(), transaction_handle).await,
+        "DELETE" => handle_delete(command, ctx.clone(), transaction_handle).await,
+        "JSON.SET" => handle_json_set(command, ctx.clone(), transaction_handle).await,
+        "JSON.GET" => handle_json_get(command, ctx.clone(), transaction_handle).await,
+        "JSON.DEL" => handle_json_del(command, ctx.clone(), transaction_handle).await,
+        "LPUSH" => handle_lpush(command, ctx.clone(), transaction_handle).await,
+        "RPUSH" => handle_rpush(command, ctx.clone(), transaction_handle).await,
+        "LPOP" => handle_lpop(command, ctx.clone(), transaction_handle).await,
+        "RPOP" => handle_rpop(command, ctx.clone(), transaction_handle).await,
+        "LLEN" => handle_llen(command, ctx.clone(), transaction_handle).await,
+        "LRANGE" => handle_lrange(command, ctx.clone(), transaction_handle).await,
+        "SADD" => handle_sadd(command, ctx.clone(), transaction_handle).await,
+        "SREM" => handle_srem(command, ctx.clone(), transaction_handle).await,
+        "SMEMBERS" => handle_smembers(command, ctx.clone(), transaction_handle).await,
+        "SCARD" => handle_scard(command, ctx.clone(), transaction_handle).await,
+        "SISMEMBER" => handle_sismember(command, ctx.clone(), transaction_handle).await,
+        "KEYS" => handle_keys(command, ctx.clone(), transaction_handle).await,
+        "FLUSHDB" => handle_flushdb(command, ctx.clone()).await,
+        "WIPEDB" => handle_wipedb(command, ctx.clone(), transaction_handle).await,
+        "SAVE" => handle_save(command, ctx.clone()).await,
+        "MEMUSAGE" => handle_memory_usage(command, ctx.clone()).await,
+        "CREATEINDEX" => handle_createindex(command, ctx.clone()).await,
+        "IDX.CREATE" => handle_idx_create(command, ctx.clone()).await,
+        "IDX.DROP" => handle_idx_drop(command, ctx.clone()).await,
+        "IDX.LIST" => handle_idx_list(command, ctx.clone()).await,
+        "BEGIN" => handle_begin(command, ctx.clone(), transaction_handle).await,
+        "COMMIT" => handle_commit(command, ctx.clone(), transaction_handle).await,
+        "ROLLBACK" => handle_rollback(command, ctx.clone(), transaction_handle).await,
+        "SAVEPOINT" => handle_savepoint(command, ctx.clone(), transaction_handle).await,
+        "ROLLBACK_TO_SAVEPOINT" => handle_rollback_to_savepoint(command, ctx.clone(), transaction_handle).await,
+        "RELEASE_SAVEPOINT" => handle_release_savepoint(command, ctx.clone(), transaction_handle).await,
+        "VACUUM" => handle_vacuum(ctx.clone()).await,
         _ => Response::Error(format!("Unknown command: {}", command.name)),
     }
 }
 
-async fn handle_vacuum(ctx: &AppContext) -> Response {
-    match vacuum::vacuum(ctx).await {
+async fn handle_vacuum(ctx: Arc<AppContext>) -> Response {
+    match vacuum::vacuum(&ctx).await {
         Ok((versions_removed, keys_removed)) => Response::SimpleString(format!(
             "Removed {} versions and {} keys",
             versions_removed,
@@ -71,7 +71,7 @@ async fn handle_vacuum(ctx: &AppContext) -> Response {
 
 
 
-async fn db_value_to_response(value: &DbValue, key: &str, ctx: &AppContext) -> Response {
+async fn db_value_to_response(value: &DbValue, key: &str, ctx: &Arc<AppContext>) -> Response {
     if ctx.memory.is_enabled() {
         ctx.memory.track_access(key).await;
     }
@@ -87,11 +87,9 @@ async fn db_value_to_response(value: &DbValue, key: &str, ctx: &AppContext) -> R
     }
 }
 
-
-
 async fn handle_get(
     command: Command,
-    ctx: &AppContext,
+    ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() != 2 {
@@ -103,15 +101,15 @@ async fn handle_get(
     };
 
     let tx_guard = transaction_handle.read().await;
-    match get_visible_db_value(&key, ctx, tx_guard.as_ref()).await {
-        Some(db_value) => db_value_to_response(&db_value, &key, ctx).await,
+    match get_visible_db_value(&key, &ctx, tx_guard.as_ref()).await {
+        Some(db_value) => db_value_to_response(&db_value, &key, &ctx).await,
         None => Response::Nil,
     }
 }
 
 async fn handle_set(
     command: Command,
-    ctx: &AppContext,
+    ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() != 3 {
@@ -123,12 +121,12 @@ async fn handle_set(
     };
     let value = command.args[2].clone();
 
-    let executor = StorageExecutor::new(ctx.clone().into(), transaction_handle);
+    let executor = StorageExecutor::new(ctx, transaction_handle);
     executor.set(key, value).await}
 
 async fn handle_delete(
     command: Command,
-    ctx: &AppContext,
+    ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() < 2 {
@@ -144,7 +142,7 @@ async fn handle_delete(
         return Response::Error("Invalid key(s) provided".to_string());
     }
 
-let executor = StorageExecutor::new(ctx.clone().into(), transaction_handle);
+let executor = StorageExecutor::new(ctx, transaction_handle);
     return executor.delete(keys).await;
 }
 
@@ -152,7 +150,7 @@ let executor = StorageExecutor::new(ctx.clone().into(), transaction_handle);
 
 async fn handle_json_set(
     command: Command,
-    ctx: &AppContext,
+    ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     let (full_path, value_str) = if command.args.len() == 3 {
@@ -194,13 +192,13 @@ async fn handle_json_set(
         Err(_) => return Response::Error("Value is not valid JSON".to_string()),
     };
 
-    let executor = StorageExecutor::new(ctx.clone().into(), transaction_handle);
+    let executor = StorageExecutor::new(ctx, transaction_handle);
     executor.json_set(key, path, value).await
 }
 
 async fn handle_json_get(
     command: Command,
-    ctx: &AppContext,
+    ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() != 2 {
@@ -219,8 +217,8 @@ async fn handle_json_get(
     let inner_path = parts.next().unwrap_or("");
 
     let tx_guard = transaction_handle.read().await;
-    match get_visible_db_value(key, ctx, tx_guard.as_ref()).await {
-        Some(db_value) => json_db_value_to_response(&db_value, inner_path, key, ctx).await,
+    match get_visible_db_value(key, &ctx, tx_guard.as_ref()).await {
+        Some(db_value) => json_db_value_to_response(&db_value, inner_path, key, &ctx).await,
         None => Response::Nil,
     }
 }
@@ -229,7 +227,7 @@ async fn json_db_value_to_response(
     db_value: &DbValue,
     inner_path: &str,
     key: &str,
-    ctx: &AppContext,
+    ctx: &Arc<AppContext>,
 ) -> Response {
     if ctx.memory.is_enabled() {
         ctx.memory.track_access(key).await;
@@ -262,7 +260,7 @@ async fn json_db_value_to_response(
 
 async fn handle_json_del(
     command: Command,
-    ctx: &AppContext,
+    ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() != 2 {
@@ -280,13 +278,13 @@ async fn handle_json_del(
     };
     let inner_path = parts.next().unwrap_or("");
 
-    let executor = StorageExecutor::new(ctx.clone().into(), transaction_handle);
+    let executor = StorageExecutor::new(ctx, transaction_handle);
     executor.json_del(key, inner_path).await
 }
 
 async fn handle_lpush(
     command: Command,
-    ctx: &AppContext,
+    ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() < 3 {
@@ -298,13 +296,13 @@ async fn handle_lpush(
     };
     let values: Vec<Vec<u8>> = command.args[2..].to_vec();
 
-    let executor = StorageExecutor::new(ctx.clone().into(), transaction_handle);
+    let executor = StorageExecutor::new(ctx, transaction_handle);
     executor.lpush(key, values).await
 }
 
 async fn handle_rpush(
     command: Command,
-    ctx: &AppContext,
+    ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() < 3 {
@@ -316,13 +314,13 @@ async fn handle_rpush(
     };
     let values: Vec<Vec<u8>> = command.args[2..].to_vec();
 
-    let executor = StorageExecutor::new(ctx.clone().into(), transaction_handle);
+    let executor = StorageExecutor::new(ctx, transaction_handle);
     executor.rpush(key, values).await
 }
 
 async fn handle_lpop(
     command: Command,
-    ctx: &AppContext,
+    ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() != 2 && command.args.len() != 3 {
@@ -342,7 +340,7 @@ async fn handle_lpop(
         1
     };
 
-    let executor = StorageExecutor::new(ctx.clone().into(), transaction_handle);
+    let executor = StorageExecutor::new(ctx, transaction_handle);
     let mut response = executor.lpop(key, count).await;
 
     // The executor returns a MultiBytes response. We need to adjust it if only one item was requested without a count.
@@ -360,7 +358,7 @@ async fn handle_lpop(
 
 async fn handle_rpop(
     command: Command,
-    ctx: &AppContext,
+    ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() != 2 && command.args.len() != 3 {
@@ -380,7 +378,7 @@ async fn handle_rpop(
         1
     };
 
-    let executor = StorageExecutor::new(ctx.clone().into(), transaction_handle);
+    let executor = StorageExecutor::new(ctx, transaction_handle);
     let mut response = executor.rpop(key, count).await;
 
     // The executor returns a MultiBytes response. We need to adjust it if only one item was requested without a count.
@@ -398,7 +396,7 @@ async fn handle_rpop(
 
 async fn handle_llen(
     command: Command,
-    ctx: &AppContext,
+    ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() != 2 {
@@ -410,7 +408,7 @@ async fn handle_llen(
     };
 
     let tx_guard = transaction_handle.read().await;
-    match get_visible_db_value(&key, ctx, tx_guard.as_ref()).await {
+    match get_visible_db_value(&key, &ctx, tx_guard.as_ref()).await {
         Some(DbValue::List(list_lock)) => {
             let list = list_lock.read().await;
             Response::Integer(list.len() as i64)
@@ -422,7 +420,7 @@ async fn handle_llen(
 
 async fn handle_lrange(
     command: Command,
-    ctx: &AppContext,
+    ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() != 4 {
@@ -448,7 +446,7 @@ async fn handle_lrange(
     };
 
         let tx_guard = transaction_handle.read().await;
-    match get_visible_db_value(&key, ctx, tx_guard.as_ref()).await {
+    match get_visible_db_value(&key, &ctx, tx_guard.as_ref()).await {
         Some(DbValue::List(list_lock)) => {
             let list = list_lock.read().await;
             let len = list.len() as i64;
@@ -477,7 +475,7 @@ async fn handle_lrange(
 
 async fn handle_sadd(
     command: Command,
-    ctx: &AppContext,
+    ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() < 3 {
@@ -489,13 +487,13 @@ async fn handle_sadd(
     };
     let members: Vec<Vec<u8>> = command.args[2..].to_vec();
 
-    let executor = StorageExecutor::new(ctx.clone().into(), transaction_handle);
+    let executor = StorageExecutor::new(ctx, transaction_handle);
     executor.sadd(key, members).await
 }
 
 async fn handle_srem(
     command: Command,
-    ctx: &AppContext,
+    ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() < 3 {
@@ -507,13 +505,13 @@ async fn handle_srem(
     };
     let members: Vec<Vec<u8>> = command.args[2..].to_vec();
 
-    let executor = StorageExecutor::new(ctx.clone().into(), transaction_handle);
+    let executor = StorageExecutor::new(ctx, transaction_handle);
     executor.srem(key, members).await
 }
 
 async fn handle_smembers(
     command: Command,
-    ctx: &AppContext,
+    ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() != 2 {
@@ -525,7 +523,7 @@ async fn handle_smembers(
     };
 
         let tx_guard = transaction_handle.read().await;
-    match get_visible_db_value(&key, ctx, tx_guard.as_ref()).await {
+    match get_visible_db_value(&key, &ctx, tx_guard.as_ref()).await {
         Some(DbValue::Set(set_lock)) => {
             let set = set_lock.read().await;
             let members: Vec<Vec<u8>> = set.iter().cloned().collect();
@@ -538,7 +536,7 @@ async fn handle_smembers(
 
 async fn handle_scard(
     command: Command,
-    ctx: &AppContext,
+    ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() != 2 {
@@ -550,7 +548,7 @@ async fn handle_scard(
     };
 
         let tx_guard = transaction_handle.read().await;
-    match get_visible_db_value(&key, ctx, tx_guard.as_ref()).await {
+    match get_visible_db_value(&key, &ctx, tx_guard.as_ref()).await {
         Some(DbValue::Set(set_lock)) => {
             let set = set_lock.read().await;
             Response::Integer(set.len() as i64)
@@ -562,7 +560,7 @@ async fn handle_scard(
 
 async fn handle_sismember(
     command: Command,
-    ctx: &AppContext,
+    ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() != 3 {
@@ -575,7 +573,7 @@ async fn handle_sismember(
     let member = &command.args[2];
 
         let tx_guard = transaction_handle.read().await;
-    match get_visible_db_value(&key, ctx, tx_guard.as_ref()).await {
+    match get_visible_db_value(&key, &ctx, tx_guard.as_ref()).await {
         Some(DbValue::Set(set_lock)) => {
             let set = set_lock.read().await;
             if set.contains(member) {
@@ -591,7 +589,7 @@ async fn handle_sismember(
 
 async fn handle_keys(
     command: Command,
-    ctx: &AppContext,
+    ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() != 2 {
@@ -615,7 +613,7 @@ async fn handle_keys(
         // 1. Get potentially visible keys from the main DB
         for db_entry in ctx.db.iter() {
             let key = db_entry.key();
-            if get_visible_db_value(key, ctx, Some(tx)).await.is_some() {
+            if get_visible_db_value(key, &ctx, Some(tx)).await.is_some() {
                 keys.insert(key.clone());
             }
         }
@@ -651,18 +649,23 @@ async fn handle_keys(
 
     for key in matching_keys {
         if let Some(entry) = ctx.db.get(&key) {
-            let version_chain = entry.value().read().await;
-            if let Some(latest_version) = version_chain.last() {
-                if ctx.tx_status_manager.get_status(latest_version.creator_txid)
+            let version_chain_arc = entry.value().clone();
+            drop(entry);
+            let version_chain = version_chain_arc.read().await;
+            for version in version_chain.iter().rev() {
+                if ctx.tx_status_manager.get_status(version.creator_txid)
                     == Some(TransactionStatus::Committed)
                 {
-                    if latest_version.expirer_txid == 0
+                    if version.expirer_txid == 0
                         || ctx
                             .tx_status_manager
-                            .get_status(latest_version.expirer_txid)
+                            .get_status(version.expirer_txid)
                             != Some(TransactionStatus::Committed)
                     {
                         keys.push(key.as_bytes().to_vec());
+                        break;
+                    } else {
+                        break;
                     }
                 }
             }
@@ -671,7 +674,7 @@ async fn handle_keys(
     Response::MultiBytes(keys)
 }
 
-async fn handle_flushdb(command: Command, ctx: &AppContext) -> Response {
+async fn handle_flushdb(command: Command, ctx: Arc<AppContext>) -> Response {
     if command.args.len() != 1 {
         return Response::Error("FLUSHDB takes no arguments".to_string());
     }
@@ -690,7 +693,7 @@ async fn handle_flushdb(command: Command, ctx: &AppContext) -> Response {
 
 async fn handle_wipedb(
     command: Command,
-    ctx: &AppContext,
+    ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() != 1 {
@@ -733,7 +736,7 @@ async fn handle_wipedb(
     Response::Ok
 }
 
-async fn handle_save(command: Command, ctx: &AppContext) -> Response {
+async fn handle_save(command: Command, ctx: Arc<AppContext>) -> Response {
     if command.args.len() != 1 {
         return Response::Error("SAVE takes no arguments".to_string());
     }
@@ -746,7 +749,7 @@ async fn handle_save(command: Command, ctx: &AppContext) -> Response {
     Response::Ok
 }
 
-async fn handle_memory_usage(command: Command, ctx: &AppContext) -> Response {
+async fn handle_memory_usage(command: Command, ctx: Arc<AppContext>) -> Response {
     if command.args.len() != 1 {
         return Response::Error("MEMUSAGE takes no arguments".to_string());
     }
@@ -754,7 +757,7 @@ async fn handle_memory_usage(command: Command, ctx: &AppContext) -> Response {
     Response::Integer(usage as i64)
 }
 
-async fn handle_createindex(command: Command, ctx: &AppContext) -> Response {
+async fn handle_createindex(command: Command, ctx: Arc<AppContext>) -> Response {
     if command.args.len() != 4 || String::from_utf8_lossy(&command.args[2]).to_uppercase() != "ON" {
         return Response::Error("Usage: CREATEINDEX <key-prefix> ON <json-path>".to_string());
     }
@@ -787,7 +790,7 @@ async fn handle_createindex(command: Command, ctx: &AppContext) -> Response {
     handle_idx_create(adapted_command, ctx).await
 }
 
-pub async fn handle_idx_create(command: Command, ctx: &AppContext) -> Response {
+pub async fn handle_idx_create(command: Command, ctx: Arc<AppContext>) -> Response {
     if command.args.len() != 4 {
         return Response::Error(
             "IDX.CREATE requires an index name, a key prefix, and a JSON path".to_string(),
@@ -839,7 +842,10 @@ pub async fn handle_idx_create(command: Command, ctx: &AppContext) -> Response {
 
     for entry in ctx.db.iter() {
         if entry.key().starts_with(pattern) {
-            let version_chain = entry.value().read().await;
+            let version_chain_arc = entry.value().clone();
+            let key = entry.key().clone();
+            drop(entry);
+            let version_chain = version_chain_arc.read().await;
             if let Some(latest_version) = version_chain.last() {
                 if ctx.tx_status_manager.get_status(latest_version.creator_txid)
                     != Some(TransactionStatus::Committed)
@@ -859,7 +865,7 @@ pub async fn handle_idx_create(command: Command, ctx: &AppContext) -> Response {
                     index_data
                         .entry(index_key)
                         .or_default()
-                        .insert(entry.key().clone());
+                        .insert(key.clone());
                     backfilled_count += 1;
                 }
             }
@@ -873,7 +879,7 @@ pub async fn handle_idx_create(command: Command, ctx: &AppContext) -> Response {
     Response::Ok
 }
 
-pub async fn handle_idx_drop(command: Command, ctx: &AppContext) -> Response {
+pub async fn handle_idx_drop(command: Command, ctx: Arc<AppContext>) -> Response {
     if command.args.len() != 2 {
         return Response::Error("IDX.DROP requires an index name".to_string());
     }
@@ -894,7 +900,7 @@ pub async fn handle_idx_drop(command: Command, ctx: &AppContext) -> Response {
     }
 }
 
-async fn handle_idx_list(command: Command, ctx: &AppContext) -> Response {
+async fn handle_idx_list(command: Command, ctx: Arc<AppContext>) -> Response {
     if command.args.len() != 1 {
         return Response::Error("IDX.LIST takes no arguments".to_string());
     }
@@ -909,7 +915,7 @@ async fn handle_idx_list(command: Command, ctx: &AppContext) -> Response {
 
 async fn handle_begin(
     command: Command,
-    ctx: &AppContext,
+    ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() != 1 {
@@ -928,7 +934,7 @@ async fn handle_begin(
 
 async fn handle_commit(
     _command: Command,
-    ctx: &AppContext,
+    ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     let tx = {
@@ -1005,8 +1011,34 @@ async fn handle_commit(
     for item in tx.writes.iter() {
         let key = item.key();
         let value = item.value();
-        let mut version_chain_lock = ctx.db.entry(key.clone()).or_default();
-        let mut version_chain = version_chain_lock.value_mut().write().await;
+        let version_chain_arc = ctx.db.entry(key.clone()).or_default().clone();
+
+        // --- Index Maintenance ---
+        let old_db_value = {
+            let version_chain = version_chain_arc.read().await;
+            version_chain.iter().rev()
+                .find(|v| tx.snapshot.is_visible(v, &ctx.tx_status_manager))
+                .map(|v| v.value.clone())
+        };
+
+        if let Some(old_val) = old_db_value.as_ref().and_then(|v| match v {
+            DbValue::Json(val) => Some(val.clone()),
+            DbValue::JsonB(b) => serde_json::from_slice(b).ok(),
+            _ => None
+        }) {
+            ctx.index_manager.remove_key_from_indexes(key, &old_val).await;
+        }
+
+        if let Some(new_val) = value.as_ref().and_then(|v| match v {
+            DbValue::Json(val) => Some(val.clone()),
+            DbValue::JsonB(b) => serde_json::from_slice(b).ok(),
+            _ => None
+        }) {
+            ctx.index_manager.add_key_to_indexes(key, &new_val).await;
+        }
+        // --- End Index Maintenance ---
+
+        let mut version_chain = version_chain_arc.write().await;
 
         // Find the version that was visible to this transaction and expire it.
         if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| {
@@ -1035,7 +1067,7 @@ async fn handle_commit(
 
 async fn handle_rollback(
     command: Command,
-    ctx: &AppContext,
+    ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() != 1 {
@@ -1062,7 +1094,7 @@ async fn handle_rollback(
 
 async fn handle_savepoint(
     command: Command,
-    _ctx: &AppContext,
+    _ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() != 2 {
@@ -1095,7 +1127,7 @@ async fn handle_savepoint(
 
 async fn handle_rollback_to_savepoint(
     command: Command,
-    _ctx: &AppContext,
+    _ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() != 2 {
@@ -1142,7 +1174,7 @@ async fn handle_rollback_to_savepoint(
 
 async fn handle_release_savepoint(
     command: Command,
-    _ctx: &AppContext,
+    _ctx: Arc<AppContext>,
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() != 2 {

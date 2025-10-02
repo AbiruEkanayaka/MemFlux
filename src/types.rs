@@ -125,17 +125,16 @@ impl Snapshot {
         tx_manager: &TransactionStatusManager,
         id_manager: &TransactionIdManager,
     ) -> Self {
+        let xmax = id_manager.get_current_txid();
         let active_txids = tx_manager.get_active_txids();
-        let xmin = active_txids
-            .iter()
-            .min()
-            .copied()
-            .unwrap_or_else(|| id_manager.get_current_txid());
+        let xip: HashSet<TxId> = active_txids.into_iter().filter(|id| *id < xmax).collect();
+        let xmin = xip.iter().min().copied().unwrap_or(xmax);
+
         Self {
             txid,
             xmin,
-            xmax: id_manager.get_current_txid(),
-            xip: active_txids,
+            xmax,
+            xip,
         }
     }
 
@@ -199,11 +198,11 @@ impl Clone for DbValue {
             DbValue::Bytes(b) => DbValue::Bytes(b.clone()),
             DbValue::Array(a) => DbValue::Array(a.clone()),
             DbValue::List(lock) => {
-                let list = lock.try_read().expect("Cloning a List failed due to a write lock being held.").clone();
+                let list = tokio::task::block_in_place(|| lock.blocking_read().clone());
                 DbValue::List(RwLock::new(list))
             }
             DbValue::Set(lock) => {
-                let set = lock.try_read().expect("Cloning a Set failed due to a write lock being held.").clone();
+                let set = tokio::task::block_in_place(|| lock.blocking_read().clone());
                 DbValue::Set(RwLock::new(set))
             }
         }
@@ -315,7 +314,7 @@ pub struct LogRequest {
 // --- Type Aliases ---
 
 pub type Logger = mpsc::Sender<PersistenceRequest>;
-pub type Db = Arc<DashMap<String, RwLock<Vec<VersionedValue>>>>;
+pub type Db = Arc<DashMap<String, Arc<RwLock<Vec<VersionedValue>>>>>;
 pub type JsonCache = Arc<DashMap<String, Arc<Vec<u8>>>>;
 pub type SchemaCache = Arc<DashMap<String, Arc<VirtualSchema>>>;
 pub type ViewCache = Arc<DashMap<String, Arc<ViewDefinition>>>;

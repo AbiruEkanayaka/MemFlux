@@ -92,7 +92,9 @@ impl PersistenceEngine {
                 let keys: Vec<String> = db_clone.iter().map(|item| item.key().clone()).collect();
                 for key in keys {
                     if let Some(item) = db_clone.get(&key) {
-                        let version_chain = item.value().read().await;
+                        let version_chain_arc = item.value().clone();
+                        drop(item);
+                        let version_chain = version_chain_arc.read().await;
                         for version in version_chain.iter().rev() {
                             if tx_status_manager.get_status(version.creator_txid)
                                 == Some(TransactionStatus::Committed)
@@ -104,7 +106,7 @@ impl PersistenceEngine {
                                     let serializable_value =
                                         SerializableDbValue::from_db_value(&version.value).await;
                                     let entry = SnapshotEntry {
-                                        key: item.key().clone(),
+                                        key: key.clone(),
                                         value: serializable_value,
                                     };
                                     if tx.send(entry).await.is_err() {
@@ -267,12 +269,17 @@ impl PersistenceEngine {
 
                     let final_result = if write_result.is_ok() {
                         match highest_durability {
-                            crate::config::DurabilityLevel::Full => file.sync_all().await,
-                            crate::config::DurabilityLevel::Fsync => file.sync_data().await,
-                            crate::config::DurabilityLevel::None => {
-                                // For None, we acknowledge after the OS write.
+                            crate::config::DurabilityLevel::Full => {
+                                file.sync_all().await
+                            }
+                            crate::config::DurabilityLevel::Fsync => {
+                                // For Fsync, we acknowledge after the OS write.
                                 // The background fsync loop will handle flushing to disk.
                                 let _ = fsync_notify_tx.try_send(());
+                                Ok(())
+                            }
+                            crate::config::DurabilityLevel::None => {
+                                // For None, we just acknowledge after the OS write. No fsync is triggered.
                                 Ok(())
                             }
                         }
@@ -431,7 +438,7 @@ async fn load_from_snapshot(snapshot_path: &str, db: &Db) -> Result<()> {
                     creator_txid: 0, // Pre-existing data
                     expirer_txid: 0,
                 };
-                db_clone.insert(entry.key, RwLock::new(vec![versioned_value]));
+                db_clone.insert(entry.key, Arc::new(RwLock::new(vec![versioned_value])));
             });
             total_count += batch_count as i32;
         }
@@ -484,7 +491,7 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                     creator_txid: 0,
                     expirer_txid: 0,
                 };
-                db.insert(key, RwLock::new(vec![new_version]));
+                db.insert(key, Arc::new(RwLock::new(vec![new_version])));
             }
             LogEntry::SetJsonB { key, value } => {
                 let new_version = VersionedValue {
@@ -492,7 +499,7 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                     creator_txid: 0,
                     expirer_txid: 0,
                 };
-                db.insert(key, RwLock::new(vec![new_version]));
+                db.insert(key, Arc::new(RwLock::new(vec![new_version])));
             }
             LogEntry::Delete { key } => {
                 db.remove(&key);
@@ -503,14 +510,14 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                 let mut parts = path.splitn(2, '.');
                 if let Some(key) = parts.next() {
                     let value: serde_json::Value = serde_json::from_str(&value).unwrap_or(serde_json::Value::Null);
-                    let entry = db.entry(key.to_string()).or_insert_with(|| {
-                        RwLock::new(vec![VersionedValue {
+                    let version_chain_arc = db.entry(key.to_string()).or_insert_with(|| {
+                        Arc::new(RwLock::new(vec![VersionedValue {
                             value: DbValue::JsonB(b"{}".to_vec()),
                             creator_txid: 0,
                             expirer_txid: 0,
-                        }])
-                    });
-                    let mut version_chain = entry.value().write().await;
+                        }]))
+                    }).clone();
+                    let mut version_chain = version_chain_arc.write().await;
                     if let Some(latest_version) = version_chain.last_mut() {
                         let mut current_val: serde_json::Value = match &latest_version.value {
                             DbValue::Json(v) => v.clone(),
@@ -536,7 +543,9 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                 let mut parts = path.splitn(2, '.');
                 if let Some(key) = parts.next() {
                     if let Some(entry) = db.get(key) {
-                        let mut version_chain = entry.value().write().await;
+                        let version_chain_arc = entry.value().clone();
+                        drop(entry);
+                        let mut version_chain = version_chain_arc.write().await;
                         if let Some(latest_version) = version_chain.last_mut() {
                              let mut current_val: serde_json::Value = match &latest_version.value {
                                 DbValue::Json(v) => v.clone(),
@@ -565,14 +574,14 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                 }
             }
             LogEntry::LPush { key, values } => {
-                let entry = db.entry(key).or_insert_with(|| {
-                    RwLock::new(vec![VersionedValue {
+                let version_chain_arc = db.entry(key).or_insert_with(|| {
+                    Arc::new(RwLock::new(vec![VersionedValue {
                         value: DbValue::List(RwLock::new(VecDeque::new())),
                         creator_txid: 0,
                         expirer_txid: 0,
-                    }])
-                });
-                if let Some(latest_version) = entry.value().write().await.last_mut() {
+                    }]))
+                }).clone();
+                if let Some(latest_version) = version_chain_arc.write().await.last_mut() {
                     if let DbValue::List(list_lock) = &mut latest_version.value {
                         let mut list = list_lock.write().await;
                         for v in values {
@@ -582,14 +591,14 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                 }
             }
             LogEntry::RPush { key, values } => {
-                let entry = db.entry(key).or_insert_with(|| {
-                    RwLock::new(vec![VersionedValue {
+                let version_chain_arc = db.entry(key).or_insert_with(|| {
+                    Arc::new(RwLock::new(vec![VersionedValue {
                         value: DbValue::List(RwLock::new(VecDeque::new())),
                         creator_txid: 0,
                         expirer_txid: 0,
-                    }])
-                });
-                if let Some(latest_version) = entry.value().write().await.last_mut() {
+                    }]))
+                }).clone();
+                if let Some(latest_version) = version_chain_arc.write().await.last_mut() {
                     if let DbValue::List(list_lock) = &mut latest_version.value {
                         let mut list = list_lock.write().await;
                         for v in values {
@@ -600,7 +609,9 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
             }
             LogEntry::LPop { key, count } => {
                 if let Some(entry) = db.get(&key) {
-                    if let Some(latest_version) = entry.value().write().await.last_mut() {
+                    let version_chain_arc = entry.value().clone();
+                    drop(entry);
+                    if let Some(latest_version) = version_chain_arc.write().await.last_mut() {
                         if let DbValue::List(list_lock) = &mut latest_version.value {
                             let mut list = list_lock.write().await;
                             for _ in 0..count {
@@ -614,7 +625,9 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
             }
             LogEntry::RPop { key, count } => {
                 if let Some(entry) = db.get(&key) {
-                    if let Some(latest_version) = entry.value().write().await.last_mut() {
+                    let version_chain_arc = entry.value().clone();
+                    drop(entry);
+                    if let Some(latest_version) = version_chain_arc.write().await.last_mut() {
                         if let DbValue::List(list_lock) = &mut latest_version.value {
                             let mut list = list_lock.write().await;
                             for _ in 0..count {
@@ -627,14 +640,14 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                 }
             }
             LogEntry::SAdd { key, members } => {
-                let entry = db.entry(key).or_insert_with(|| {
-                    RwLock::new(vec![VersionedValue {
+                let version_chain_arc = db.entry(key).or_insert_with(|| {
+                    Arc::new(RwLock::new(vec![VersionedValue {
                         value: DbValue::Set(RwLock::new(HashSet::new())),
                         creator_txid: 0,
                         expirer_txid: 0,
-                    }])
-                });
-                if let Some(latest_version) = entry.value().write().await.last_mut() {
+                    }]))
+                }).clone();
+                if let Some(latest_version) = version_chain_arc.write().await.last_mut() {
                     if let DbValue::Set(set_lock) = &mut latest_version.value {
                         let mut set = set_lock.write().await;
                         for m in members {
@@ -645,7 +658,9 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
             }
             LogEntry::SRem { key, members } => {
                 if let Some(entry) = db.get(&key) {
-                    if let Some(latest_version) = entry.value().write().await.last_mut() {
+                    let version_chain_arc = entry.value().clone();
+                    drop(entry);
+                    if let Some(latest_version) = version_chain_arc.write().await.last_mut() {
                         if let DbValue::Set(set_lock) = &mut latest_version.value {
                             let mut set = set_lock.write().await;
                             for m in members {
@@ -690,7 +705,7 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                                         creator_txid: 0,
                                         expirer_txid: 0,
                                     };
-                                    db.insert(new_schema_key, RwLock::new(vec![new_version]));
+                                    db.insert(new_schema_key, Arc::new(RwLock::new(vec![new_version])));
                                 }
                             }
                         }

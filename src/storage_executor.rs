@@ -60,7 +60,9 @@ pub async fn get_visible_db_value<'a>(
             return entry.value().clone();
         }
         if let Some(version_chain_lock) = ctx.db.get(key) {
-            let version_chain = version_chain_lock.read().await;
+            let version_chain_arc = version_chain_lock.clone();
+            drop(version_chain_lock);
+            let version_chain = version_chain_arc.read().await;
             for version in version_chain.iter().rev() {
                 if tx.snapshot
                     .is_visible(version, &ctx.tx_status_manager)
@@ -79,7 +81,9 @@ pub async fn get_visible_db_value<'a>(
         return None;
     }
     if let Some(version_chain_lock) = ctx.db.get(key) {
-        let version_chain = version_chain_lock.read().await;
+        let version_chain_arc = version_chain_lock.clone();
+        drop(version_chain_lock);
+        let version_chain = version_chain_arc.read().await;
         for version in version_chain.iter().rev() {
             if ctx.tx_status_manager.get_status(version.creator_txid) == Some(TransactionStatus::Committed) {
                 if version.expirer_txid == 0 || ctx.tx_status_manager.get_status(version.expirer_txid) != Some(TransactionStatus::Committed) {
@@ -88,7 +92,7 @@ pub async fn get_visible_db_value<'a>(
                     }
                     return Some(version.value.clone());
                 } else {
-                    return None;
+                    continue;
                 }
             }
         }
@@ -147,7 +151,9 @@ impl StorageExecutor {
         self.ctx.tx_status_manager.begin(txid);
         let mut old_size = 0;
         if let Some(version_chain_lock) = self.ctx.db.get(&key) {
-            let version_chain = version_chain_lock.read().await;
+            let version_chain_arc = version_chain_lock.clone();
+            drop(version_chain_lock);
+            let version_chain = version_chain_arc.read().await;
             if let Some(latest_version) = version_chain.iter().rev().find(|v| self.ctx.tx_status_manager.get_status(v.creator_txid) == Some(TransactionStatus::Committed) && v.expirer_txid == 0) {
                 old_size = key.len() as u64 + memory::estimate_db_value_size(&latest_version.value).await;
             }
@@ -165,8 +171,8 @@ impl StorageExecutor {
             self.ctx.tx_status_manager.abort(txid);
             return ack_response;
         }
-        let mut version_chain_lock = self.ctx.db.entry(key.clone()).or_default();
-        let mut version_chain = version_chain_lock.value_mut().write().await;
+        let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
+        let mut version_chain = version_chain_arc.write().await;
         if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == 0 && self.ctx.tx_status_manager.get_status(v.creator_txid) == Some(TransactionStatus::Committed)) {
             latest_version.expirer_txid = txid;
         }
@@ -216,7 +222,9 @@ impl StorageExecutor {
             let mut old_size = 0;
             let mut old_value_for_index: Option<Value> = None;
             if let Some(version_chain_lock) = self.ctx.db.get(&key) {
-                let mut version_chain = version_chain_lock.value().write().await;
+                let version_chain_arc = version_chain_lock.value().clone();
+                drop(version_chain_lock);
+                let mut version_chain = version_chain_arc.write().await;
                 let mut expired_something = false;
                 if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == 0 && self.ctx.tx_status_manager.get_status(v.creator_txid) == Some(TransactionStatus::Committed)) {
                     latest_version.expirer_txid = txid;
@@ -334,8 +342,8 @@ impl StorageExecutor {
         drop(tx_guard);
         let txid = self.ctx.tx_id_manager.new_txid();
         self.ctx.tx_status_manager.begin(txid);
-        let mut version_chain_lock = self.ctx.db.entry(key.clone()).or_default();
-        let mut version_chain = version_chain_lock.value_mut().write().await;
+        let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
+        let mut version_chain = version_chain_arc.write().await;
         let mut old_size = 0;
         let mut old_val_for_index = json!({});
         let mut current_val = if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == 0 && self.ctx.tx_status_manager.get_status(v.creator_txid) == Some(TransactionStatus::Committed)) {
@@ -474,8 +482,8 @@ impl StorageExecutor {
         drop(tx_guard);
         let txid = self.ctx.tx_id_manager.new_txid();
         self.ctx.tx_status_manager.begin(txid);
-        let mut version_chain_lock = self.ctx.db.entry(key.clone()).or_default();
-        let mut version_chain = version_chain_lock.value_mut().write().await;
+        let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
+        let mut version_chain = version_chain_arc.write().await;
         let old_size;
         let old_val_for_index;
         let mut modified = false;
@@ -588,8 +596,8 @@ impl StorageExecutor {
             self.ctx.tx_status_manager.abort(txid);
             return ack_response;
         }
-        let mut version_chain_lock = self.ctx.db.entry(key.clone()).or_default();
-        let mut version_chain = version_chain_lock.value_mut().write().await;
+        let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
+        let mut version_chain = version_chain_arc.write().await;
         let mut old_size = 0;
         let mut new_list = if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == 0 && self.ctx.tx_status_manager.get_status(v.creator_txid) == Some(TransactionStatus::Committed)) {
             latest_version.expirer_txid = txid;
@@ -663,8 +671,8 @@ impl StorageExecutor {
             self.ctx.tx_status_manager.abort(txid);
             return ack_response;
         }
-        let mut version_chain_lock = self.ctx.db.entry(key.clone()).or_default();
-        let mut version_chain = version_chain_lock.value_mut().write().await;
+        let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
+        let mut version_chain = version_chain_arc.write().await;
         let mut old_size = 0;
         let mut new_list = if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == 0 && self.ctx.tx_status_manager.get_status(v.creator_txid) == Some(TransactionStatus::Committed)) {
             latest_version.expirer_txid = txid;
@@ -736,8 +744,8 @@ impl StorageExecutor {
             self.ctx.tx_status_manager.abort(txid);
             return ack_response;
         }
-        let mut version_chain_lock = self.ctx.db.entry(key.clone()).or_default();
-        let mut version_chain = version_chain_lock.value_mut().write().await;
+        let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
+        let mut version_chain = version_chain_arc.write().await;
         let mut old_size = 0;
         let mut popped = Vec::new();
         let mut list_exists = false;
@@ -811,8 +819,8 @@ impl StorageExecutor {
             self.ctx.tx_status_manager.abort(txid);
             return ack_response;
         }
-        let mut version_chain_lock = self.ctx.db.entry(key.clone()).or_default();
-        let mut version_chain = version_chain_lock.value_mut().write().await;
+        let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
+        let mut version_chain = version_chain_arc.write().await;
         let mut old_size = 0;
         let mut popped = Vec::new();
         let mut list_exists = false;
@@ -899,8 +907,8 @@ impl StorageExecutor {
             self.ctx.tx_status_manager.abort(txid);
             return ack_response;
         }
-        let mut version_chain_lock = self.ctx.db.entry(key.clone()).or_default();
-        let mut version_chain = version_chain_lock.value_mut().write().await;
+        let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
+        let mut version_chain = version_chain_arc.write().await;
         if old_size > 0 {
             if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == 0 && self.ctx.tx_status_manager.get_status(v.creator_txid) == Some(TransactionStatus::Committed)) {
                 latest_version.expirer_txid = txid;
@@ -967,8 +975,8 @@ impl StorageExecutor {
             self.ctx.tx_status_manager.abort(txid);
             return ack_response;
         }
-        let mut version_chain_lock = self.ctx.db.entry(key.clone()).or_default();
-        let mut version_chain = version_chain_lock.value_mut().write().await;
+        let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
+        let mut version_chain = version_chain_arc.write().await;
         let mut old_size = 0;
         let mut removed_count = 0;
         let mut new_set = if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == 0 && self.ctx.tx_status_manager.get_status(v.creator_txid) == Some(TransactionStatus::Committed)) {
@@ -1005,8 +1013,17 @@ impl StorageExecutor {
             for row in rows {
                 let table_part = match row.get(table_name) { Some(part) => part, None => continue };
                 let key = match table_part.get("_key").and_then(|k| k.as_str()) { Some(k) => k.to_string(), None => continue };
-                let log_entry = LogEntry::Delete { key: key.clone() };
-                tx.log_entries.write().await.push(log_entry);
+                
+                if self.ctx.memory.is_enabled() {
+                    let old_db_value = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
+                    if let Some(v) = old_db_value {
+                        let old_size = key.len() as u64 + memory::estimate_db_value_size(&v).await;
+                        self.ctx.memory.decrease_memory(old_size);
+                        tx.reserved_memory.fetch_sub(old_size as i64, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+
+                tx.log_entries.write().await.push(LogEntry::Delete { key: key.clone() });
                 tx.writes.insert(key, None);
                 deleted_count += 1;
             }
@@ -1027,7 +1044,9 @@ impl StorageExecutor {
             }
             let mut old_size = 0;
             if let Some(version_chain_lock) = self.ctx.db.get(&key) {
-                let mut version_chain = version_chain_lock.value().write().await;
+                let version_chain_arc = version_chain_lock.value().clone();
+                drop(version_chain_lock);
+                let mut version_chain = version_chain_arc.write().await;
                 let mut expired_something = false;
                 if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == 0 && self.ctx.tx_status_manager.get_status(v.creator_txid) == Some(TransactionStatus::Committed)) {
                     latest_version.expirer_txid = txid;
@@ -1054,6 +1073,14 @@ impl StorageExecutor {
             for row in rows_to_update {
                 let table_part = match row.get(table_name) { Some(part) => part, None => continue };
                 let key = match table_part.get("_key").and_then(|k| k.as_str()) { Some(k) => k.to_string(), None => continue };
+                
+                let old_db_value = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
+                let old_size = if let Some(ref v) = old_db_value {
+                    key.len() as u64 + memory::estimate_db_value_size(v).await
+                } else {
+                    0
+                };
+
                 let mut new_val = table_part.clone();
                 for (col, expr) in set_clauses {
                     let mut val = expr.evaluate_with_context(&row, None, self.ctx.clone(), Some(self.transaction_handle.clone())).await?;
@@ -1065,66 +1092,93 @@ impl StorageExecutor {
                     new_val[col] = val;
                 }
                 let new_val_bytes = serde_json::to_vec(&new_val)?;
+                let new_size = key.len() as u64 + new_val_bytes.len() as u64;
+                let memory_change = new_size as i64 - old_size as i64;
+
+                if self.ctx.memory.is_enabled() {
+                    if memory_change > 0 {
+                        if let Err(e) = self.ctx.memory.ensure_memory_for(memory_change as u64, &self.ctx).await {
+                            return Err(anyhow!(e.to_string()));
+                        }
+                        self.ctx.memory.increase_memory(memory_change as u64);
+                    } else {
+                        self.ctx.memory.decrease_memory(-memory_change as u64);
+                    }
+                    tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+                }
+
                 let log_entry = LogEntry::SetJsonB { key: key.clone(), value: new_val_bytes.clone() };
                 tx.log_entries.write().await.push(log_entry);
-                            tx.writes.insert(key, Some(DbValue::JsonB(new_val_bytes)));
-                            updated_rows.push(new_val);
+                tx.writes.insert(key, Some(DbValue::JsonB(new_val_bytes)));
+                updated_rows.push(new_val);
+            }
+        } else {
+            drop(tx_guard);
+            for row in rows_to_update {
+                let table_part = match row.get(table_name) { Some(part) => part, None => continue };
+                let key = match table_part.get("_key").and_then(|k| k.as_str()) { Some(k) => k.to_string(), None => continue };
+                
+                let txid = self.ctx.tx_id_manager.new_txid();
+                self.ctx.tx_status_manager.begin(txid);
+
+                let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
+                let version_chain = version_chain_arc.read().await;
+
+                let old_val_opt = {
+                    let mut old_val = None;
+                    for version in version_chain.iter().rev() {
+                        if self.ctx.tx_status_manager.get_status(version.creator_txid) == Some(TransactionStatus::Committed) && (version.expirer_txid == 0 || self.ctx.tx_status_manager.get_status(version.expirer_txid) != Some(TransactionStatus::Committed)) {
+                            old_val = Some(match &version.value {
+                                DbValue::Json(v) => v.clone(),
+                                DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
+                                _ => return Err(anyhow!("WRONGTYPE Operation against a non-JSON value")),
+                            });
+                            break;
                         }
-                        return Ok(updated_rows);        }
-        drop(tx_guard);
-        for row in rows_to_update {
-            let table_part = match row.get(table_name) { Some(part) => part, None => continue };
-            let key = match table_part.get("_key").and_then(|k| k.as_str()) { Some(k) => k.to_string(), None => continue };
-            let txid = self.ctx.tx_id_manager.new_txid();
-            self.ctx.tx_status_manager.begin(txid);
-            let (old_val_for_index, new_val) = {
-                let version_chain_lock = self.ctx.db.entry(key.clone()).or_default();
-                let version_chain = version_chain_lock.read().await;
-                let mut old_val = json!({});
-                let mut found_visible = false;
-                for version in version_chain.iter().rev() {
-                    if self.ctx.tx_status_manager.get_status(version.creator_txid) == Some(TransactionStatus::Committed) && (version.expirer_txid == 0 || self.ctx.tx_status_manager.get_status(version.expirer_txid) != Some(TransactionStatus::Committed)) {
-                        old_val = match &version.value {
-                            DbValue::Json(v) => v.clone(),
-                            DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
-                            _ => return Err(anyhow!("WRONGTYPE Operation against a non-JSON value")),
-                        };
-                        found_visible = true;
-                        break;
                     }
+                    old_val
+                };
+
+                if old_val_opt.is_none() {
+                    self.ctx.tx_status_manager.abort(txid);
+                    continue;
                 }
-                if !found_visible { continue; }
-                            let mut new_val = old_val.clone();
-                            for (col, expr) in set_clauses {
-                                let mut val = expr.evaluate_with_context(&row, Some(&old_val), self.ctx.clone(), None).await?;
-                                if let Some(s) = &schema {
-                                    if let Some(col_def) = s.columns.get(col) {
-                                        val = crate::query_engine::logical_plan::cast_value_to_type(val, &col_def.data_type)?;
-                                    }
-                                }
-                                new_val[col] = val;
-                            }
-                (old_val, new_val)
-            };
-            let new_val_bytes = serde_json::to_vec(&new_val)?;
-            let log_entry = LogEntry::SetJsonB { key: key.clone(), value: new_val_bytes.clone() };
-            if let Response::Error(e) = log_to_wal(log_entry, &self.ctx).await {
-                self.ctx.tx_status_manager.abort(txid);
-                return Err(anyhow!(e));
-            }
-            let mut version_chain_lock = self.ctx.db.entry(key.clone()).or_default();
-            let mut version_chain = version_chain_lock.value_mut().write().await;
-            if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == 0 && self.ctx.tx_status_manager.get_status(v.creator_txid) == Some(TransactionStatus::Committed)) {
-                latest_version.expirer_txid = txid;
-            }
-            let new_version = crate::types::VersionedValue { value: DbValue::JsonB(new_val_bytes), creator_txid: txid, expirer_txid: 0 };
-            version_chain.push(new_version);
-            self.ctx.index_manager.remove_key_from_indexes(&key, &old_val_for_index).await;
-                    self.ctx.index_manager.add_key_to_indexes(&key, &new_val).await;
-                    self.ctx.tx_status_manager.commit(txid);
-                    updated_rows.push(new_val);
+                let old_val = old_val_opt.unwrap();
+
+                let mut new_val = old_val.clone();
+                for (col, expr) in set_clauses {
+                    let mut val = expr.evaluate_with_context(&row, Some(&old_val), self.ctx.clone(), None).await?;
+                    if let Some(s) = &schema {
+                        if let Some(col_def) = s.columns.get(col) {
+                            val = crate::query_engine::logical_plan::cast_value_to_type(val, &col_def.data_type)?;
+                        }
+                    }
+                    new_val[col] = val;
                 }
-                Ok(updated_rows)    }
+                
+                let new_val_bytes = serde_json::to_vec(&new_val)?;
+                let log_entry = LogEntry::SetJsonB { key: key.clone(), value: new_val_bytes.clone() };
+                if let Response::Error(e) = log_to_wal(log_entry, &self.ctx).await {
+                    self.ctx.tx_status_manager.abort(txid);
+                    return Err(anyhow!(e));
+                }
+                
+                drop(version_chain);
+                let mut version_chain = version_chain_arc.write().await;
+
+                if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == 0 && self.ctx.tx_status_manager.get_status(v.creator_txid) == Some(TransactionStatus::Committed)) {
+                    latest_version.expirer_txid = txid;
+                }
+                let new_version = crate::types::VersionedValue { value: DbValue::JsonB(new_val_bytes), creator_txid: txid, expirer_txid: 0 };
+                version_chain.push(new_version);
+                self.ctx.index_manager.remove_key_from_indexes(&key, &old_val).await;
+                self.ctx.index_manager.add_key_to_indexes(&key, &new_val).await;
+                self.ctx.tx_status_manager.commit(txid);
+                updated_rows.push(new_val);
+            }
+        }
+        Ok(updated_rows)
+    }
 
     pub async fn insert_rows(&self, table_name: &str, columns: &[String], source_rows: Vec<Value>, source_column_names: &[String], on_conflict: &Option<(Vec<String>, crate::query_engine::logical_plan::OnConflictAction)>) -> Result<Vec<Value>> {
         let mut inserted_rows = Vec::new();
@@ -1175,19 +1229,21 @@ impl StorageExecutor {
                 let pk = match row_data.get(&pk_col) { Some(Value::String(s)) => s.clone(), Some(Value::Number(n)) => n.to_string(), _ => uuid::Uuid::new_v4().to_string() };
                 let key = format!("{}:{}", table_name, pk);
 
-                let key_exists = tx.writes.contains_key(&key) || self.ctx.db.contains_key(&key);
-                if key_exists {
+                let visible_value = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
+                if visible_value.is_some() {
                     if let Some((_target, action)) = on_conflict {
                         match action {
                             crate::query_engine::logical_plan::OnConflictAction::DoNothing => {
                                 continue; // Skip insertion
                             }
                             crate::query_engine::logical_plan::OnConflictAction::DoUpdate(set_clauses) => {
-                                let old_val = match get_visible_db_value(&key, &self.ctx, Some(tx)).await {
+                                let old_val = match visible_value {
                                     Some(DbValue::JsonB(b)) => serde_json::from_slice(&b)?,
                                     Some(DbValue::Json(v)) => v.clone(),
                                     _ => json!({}),
                                 };
+
+                                let old_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::JsonB(serde_json::to_vec(&old_val)?)).await;
 
                                 let mut new_val = old_val.clone();
                                 let excluded_row = json!({ "excluded": row_data.clone() });
@@ -1198,6 +1254,21 @@ impl StorageExecutor {
                                 }
 
                                 let value_bytes = serde_json::to_vec(&new_val)?;
+                                let new_size = key.len() as u64 + value_bytes.len() as u64;
+                                let memory_change = new_size as i64 - old_size as i64;
+
+                                if self.ctx.memory.is_enabled() {
+                                    if memory_change > 0 {
+                                        if let Err(e) = self.ctx.memory.ensure_memory_for(memory_change as u64, &self.ctx).await {
+                                            return Err(anyhow!(e.to_string()));
+                                        }
+                                        self.ctx.memory.increase_memory(memory_change as u64);
+                                    } else {
+                                        self.ctx.memory.decrease_memory(-memory_change as u64);
+                                    }
+                                    tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+                                }
+
                                 let log_entry = LogEntry::SetJsonB { key: key.clone(), value: value_bytes.clone() };
                                 tx.log_entries.write().await.push(log_entry);
                                 tx.writes.insert(key, Some(DbValue::JsonB(value_bytes)));
@@ -1212,6 +1283,19 @@ impl StorageExecutor {
                 }
 
                 let value_bytes = serde_json::to_vec(&row_data)?;
+                let new_size = key.len() as u64 + value_bytes.len() as u64;
+                let memory_change = new_size as i64 - 0; // New insertion, old size is 0
+
+                if self.ctx.memory.is_enabled() {
+                    if memory_change > 0 {
+                        if let Err(e) = self.ctx.memory.ensure_memory_for(memory_change as u64, &self.ctx).await {
+                            return Err(anyhow!(e.to_string()));
+                        }
+                        self.ctx.memory.increase_memory(memory_change as u64);
+                    }
+                    tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+                }
+
                 let log_entry = LogEntry::SetJsonB { key: key.clone(), value: value_bytes.clone() };
                 tx.log_entries.write().await.push(log_entry);
                 tx.writes.insert(key, Some(DbValue::JsonB(value_bytes)));
@@ -1340,22 +1424,22 @@ impl StorageExecutor {
         let pk_col = if let Some(s) = &schema { s.constraints.iter().find_map(|c| if let crate::query_engine::ast::TableConstraint::PrimaryKey { columns, .. } = c { columns.first().cloned() } else { None }).unwrap_or_else(|| "id".to_string()) } else { "id".to_string() };
                     let pk = match row_data.get(&pk_col) { Some(Value::String(s)) => s.clone(), Some(Value::Number(n)) => n.to_string(), _ => uuid::Uuid::new_v4().to_string() };
                     let key = format!("{}:{}", table_name, pk);
-                    if self.ctx.db.contains_key(&key) {
-                        if let Some((_target, action)) = on_conflict {
-                            match action {
-                                crate::query_engine::logical_plan::OnConflictAction::DoNothing => {
-                                    continue; // Skip insertion
-                                }
-                                crate::query_engine::logical_plan::OnConflictAction::DoUpdate(set_clauses) => {
-                                let txid = self.ctx.tx_id_manager.new_txid();
-                                self.ctx.tx_status_manager.begin(txid);
-                                let (old_val_for_index, new_val) = {
-                                    let old_val = match get_visible_db_value(&key, &self.ctx, None).await {
-                                        Some(DbValue::JsonB(b)) => serde_json::from_slice(&b)?,
-                                        Some(DbValue::Json(v)) => v.clone(),
-                                        _ => json!({}),
-                                    };
-                                    let mut new_val = old_val.clone();
+                                let visible_value = get_visible_db_value(&key, &self.ctx, None).await;
+                                if visible_value.is_some() {
+                                    if let Some((_target, action)) = on_conflict {
+                                        match action {
+                                            crate::query_engine::logical_plan::OnConflictAction::DoNothing => {
+                                                continue; // Skip insertion
+                                            }
+                                            crate::query_engine::logical_plan::OnConflictAction::DoUpdate(set_clauses) => {
+                                                let txid = self.ctx.tx_id_manager.new_txid();
+                                                self.ctx.tx_status_manager.begin(txid);
+                                                let (old_val_for_index, new_val) = {
+                                                    let old_val = match visible_value {
+                                                        Some(DbValue::JsonB(b)) => serde_json::from_slice(&b)?,
+                                                        Some(DbValue::Json(v)) => v.clone(),
+                                                        _ => json!({}),
+                                                    };                                    let mut new_val = old_val.clone();
                                     let excluded_row = json!({ "excluded": row_data.clone() });
                                     for (col, expr) in set_clauses {
                                         let val = expr.evaluate_with_context(&excluded_row, Some(&old_val), self.ctx.clone(), None).await?;
@@ -1369,8 +1453,8 @@ impl StorageExecutor {
                                     self.ctx.tx_status_manager.abort(txid);
                                     return Err(anyhow!(e));
                                 }
-                                let mut version_chain_lock = self.ctx.db.entry(key.clone()).or_default();
-                                let mut version_chain = version_chain_lock.value_mut().write().await;
+                                let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
+                                let mut version_chain = version_chain_arc.write().await;
                                 if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == 0 && self.ctx.tx_status_manager.get_status(v.creator_txid) == Some(TransactionStatus::Committed)) {
                                     latest_version.expirer_txid = txid;
                                 }
@@ -1395,8 +1479,8 @@ impl StorageExecutor {
             let txid = self.ctx.tx_id_manager.new_txid();
             self.ctx.tx_status_manager.begin(txid);
             let new_version = crate::types::VersionedValue { value: DbValue::JsonB(value_bytes), creator_txid: txid, expirer_txid: 0 };
-            let mut version_chain_lock = self.ctx.db.entry(key.clone()).or_default();
-            let mut version_chain = version_chain_lock.value_mut().write().await;
+            let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
+            let mut version_chain = version_chain_arc.write().await;
             version_chain.push(new_version);
             self.ctx.tx_status_manager.commit(txid);
             inserted_rows.push(row_data);
