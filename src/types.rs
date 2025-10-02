@@ -48,15 +48,15 @@ impl TransactionIdManager {
     }
 
     pub fn new_txid(&self) -> TxId {
-        self.next_txid.fetch_add(1, Ordering::Relaxed)
+        self.next_txid.fetch_add(1, Ordering::SeqCst)
     }
 
     pub fn get_current_txid(&self) -> TxId {
-        self.next_txid.load(Ordering::Relaxed)
+        self.next_txid.load(Ordering::SeqCst)
     }
 
     pub fn reset(&self) {
-        self.next_txid.store(1, Ordering::Relaxed);
+        self.next_txid.store(1, Ordering::SeqCst);
     }
 }
 

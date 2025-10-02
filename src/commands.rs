@@ -122,7 +122,8 @@ async fn handle_set(
     let value = command.args[2].clone();
 
     let executor = StorageExecutor::new(ctx, transaction_handle);
-    executor.set(key, value).await}
+    executor.set(key, value).await
+}
 
 async fn handle_delete(
     command: Command,
