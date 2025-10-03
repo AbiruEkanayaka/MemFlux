@@ -215,7 +215,12 @@ class Cursor:
                 elif param is None:
                     quoted_param = "NULL"
                 elif isinstance(param, bytes):
-                    quoted_param = f"'{param.decode('utf-8').replace("'", "''")}'"
+                    try:
+                        decoded_param = param.decode('utf-8')
+                        quoted_param = f"'{decoded_param.replace("'", "''")}'"
+                    except UnicodeDecodeError:
+                        hex_param = param.hex()
+                        quoted_param = f"'\\x{hex_param}'"
                 else:
                     quoted_param = shlex.quote(str(param))
                 
