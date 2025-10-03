@@ -6,7 +6,8 @@ use tokio::sync::{oneshot, RwLock};
 
 use crate::arc::ArcCache;
 use crate::config::EvictionPolicy;
-use crate::types::{AppContext, DbValue, LogEntry, LogRequest};
+use crate::types::{AppContext, DbValue, LogEntry, LogRequest, PersistenceRequest};
+
 
 // A rough estimation of the memory used by a DbValue.
 // It's not perfect but gives us a baseline for memory management.
@@ -295,6 +296,31 @@ impl MemoryManager {
         self.max_memory_bytes
     }
 
+    pub async fn reset(&self) {
+        self.estimated_memory.store(0, Ordering::Relaxed);
+        match self.policy {
+            EvictionPolicy::LRU => {
+                self.lru_keys.write().await.clear();
+            }
+            EvictionPolicy::LFU => {
+                self.lfu_freqs.write().await.clear();
+                self.lfu_freq_keys.write().await.clear();
+                *self.lfu_min_freq.write().await = 0;
+            }
+            EvictionPolicy::LFRU => {
+                self.lfru_probationary.write().await.clear();
+                self.lfru_protected.write().await.clear();
+            }
+            EvictionPolicy::ARC => {
+                let capacity = self.arc_cache.read().await.capacity;
+                *self.arc_cache.write().await = ArcCache::new(capacity);
+            }
+            EvictionPolicy::Random => {
+                self.random_keys.write().await.clear();
+            }
+        }
+    }
+
     /// Restores an evicted key back into the cache tracking structures.
     pub async fn restore_evicted_key(&self, key: String, old_freq: Option<u64>) {
         match self.policy {
@@ -407,53 +433,67 @@ impl MemoryManager {
             };
 
             if let Some((key, old_freq)) = key_to_evict_info {
-                let old_value_for_index =
-                    ctx.db.get(&key).and_then(|entry| match entry.value() {
-                        DbValue::Json(v) => Some(v.clone()),
+                let old_value_for_index = if let Some(version_chain_lock) = ctx.db.get(&key) {
+                    let version_chain = version_chain_lock.read().await;
+                    version_chain.last().and_then(|v| match &v.value {
+                        DbValue::Json(val) => Some(val.clone()),
+                        DbValue::JsonB(b) => serde_json::from_slice(b).ok(),
                         _ => None,
-                    });
-
-                // Log the deletion for persistence
-                let log_entry = LogEntry::Delete { key: key.clone() };
-                let (ack_tx, ack_rx) = oneshot::channel();
-                if ctx.logger
-                    .send(LogRequest {
-                        entry: log_entry,
-                        ack: ack_tx,
                     })
-                    .await
-                    .is_err()
-                {
-                    // If persistence is down, we probably shouldn't evict.
-                    // Put the key back and return an error.
-                    self.restore_evicted_key(key, old_freq).await;
-                    return Err(anyhow!("Persistence engine is down, cannot evict"));
-                }
-                match ack_rx.await {
-                    Ok(Ok(())) => {
-                        // WAL write successful, now evict from memory
-                        if let Some(entry) = ctx.db.remove(&key) {
-                            let size = estimate_db_value_size(&entry.1).await;
-                            self.decrease_memory(size + key.len() as u64);
+                } else {
+                    None
+                };
 
-                            if let Some(ref old_val) = old_value_for_index {
-                                ctx.index_manager
-                                    .remove_key_from_indexes(&key, old_val)
-                                    .await;
-                            }
-                            println!("Evicted key to free memory: {}", key);
+                if ctx.config.persistence {
+                    // Log the deletion for persistence
+                    let log_entry = LogEntry::Delete { key: key.clone() };
+                    let (ack_tx, ack_rx) = oneshot::channel();
+                    if ctx.logger
+                        .send(PersistenceRequest::Log(LogRequest {
+                            entry: log_entry,
+                            ack: ack_tx,
+                            durability: ctx.config.durability.clone(),
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        // If persistence is down, we probably shouldn't evict.
+                        // Put the key back and return an error.
+                        self.restore_evicted_key(key, old_freq).await;
+                        return Err(anyhow!("Persistence engine is down, cannot evict"));
+                    }
+                    match ack_rx.await {
+                        Ok(Ok(())) => {
+                            // WAL write successful, continue to evict from memory
+                        }
+                        Ok(Err(e)) => {
+                            self.restore_evicted_key(key, old_freq).await;
+                            return Err(anyhow!("WAL write error during eviction: {}", e));
+                        }
+                        Err(_) => {
+                            self.restore_evicted_key(key, old_freq).await;
+                            return Err(anyhow!(
+                                "Persistence engine dropped ACK channel during eviction"
+                            ));
                         }
                     }
-                    Ok(Err(e)) => {
-                        self.restore_evicted_key(key, old_freq).await;
-                        return Err(anyhow!("WAL write error during eviction: {}", e));
+                }
+
+                // WAL write successful or persistence disabled, now evict from memory
+                if let Some(entry) = ctx.db.remove(&key) {
+                    let version_chain = entry.1.read().await;
+                    let mut total_size = 0;
+                    for version in version_chain.iter() {
+                        total_size += estimate_db_value_size(&version.value).await;
                     }
-                    Err(_) => {
-                        self.restore_evicted_key(key, old_freq).await;
-                        return Err(anyhow!(
-                            "Persistence engine dropped ACK channel during eviction"
-                        ));
+                    self.decrease_memory(total_size + key.len() as u64);
+
+                    if let Some(ref old_val) = old_value_for_index {
+                        ctx.index_manager
+                            .remove_key_from_indexes(&key, old_val)
+                            .await;
                     }
+                    println!("Evicted key to free memory: {}", key);
                 }
             } else {
                 // No more keys to evict

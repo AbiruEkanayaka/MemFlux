@@ -121,6 +121,9 @@ pub enum PhysicalPlan {
         input: Box<PhysicalPlan>,
         expressions: Vec<Expression>,
     },
+    BeginTransaction,
+    CommitTransaction,
+    RollbackTransaction,
 }
 
 pub fn logical_to_physical_plan(
@@ -300,13 +303,13 @@ pub fn logical_to_physical_plan(
         }),
         LogicalPlan::CreateIndex { statement } => Ok(PhysicalPlan::CreateIndex { statement }),
         LogicalPlan::Values { values } => Ok(PhysicalPlan::Values { values }),
-        LogicalPlan::SubqueryScan { alias, input } => Ok(PhysicalPlan::SubqueryScan {
-            alias,
-            input: Box::new(logical_to_physical_plan(*input, index_manager)?),
-        }),
         LogicalPlan::DistinctOn { input, expressions } => Ok(PhysicalPlan::DistinctOn {
             input: Box::new(logical_to_physical_plan(*input, index_manager)?),
             expressions,
+        }),
+        LogicalPlan::SubqueryScan { alias, input } => Ok(PhysicalPlan::SubqueryScan {
+            alias,
+            input: Box::new(logical_to_physical_plan(*input, index_manager)?),
         }),
         LogicalPlan::RecursiveCteScan { alias, column_aliases, non_recursive, recursive, union_all } => Ok(PhysicalPlan::RecursiveCteScan {
             alias,
@@ -316,6 +319,9 @@ pub fn logical_to_physical_plan(
             union_all,
         }),
         LogicalPlan::WorkingTableScan { cte_name, alias } => Ok(PhysicalPlan::WorkingTableScan { cte_name, alias }),
+        LogicalPlan::BeginTransaction => Ok(PhysicalPlan::BeginTransaction),
+        LogicalPlan::CommitTransaction => Ok(PhysicalPlan::CommitTransaction),
+        LogicalPlan::RollbackTransaction => Ok(PhysicalPlan::RollbackTransaction),
     }
 }
 

@@ -19,6 +19,16 @@ Deletes all keys from the current database. This operation is instantaneous and 
 - **Syntax:** `FLUSHDB`
 - **Returns:** `+OK`
 
+#### `WIPEDB`
+Deletes all keys, indexes, caches, and resets the transaction state. This is a more thorough reset than `FLUSHDB` and cannot be run inside a transaction.
+- **Syntax:** `WIPEDB`
+- **Returns:** `+OK`
+
+#### `VACUUM`
+Scans the database and removes dead data versions to reclaim space. This is part of the MVCC system and is also run automatically in the background.
+- **Syntax:** `VACUUM`
+- **Returns:** A simple string indicating the number of versions and keys removed.
+
 #### `SAVE`
 This command is provided for compatibility but is a no-op. MemFlux handles saving data to disk automatically via its persistence engine.
 - **Syntax:** `SAVE`
@@ -147,6 +157,42 @@ Returns the number of members in the set (its cardinality).
 Checks if a member exists in the set.
 - **Syntax:** `SISMEMBER <key> <member>`
 - **Returns:** An integer reply: `1` if the member exists, `0` otherwise.
+
+## Transaction Commands
+
+These commands are used to control explicit transactions. For a more detailed guide, see the [Transactions documentation](./transactions.md).
+
+#### `BEGIN`
+Starts a new transaction context for the current connection.
+- **Syntax:** `BEGIN`
+- **Returns:** `+OK`
+
+#### `COMMIT`
+Atomically commits all commands executed since `BEGIN`.
+- **Syntax:** `COMMIT`
+- **Returns:** `+OK`
+
+#### `ROLLBACK`
+Discards all changes made in the current transaction.
+- **Syntax:** `ROLLBACK`
+- **Returns:** `+OK`
+
+### Savepoint Commands
+
+#### `SAVEPOINT <name>`
+Creates a named savepoint within the current transaction.
+- **Syntax:** `SAVEPOINT <name>`
+- **Returns:** `+OK`
+
+#### `ROLLBACK TO SAVEPOINT <name>`
+Rolls the transaction state back to a previously created savepoint.
+- **Syntax:** `ROLLBACK TO SAVEPOINT <name>`
+- **Returns:** `+OK`
+
+#### `RELEASE SAVEPOINT <name>`
+Removes a savepoint.
+- **Syntax:** `RELEASE SAVEPOINT <name>`
+- **Returns:** `+OK`
 
 ## Indexing Commands
 

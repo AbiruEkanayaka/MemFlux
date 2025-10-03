@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 
 use memflux::config::Config;
 use memflux::protocol::parse_command_from_stream;
+use memflux::transaction::TransactionHandle;
 use memflux::types::Response;
 use memflux::MemFluxDB;
 
@@ -11,6 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 use tokio_rustls::TlsAcceptor;
 
 fn generate_self_signed_cert(cert_path: &str, key_path: &str) -> Result<()> {
@@ -100,8 +102,8 @@ async fn main() -> Result<()> {
             } else {
                 if let Err(e) = handle_connection(stream, db_clone).await {
                     if e.downcast_ref::<std::io::Error>().map_or(true, |io_err| {
-                        io_err.kind() != std::io::ErrorKind::BrokenPipe
-                    }) {
+                                io_err.kind() != std::io::ErrorKind::BrokenPipe
+                            }) {
                         eprintln!("Connection error from {}: {:?}", peer_addr, e);
                     }
                 }
@@ -118,6 +120,7 @@ where
     let (reader, mut writer) = tokio::io::split(stream);
     let mut buf_reader = BufReader::new(reader);
     let mut authenticated = db.app_context.config.requirepass.is_empty();
+    let transaction_handle: TransactionHandle = Arc::new(RwLock::new(None));
 
     loop {
         match parse_command_from_stream(&mut buf_reader).await {
@@ -142,7 +145,7 @@ where
                     continue;
                 }
 
-                let response = db.execute_command(command).await;
+                let response = db.execute_command(command, transaction_handle.clone()).await;
                 writer.write_all(&response.into_protocol_format()).await?;
             }
             Ok(None) => {

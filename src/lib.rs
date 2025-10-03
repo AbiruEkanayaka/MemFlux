@@ -15,8 +15,11 @@ pub mod memory;
 pub mod persistence;
 pub mod protocol;
 pub mod query_engine;
+pub mod storage_executor;
 pub mod schema;
+pub mod transaction;
 pub mod types;
+pub mod vacuum;
 
 // Public exports for the library API
 use crate::config::Config;
@@ -25,14 +28,20 @@ use crate::memory::MemoryManager;
 use crate::persistence::{load_db_from_disk, PersistenceEngine};
 use crate::query_engine::functions;
 use crate::schema::{load_schemas_from_db, VIEW_PREFIX};
-use crate::types::{AppContext, Db, FunctionRegistry, ViewCache, ViewDefinition};
+use crate::transaction::TransactionHandle;
+use crate::types::{
+    AppContext, Db, FunctionRegistry, PersistenceRequest, TransactionIdManager,
+    TransactionStatusManager, ViewCache, ViewDefinition,
+};
 
 /// The main database instance, providing the primary API for interaction.
 pub struct MemFluxDB {
     pub app_context: Arc<AppContext>,
     // The handle to the persistence engine's background task.
     // Kept to ensure the task is not dropped prematurely.
-    _persistence_handle: JoinHandle<()>, 
+    _persistence_handle: Option<JoinHandle<()>>,
+    // The handle to the vacuum background task.
+    _vacuum_handle: Option<JoinHandle<()>>,
 }
 
 impl MemFluxDB {
@@ -40,30 +49,59 @@ impl MemFluxDB {
     /// This is the core constructor used by both the server and the FFI layer.
     pub async fn open_with_config(config: Config) -> Result<Self> {
         let config = Arc::new(config);
-        let db = load_db_from_disk(
-            &config.snapshot_file,
-            &config.wal_file,
-            &config.wal_overflow_file,
-        )
-        .await?;
-        println!("Database loaded with {} top-level keys.", db.len());
 
-        let (persistence_engine, logger) = PersistenceEngine::new(&config, db.clone());
-        let persistence_handle = tokio::spawn(async move {
-            if let Err(e) = persistence_engine.run().await {
-                eprintln!("Fatal error in persistence engine: {}", e);
-            }
-        });
+        let db = if config.persistence {
+            load_db_from_disk(
+                &config.snapshot_file,
+                &config.wal_file,
+                &config.wal_overflow_file,
+            )
+            .await?
+        } else {
+            println!("Persistence is disabled. Starting with an in-memory database.");
+            Arc::new(DashMap::new())
+        };
+        if config.persistence {
+            println!("Database loaded with {} top-level keys.", db.len());
+        }
+
+        let tx_id_manager = Arc::new(TransactionIdManager::new());
+        let tx_status_manager = Arc::new(TransactionStatusManager::new());
+
+        let (logger, persistence_handle) = if config.persistence {
+            let (persistence_engine, logger) = PersistenceEngine::new(
+                &config,
+                db.clone(),
+                tx_status_manager.clone(),
+                tx_id_manager.clone(),
+            );
+            let handle = tokio::spawn(async move {
+                if let Err(e) = persistence_engine.run().await {
+                    eprintln!("Fatal error in persistence engine: {}", e);
+                }
+            });
+            (logger, Some(handle))
+        } else {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<PersistenceRequest>(1024);
+            tokio::spawn(async move {
+                while let Some(req) = rx.recv().await {
+                    if let PersistenceRequest::Log(log_req) = req {
+                        let _ = log_req.ack.send(Ok(()));
+                    }
+                }
+            });
+            (tx, None)
+        };
 
         let schema_cache = Arc::new(DashMap::new());
-        if let Err(e) = load_schemas_from_db(&db, &schema_cache).await {
+        if let Err(e) = load_schemas_from_db(&db, &schema_cache, &tx_status_manager, &tx_id_manager).await {
             eprintln!("Warning: Could not load virtual schemas: {}.", e);
         } else if !schema_cache.is_empty() {
             println!("Loaded {} virtual schemas.", schema_cache.len());
         }
 
         let view_cache = Arc::new(DashMap::new());
-        if let Err(e) = load_views_from_db(&db, &view_cache).await {
+        if let Err(e) = load_views_from_db(&db, &view_cache, &tx_status_manager, &tx_id_manager).await {
             eprintln!("Warning: Could not load views: {}.", e);
         } else if !view_cache.is_empty() {
             println!("Loaded {} views.", view_cache.len());
@@ -75,9 +113,12 @@ impl MemFluxDB {
         ));
         if memory_manager.is_enabled() {
             println!(
-                "Maxmemory policy is enabled ({}MB) with '{:?}' eviction policy.",
-                config.maxmemory_mb,
-                config.eviction_policy
+                "Maxmemory policy is enabled ({}MB) with \'{:?}\' eviction policy.",
+                config.maxmemory_mb, config.eviction_policy
+            );
+            println!(
+                "Default transaction isolation level: {:?}.",
+                config.isolation_level
             );
         }
         println!("Calculating initial memory usage...");
@@ -85,9 +126,15 @@ impl MemFluxDB {
         let mut keys = Vec::new();
         for item in db.iter() {
             let key_size = item.key().len() as u64;
-            let value_size = memory::estimate_db_value_size(item.value()).await;
-            initial_mem += key_size + value_size;
-            keys.push(item.key().clone());
+            let version_chain_arc = item.value().clone();
+            let key = item.key().clone();
+            drop(item);
+            let version_chain = version_chain_arc.read().await;
+            if let Some(version) = version_chain.last() {
+                let value_size = memory::estimate_db_value_size(&version.value).await;
+                initial_mem += key_size + value_size;
+            }
+            keys.push(key);
         }
         memory_manager.increase_memory(initial_mem);
         if memory_manager.is_enabled() {
@@ -105,6 +152,7 @@ impl MemFluxDB {
         functions::register_numeric_functions(&mut function_registry);
         functions::register_datetime_functions(&mut function_registry);
         let function_registry = Arc::new(function_registry);
+
         let app_context = Arc::new(AppContext {
             db,
             logger,
@@ -115,6 +163,9 @@ impl MemFluxDB {
             function_registry,
             config: config.clone(),
             memory: memory_manager,
+            tx_id_manager,
+            tx_status_manager,
+            active_transactions: Arc::new(DashMap::new()),
         });
 
         if app_context.memory.is_enabled()
@@ -135,9 +186,31 @@ impl MemFluxDB {
             }
         }
 
+        let vacuum_app_context = app_context.clone();
+        let vacuum_handle = tokio::spawn(async move {
+            // Run vacuum every 60 seconds.
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                println!("Running background vacuum...");
+                match vacuum::vacuum(&vacuum_app_context).await {
+                    Ok((versions, keys)) => {
+                        if versions > 0 || keys > 0 {
+                            println!(
+                                "Vacuum complete. Removed {} versions and {} keys.",
+                                versions, keys
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!("Error during background vacuum: {}", e),
+                }
+            }
+        });
+
         Ok(MemFluxDB {
             app_context,
             _persistence_handle: persistence_handle,
+            _vacuum_handle: Some(vacuum_handle),
         })
     }
 
@@ -152,6 +225,7 @@ impl MemFluxDB {
     pub fn execute_sql_stream<'a>(
         &'a self,
         sql: &'a str,
+        transaction_handle: TransactionHandle,
     ) -> impl Stream<Item = Result<Value>> + Send + 'a {
         use query_engine::{ast_to_logical_plan, execute, logical_to_physical_plan};
 
@@ -169,7 +243,8 @@ impl MemFluxDB {
 
             match physical_plan_result {
                 Ok(physical_plan) => {
-                    let mut stream = execute(physical_plan, self.app_context.clone(), None, None);
+                    // TODO: Pass transaction handle down to the query engine
+                    let mut stream = execute(physical_plan, self.app_context.clone(), None, None, Some(transaction_handle));
                     while let Some(row_result) = stream.next().await {
                         yield row_result?;
                     }
@@ -182,7 +257,11 @@ impl MemFluxDB {
     }
 
     /// Executes a command, either SQL or a direct database command.
-    pub async fn execute_command(&self, command: types::Command) -> types::Response {
+    pub async fn execute_command(
+        &self,
+        command: types::Command,
+        transaction_handle: TransactionHandle,
+    ) -> types::Response {
         if command.name == "SQL" {
             let sql = command.args[1..]
                 .iter()
@@ -199,7 +278,7 @@ impl MemFluxDB {
                 _ => false,
             };
 
-            let mut stream = Box::pin(self.execute_sql_stream(&sql));
+            let mut stream = Box::pin(self.execute_sql_stream(&sql, transaction_handle));
 
             if is_select_like {
                 let mut rows = Vec::new();
@@ -218,57 +297,86 @@ impl MemFluxDB {
                 }
                 types::Response::MultiBytes(multi_bytes)
             } else {
-                if let Some(result) = stream.next().await {
+                let mut final_response = types::Response::Ok; // Default to OK
+                let mut encountered_error = None;
+
+                while let Some(result) = stream.next().await {
                     match result {
                         Ok(value) => {
                             if let Some(count) = value.get("rows_affected").and_then(|v| v.as_i64()) {
-                                types::Response::Integer(count)
+                                final_response = types::Response::Integer(count);
                             } else {
-                                types::Response::Ok
+                                final_response = types::Response::Ok; // Or some other success indicator
                             }
                         }
                         Err(e) => {
-                            types::Response::Error(format!("Execution Error: {}", e))
+                            encountered_error = Some(types::Response::Error(format!("Execution Error: {}", e)));
+                            break; // Stop processing on first error
                         }
                     }
+                }
+
+                if let Some(err_resp) = encountered_error {
+                    err_resp
                 } else {
-                    types::Response::Error("Command executed with no result".to_string())
+                    final_response
                 }
             }
         } else {
-            commands::process_command(command, &self.app_context).await
+            commands::process_command(command, self.app_context.clone(), transaction_handle).await
         }
     }
 }
 
 /// Loads view definitions from the database.
-pub async fn load_views_from_db(db: &Db, view_cache: &ViewCache) -> Result<()> {
-    for item in db.iter() {
-        let key = item.key();
-        if key.starts_with(VIEW_PREFIX) {
-            let view_def_result: std::result::Result<ViewDefinition, _> = match item.value() {
-                types::DbValue::Bytes(bytes) => serde_json::from_slice(bytes),
-                _ => {
-                    eprintln!(
-                        "Warning: View key '{}' has non-Bytes value type. Skipping.",
-                        key
-                    );
+pub async fn load_views_from_db(
+    db: &Db,
+    view_cache: &ViewCache,
+    tx_status_manager: &TransactionStatusManager,
+    tx_id_manager: &TransactionIdManager,
+) -> Result<()> {
+    let startup_snapshot = types::Snapshot::new(0, tx_status_manager, tx_id_manager);
+    let items_to_process: Vec<(String, types::VersionedValue)> = db
+        .iter()
+        .filter(|item| item.key().starts_with(VIEW_PREFIX))
+        .filter_map(|item| {
+            item.value()
+                .try_read()
+                .ok()
+                .and_then(|guard| {
+                    guard
+                        .iter()
+                        .rev()
+                        .find(|version| startup_snapshot.is_visible(version, tx_status_manager))
+                        .cloned()
+                })
+                .map(|version| (item.key().clone(), version))
+        })
+        .collect();
+
+    for (key, latest_version) in items_to_process {
+        let view_def_result: std::result::Result<ViewDefinition, _> = match &latest_version.value {
+            types::DbValue::Bytes(bytes) => serde_json::from_slice(bytes),
+            _ => {
+                eprintln!(
+                    "Warning: View key '{}' has non-Bytes value type. Skipping.",
+                    key
+                );
+                continue;
+            }
+        };
+
+        match view_def_result {
+            Ok(view_def) => {
+                if view_def.name.is_empty() {
+                    eprintln!("Warning: View with empty name in key '{}'. Skipping.", key);
                     continue;
                 }
-            };
-
-            match view_def_result {
-                Ok(view_def) => {
-                    if view_def.name.is_empty() {
-                        eprintln!("Warning: View with empty name in key '{}'. Skipping.", key);
-                        continue;
-                    }
-                    let view_name = view_def.name.clone();
-                    view_cache.insert(view_name, Arc::new(view_def));
-                }
-                Err(e) => {
-                    eprintln!("Failed to parse view for key '{}': {}", key, e);
-                }
+                let view_name = view_def.name.clone();
+                view_cache.insert(view_name, Arc::new(view_def));
+            }
+            Err(e) => {
+                eprintln!("Failed to parse view for key '{}': {}", key, e);
             }
         }
     }

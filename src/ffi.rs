@@ -6,6 +6,7 @@ use once_cell::sync::Lazy;
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 use tokio::runtime::{Builder, Runtime};
+use tokio::sync::RwLock;
 
 // A global Tokio runtime for the FFI layer.
 static TOKIO_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
@@ -15,8 +16,11 @@ static TOKIO_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
         .expect("Failed to create Tokio runtime for FFI")
 });
 
-// The opaque pointer to the database instance.
-pub struct MemFluxDBHandle(Arc<MemFluxDB>);
+// The opaque pointer to the shared database instance.
+pub struct MemFluxDBSharedHandle(Arc<MemFluxDB>);
+
+// The opaque pointer to a cursor, which holds the transaction state.
+pub struct MemFluxCursorHandle(crate::transaction::TransactionHandle);
 
 // The C-compatible response structure.
 #[repr(C)]
@@ -43,7 +47,7 @@ pub struct FFIResponse {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn memflux_open(config_json: *const c_char) -> *mut MemFluxDBHandle {
+pub extern "C" fn memflux_open(config_json: *const c_char) -> *mut MemFluxDBSharedHandle {
     let config_str = match unsafe { CStr::from_ptr(config_json).to_str() } {
         Ok(s) => s,
         Err(_) => return std::ptr::null_mut(),
@@ -61,12 +65,31 @@ pub extern "C" fn memflux_open(config_json: *const c_char) -> *mut MemFluxDBHand
         Err(_) => return std::ptr::null_mut(),
     };
 
-    let handle = Box::new(MemFluxDBHandle(Arc::new(db)));
+    let handle = Box::new(MemFluxDBSharedHandle(Arc::new(db)));
     Box::into_raw(handle)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn memflux_close(handle: *mut MemFluxDBHandle) {
+pub extern "C" fn memflux_close(handle: *mut MemFluxDBSharedHandle) {
+    if !handle.is_null() {
+        unsafe {
+            drop(Box::from_raw(handle));
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn memflux_cursor_open(handle: *mut MemFluxDBSharedHandle) -> *mut MemFluxCursorHandle {
+    if handle.is_null() {
+        return std::ptr::null_mut();
+    }
+    let transaction_handle = Arc::new(RwLock::new(None));
+    let cursor_handle = Box::new(MemFluxCursorHandle(transaction_handle));
+    Box::into_raw(cursor_handle)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn memflux_cursor_close(handle: *mut MemFluxCursorHandle) {
     if !handle.is_null() {
         unsafe {
             drop(Box::from_raw(handle));
@@ -76,13 +99,21 @@ pub extern "C" fn memflux_close(handle: *mut MemFluxDBHandle) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn memflux_exec(
-    handle: *mut MemFluxDBHandle,
+    db_handle: *mut MemFluxDBSharedHandle,
+    cursor_handle: *mut MemFluxCursorHandle,
     command_str: *const c_char,
 ) -> *mut FFIResponse {
-    let db = match unsafe { handle.as_ref() } {
-        Some(h) => &h.0,
+    let shared_handle = match unsafe { db_handle.as_ref() } {
+        Some(h) => h,
         None => return std::ptr::null_mut(),
     };
+    let cursor_handle = match unsafe { cursor_handle.as_ref() } {
+        Some(h) => h,
+        None => return std::ptr::null_mut(),
+    };
+
+    let db = &shared_handle.0;
+    let transaction_handle = cursor_handle.0.clone();
 
     let command_c_str = unsafe { CStr::from_ptr(command_str) };
 
@@ -113,7 +144,8 @@ pub extern "C" fn memflux_exec(
 
     let command = Command { name: command_name, args };
 
-    let response = TOKIO_RUNTIME.block_on(db.execute_command(command));
+
+    let response = TOKIO_RUNTIME.block_on(db.execute_command(command, transaction_handle));
 
     Box::into_raw(Box::new(response_to_ffi(response)))
 }

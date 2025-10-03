@@ -46,6 +46,7 @@ class _FFIResponse(ctypes.Structure):
 
 # Define a type hint for the opaque database handle
 _DB_HANDLE = ctypes.c_void_p
+_CURSOR_HANDLE = ctypes.c_void_p
 
 # --- Main Wrapper Classes ---
 
@@ -54,10 +55,15 @@ class Cursor:
     A cursor object to interact with the MemFlux database.
 
     It allows executing commands and fetching results. Cursors should be
-    created by calling Connection.cursor().
+    created by calling Connection.cursor(). Each cursor has its own
+    transactional context.
     """
-    def __init__(self, connection: 'Connection'):
+    def __init__(self, connection: 'Connection', cursor_handle: _CURSOR_HANDLE):
+        if not cursor_handle:
+            raise InterfaceError("Failed to initialize cursor: received null handle.")
         self.connection = connection
+        self._handle = cursor_handle
+        self._is_closed = False
         self._last_result: Optional[List[Any]] = None
         self._row_iterator: Optional[Iterator[Any]] = None
         self._last_result_type: Optional[_FFIResponseType] = None
@@ -86,9 +92,13 @@ class Cursor:
             raise
 
     def close(self) -> None:
-        """Closes the cursor. No-op for this implementation but good for API compliance."""
-        self._last_result = None
-        self._row_iterator = None
+        """Closes the cursor, releasing its handle in the Rust library."""
+        if not self._is_closed:
+            self.connection._lib.memflux_cursor_close(self._handle)
+            self._handle = None
+            self._is_closed = True
+            self._last_result = None
+            self._row_iterator = None
 
     @property
     def rowcount(self) -> int:
@@ -110,6 +120,8 @@ class Cursor:
         """
         if self.connection.is_closed:
             raise InterfaceError("Cannot operate on a closed connection.")
+        if self._is_closed:
+            raise InterfaceError("Cannot operate on a closed cursor.")
 
         self._last_result = None
         self._row_iterator = None
@@ -117,7 +129,6 @@ class Cursor:
 
         final_command = self._bind_params(command, params)
 
-        # If the command is SQL, quote the statement to protect it from shlex on the FFI side.
         command_parts = final_command.lstrip().split(maxsplit=1)
         if command_parts and command_parts[0].upper() == 'SQL':
             if len(command_parts) > 1:
@@ -127,21 +138,21 @@ class Cursor:
 
         response_ptr = None
         try:
-            # Prepare arguments for FFI call
             command_c_str = final_command.encode('utf-8')
             
-            # Execute command
-            response_ptr = self.connection._lib.memflux_exec(self.connection._handle, command_c_str)
+            response_ptr = self.connection._lib.memflux_exec(
+                self.connection._shared_handle, 
+                self._handle, 
+                command_c_str
+            )
             if not response_ptr:
                 raise DatabaseError("FFI call to 'memflux_exec' returned a null pointer.")
             
-            # Process and store the result
             response_type, result_list = self._process_response(response_ptr.contents)
             self._last_result_type = response_type
             self._last_result = result_list
 
         finally:
-            # Crucially, always free the response memory
             if response_ptr:
                 self.connection._lib.memflux_response_free(response_ptr)
         
@@ -159,7 +170,6 @@ class Cursor:
         if self._row_iterator is None:
             self.__iter__()
         
-        # Mypy struggles here, but the logic is sound.
         remaining_rows = list(self._row_iterator) # type: ignore
         self._row_iterator = None # Exhaust the iterator
         return remaining_rows
@@ -175,7 +185,6 @@ class Cursor:
         batch = []
         for _ in range(size):
             try:
-                # Mypy struggles here as well.
                 batch.append(next(self._row_iterator)) # type: ignore
             except StopIteration:
                 self._row_iterator = None
@@ -199,7 +208,6 @@ class Cursor:
         for i in range(1, len(parts)):
             try:
                 param = next(param_iter)
-                # Use shlex.quote for shell-safe quoting, which the Rust FFI uses.
                 if isinstance(param, str):
                     quoted_param = shlex.quote(param)
                 elif isinstance(param, (int, float)):
@@ -207,17 +215,13 @@ class Cursor:
                 elif param is None:
                     quoted_param = "NULL"
                 elif isinstance(param, bytes):
-                    # FFI layer expects UTF-8 strings, so we decode.
-                    # For raw bytes, a different FFI design would be needed.
                     quoted_param = shlex.quote(param.decode('utf-8'))
                 else:
-                    # Fallback for other types like bool, etc.
                     quoted_param = shlex.quote(str(param))
                 
                 final_parts.append(quoted_param)
                 final_parts.append(parts[i])
             except StopIteration:
-                # Should not be reached due to the count check above, but is a safeguard.
                 raise InterfaceError("More placeholders than parameters.")
 
         return "".join(final_parts)
@@ -242,10 +246,8 @@ class Cursor:
                 return (response_type, [b''])
             val_bytes = ctypes.string_at(resp.bytes_value, resp.bytes_len)
             try:
-                # Attempt to decode as JSON, as this is how JSON objects are returned
                 return (response_type, [json.loads(val_bytes.decode('utf-8'))])
             except (json.JSONDecodeError, UnicodeDecodeError):
-                # Fallback to returning raw bytes for non-JSON byte strings
                 return (response_type, [val_bytes])
                 
         if response_type == _FFIResponseType.MULTI_BYTES:
@@ -258,10 +260,8 @@ class Cursor:
                     continue
                 item_bytes = ctypes.string_at(resp.multi_bytes_value[i], resp.multi_bytes_lens[i])
                 try:
-                    # SQL results and JSON arrays are returned as MultiBytes of JSON strings
                     results.append(json.loads(item_bytes.decode('utf-8')))
                 except (json.JSONDecodeError, UnicodeDecodeError):
-                    # Fallback for non-JSON data like SMEMBERS
                     results.append(item_bytes)
             return (response_type, results)
 
@@ -283,7 +283,7 @@ class Connection:
     def __init__(self, db_handle: _DB_HANDLE, library: ctypes.CDLL):
         if not db_handle:
             raise InterfaceError("Failed to initialize database: received null handle.")
-        self._handle = db_handle
+        self._shared_handle = db_handle
         self._lib = library
         self.is_closed = False
         self._lock = threading.Lock()
@@ -300,8 +300,8 @@ class Connection:
         """Closes the database connection."""
         with self._lock:
             if not self.is_closed:
-                self._lib.memflux_close(self._handle)
-                self._handle = None
+                self._lib.memflux_close(self._shared_handle)
+                self._shared_handle = None
                 self.is_closed = True
 
     def cursor(self) -> Cursor:
@@ -309,7 +309,10 @@ class Connection:
         with self._lock:
             if self.is_closed:
                 raise InterfaceError("Cannot operate on a closed connection.")
-        return Cursor(self)
+            cursor_handle = self._lib.memflux_cursor_open(self._shared_handle)
+            if not cursor_handle:
+                raise InterfaceError("Failed to create a new cursor from the FFI.")
+        return Cursor(self, cursor_handle)
 
 
 def connect(config: Dict[str, Any], lib: str) -> Connection:
@@ -330,19 +333,21 @@ def connect(config: Dict[str, Any], lib: str) -> Connection:
 
     # --- Define FFI function signatures ---
     try:
-        # memflux_open
         library.memflux_open.argtypes = [ctypes.c_char_p]
         library.memflux_open.restype = _DB_HANDLE
         
-        # memflux_close
         library.memflux_close.argtypes = [_DB_HANDLE]
         library.memflux_close.restype = None
 
-        # memflux_exec
-        library.memflux_exec.argtypes = [_DB_HANDLE, ctypes.c_char_p]
+        library.memflux_cursor_open.argtypes = [_DB_HANDLE]
+        library.memflux_cursor_open.restype = _CURSOR_HANDLE
+
+        library.memflux_cursor_close.argtypes = [_CURSOR_HANDLE]
+        library.memflux_cursor_close.restype = None
+
+        library.memflux_exec.argtypes = [_DB_HANDLE, _CURSOR_HANDLE, ctypes.c_char_p]
         library.memflux_exec.restype = ctypes.POINTER(_FFIResponse)
 
-        # memflux_response_free
         library.memflux_response_free.argtypes = [ctypes.POINTER(_FFIResponse)]
         library.memflux_response_free.restype = None
     except AttributeError as e:
@@ -356,7 +361,6 @@ def connect(config: Dict[str, Any], lib: str) -> Connection:
     db_handle = library.memflux_open(config_c_str)
 
     if not db_handle:
-        # In this simple FFI, we can't get a detailed error message on open.
         raise DatabaseError("Failed to open MemFlux database. Check configuration and file permissions.")
 
     return Connection(db_handle, library)

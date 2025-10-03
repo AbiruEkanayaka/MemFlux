@@ -656,6 +656,18 @@ impl Parser {
             }
             Some("ALTER") => Ok(AstStatement::AlterTable(self.parse_alter_table()?)),
             Some("TRUNCATE") => Ok(AstStatement::TruncateTable(self.parse_truncate_table()?)),
+            Some("BEGIN") => {
+                self.advance();
+                Ok(AstStatement::BeginStatement)
+            }
+            Some("COMMIT") => {
+                self.advance();
+                Ok(AstStatement::CommitStatement)
+            }
+            Some("ROLLBACK") => {
+                self.advance();
+                Ok(AstStatement::RollbackStatement)
+            }
             Some(other) => Err(anyhow!("Unsupported SQL command: {}", other)),
             None => Err(anyhow!("Empty SQL query")),
         }

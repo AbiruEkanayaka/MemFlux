@@ -3,6 +3,20 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum DurabilityLevel {
+    None,
+    Fsync,
+    Full,
+}
+
+impl Default for DurabilityLevel {
+    fn default() -> Self {
+        DurabilityLevel::Fsync
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum EvictionPolicy {
@@ -19,11 +33,28 @@ impl Default for EvictionPolicy {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum IsolationLevel {
+    Serializable,
+    Snapshot,
+}
+
+impl Default for IsolationLevel {
+    fn default() -> Self {
+        IsolationLevel::Serializable
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
     pub host: String,
     pub port: u16,
     pub requirepass: String,
+    #[serde(default = "default_true")]
+    pub persistence: bool,
+    #[serde(default)]
+    pub durability: DurabilityLevel,
     pub wal_file: String,
     #[serde(default = "default_wal_overflow_file")]
     pub wal_overflow_file: String,
@@ -34,6 +65,8 @@ pub struct Config {
     pub maxmemory_mb: u64,
     #[serde(default)]
     pub eviction_policy: EvictionPolicy,
+    #[serde(default)]
+    pub isolation_level: IsolationLevel,
     #[serde(default)]
     pub encrypt: bool,
     #[serde(default = "default_cert_file")]
@@ -44,6 +77,8 @@ pub struct Config {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FFIConfig {
+    #[serde(default = "default_true")]
+    pub persistence: bool,
     pub wal_file: String,
     #[serde(default = "default_wal_overflow_file")]
     pub wal_overflow_file: String,
@@ -54,6 +89,10 @@ pub struct FFIConfig {
     pub maxmemory_mb: u64,
     #[serde(default)]
     pub eviction_policy: EvictionPolicy,
+    #[serde(default)]
+    pub isolation_level: IsolationLevel,
+    #[serde(default)]
+    pub durability: DurabilityLevel,
 }
 
 impl From<FFIConfig> for Config {
@@ -62,6 +101,7 @@ impl From<FFIConfig> for Config {
             host: "127.0.0.1".to_string(),
             port: 0,
             requirepass: "".to_string(),
+            persistence: ffi_config.persistence,
             wal_file: ffi_config.wal_file,
             wal_overflow_file: ffi_config.wal_overflow_file,
             snapshot_file: ffi_config.snapshot_file,
@@ -69,6 +109,8 @@ impl From<FFIConfig> for Config {
             wal_size_threshold_mb: ffi_config.wal_size_threshold_mb,
             maxmemory_mb: ffi_config.maxmemory_mb,
             eviction_policy: ffi_config.eviction_policy,
+            isolation_level: ffi_config.isolation_level,
+            durability: ffi_config.durability,
             encrypt: false,
             cert_file: "".to_string(),
             key_file: "".to_string(),
@@ -91,6 +133,10 @@ fn default_wal_overflow_file() -> String {
     "memflux.wal.overflow".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 
 impl Default for Config {
     fn default() -> Self {
@@ -98,6 +144,8 @@ impl Default for Config {
             host: "127.0.0.1".to_string(),
             port: 8360,
             requirepass: "".to_string(),
+            persistence: true,
+            durability: DurabilityLevel::default(),
             wal_file: "memflux.wal".to_string(),
             wal_overflow_file: "memflux.wal.overflow".to_string(),
             snapshot_file: "memflux.snapshot".to_string(),
@@ -105,6 +153,7 @@ impl Default for Config {
             wal_size_threshold_mb: 128,
             maxmemory_mb: default_maxmemory_mb(),
             eviction_policy: EvictionPolicy::default(),
+            isolation_level: IsolationLevel::default(),
             encrypt: false,
             cert_file: default_cert_file(),
             key_file: default_key_file(),

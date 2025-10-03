@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::commands::json_path_to_pointer;
+use crate::storage_executor::json_path_to_pointer;
 
 pub type Index = RwLock<BTreeMap<String, HashSet<String>>>;
 
@@ -19,6 +19,12 @@ pub struct IndexManager {
 }
 
 impl IndexManager {
+    pub fn clear(&self) {
+        self.indexes.clear();
+        self.prefix_to_indexes.clear();
+        self.name_to_internal_name.clear();
+    }
+
     pub fn get_indexes_for_key(&self, key: &str) -> Vec<(String, String)> {
         let mut applicable = Vec::new();
         for item in self.prefix_to_indexes.iter() {

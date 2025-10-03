@@ -4,6 +4,8 @@ MemFlux ensures data durability and allows for fast recovery by employing a pers
 
 ## Overview
 
+Persistence can be enabled or disabled via the `persistence` flag in `config.json`. When enabled, MemFlux ensures data durability and allows for fast recovery by employing a persistence strategy that combines a **Write-Ahead Log (WAL)** with periodic **snapshotting**. This approach provides a balance between write performance and recovery speed.
+
 1.  **Write-Ahead Log (WAL):** Every data modification command (e.g., `SET`, `JSON.SET`, `LPUSH`) is first serialized and appended to the `memflux.wal` file on disk. The command is only then applied to the in-memory database. This ensures that no acknowledged write is ever lost in case of a crash.
 2.  **Snapshotting:** When the WAL file reaches a certain size, a snapshot of the entire in-memory database is created. This snapshot is a more compact representation of the data, allowing for much faster startup times compared to replaying a very long WAL.
 3.  **Compaction:** After a snapshot is successfully created, the old WAL file is truncated, reclaiming disk space. This process is designed to be non-blocking.
@@ -14,7 +16,10 @@ The WAL (`memflux.wal`) is the primary mechanism for durability.
 
 *   **Format:** Each log entry is a binary record consisting of a 32-bit length prefix followed by the bincode-serialized `LogEntry` enum. This format is efficient to write and parse.
 *   **Buffering:** To optimize disk I/O, writes are batched. The persistence engine collects multiple write requests from concurrent clients and writes them to the WAL file in a single operation.
-*   **Synchronization:** Writes are asynchronously flushed to the disk (`fsync`) to ensure they are durable. This is done in a separate task to avoid blocking client requests.
+*   **Durability Levels:** The `durability` setting in `config.json` controls when a write is acknowledged to the client:
+    *   `"none"`: The write is acknowledged as soon as it is sent to the persistence engine's channel. The actual disk write happens in the background. This is the fastest but least safe option.
+    *   `"fsync"` (Default): The write is acknowledged after the data has been written to the operating system's file buffer. A background task periodically calls `fsync` to ensure data is flushed to disk. This offers a good balance of performance and safety.
+    *   `"full"`: The write is acknowledged only after the data has been fully flushed to the disk via `fsync`. This is the safest but slowest option.
 
 ## Snapshots
 

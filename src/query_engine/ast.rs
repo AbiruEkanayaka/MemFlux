@@ -256,6 +256,9 @@ pub enum AstStatement {
     AlterTable(AlterTableStatement),
     TruncateTable(TruncateTableStatement),
     CreateIndex(CreateIndexStatement),
+    BeginStatement,
+    CommitStatement,
+    RollbackStatement,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
