@@ -110,13 +110,16 @@ The primary interface for this is the Python library included in `libs/python/`.
 
     # Configuration for the database instance
     DB_CONFIG = {
+      "persistence": true,
+      "durability": "fsync",
       "wal_file": "memflux.wal",
       "wal_overflow_file": "memflux.wal.overflow",
       "snapshot_file": "memflux.snapshot",
       "snapshot_temp_file": "memflux.snapshot.tmp",
       "wal_size_threshold_mb": 128,
       "maxmemory_mb": 0,
-      "eviction_policy": "lru"
+      "eviction_policy": "lru",
+      "isolation_level": "serializable",
     }
 
     # Connect to the database (loads it in-process)
