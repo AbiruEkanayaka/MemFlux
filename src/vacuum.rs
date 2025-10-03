@@ -1,6 +1,7 @@
 use anyhow::Result;
 use crate::types::{AppContext, TransactionStatus};
 
+
 /// Scans the database and removes dead data versions to reclaim space.
 /// A version is "dead" if it was expired by a transaction that has committed,
 /// and that transaction is older than any currently active transaction.
@@ -18,6 +19,11 @@ pub async fn vacuum(ctx: &AppContext) -> Result<(usize, usize)> {
         .min()
         .copied()
         .unwrap_or_else(|| tx_id_manager.get_current_txid());
+
+    // Create a special snapshot for vacuuming. xmax = u64::MAX ensures that all committed
+    // transactions are considered 'old enough' for visibility checks, effectively making
+    // the snapshot see all committed history up to the current point.
+
 
     let mut versions_removed = 0;
     let mut keys_to_remove = Vec::new();
@@ -38,7 +44,10 @@ pub async fn vacuum(ctx: &AppContext) -> Result<(usize, usize)> {
             }
 
             // Retain versions that are NOT dead.
-            // A version is dead if its expirer_txid is committed and older than the vacuum_horizon.
+            // A version is considered 'alive' (should be retained) if:
+            // 1. Its creator transaction is still active (not yet committed or aborted).
+            // 2. It is visible according to the vacuum_snapshot (meaning its creator is committed
+            //    and its expirer is not committed and old enough to make it invisible).
             version_chain.retain(|version| {
                 if version.expirer_txid == 0 {
                     return true; // Not expired, keep.

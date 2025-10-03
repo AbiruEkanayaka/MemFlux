@@ -919,10 +919,12 @@ pub fn execute<'a>(
                                 let version_chain = version_chain_arc.read().await;
                                 let mut new_bytes_res = (vec![], false);
 
-                                if let Some(version) = version_chain.iter().rev().find(|v| {
-                                    let status = ctx.tx_status_manager.get_status(v.creator_txid);
-                                    status == Some(crate::types::TransactionStatus::Committed) && (v.expirer_txid == 0 || ctx.tx_status_manager.get_status(v.expirer_txid) != Some(crate::types::TransactionStatus::Committed))
-                                }) {
+                                let snapshot = crate::types::Snapshot::new(0, &ctx.tx_status_manager, &ctx.tx_id_manager);
+                                if let Some(version) = version_chain
+                                    .iter()
+                                    .rev()
+                                    .find(|v| snapshot.is_visible(v, &ctx.tx_status_manager))
+                                {
                                     let mut val: serde_json::Value = match &version.value {
                                         DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
                                         _ => continue,
@@ -1060,10 +1062,12 @@ pub fn execute<'a>(
                                 let version_chain = version_chain_arc.read().await;
                                 let mut new_bytes_res = (vec![], false);
 
-                                if let Some(version) = version_chain.iter().rev().find(|v| {
-                                    let status = ctx.tx_status_manager.get_status(v.creator_txid);
-                                    status == Some(crate::types::TransactionStatus::Committed) && (v.expirer_txid == 0 || ctx.tx_status_manager.get_status(v.expirer_txid) != Some(crate::types::TransactionStatus::Committed))
-                                }) {
+                                let snapshot = crate::types::Snapshot::new(0, &ctx.tx_status_manager, &ctx.tx_id_manager);
+                                if let Some(version) = version_chain
+                                    .iter()
+                                    .rev()
+                                    .find(|v| snapshot.is_visible(v, &ctx.tx_status_manager))
+                                {
                                     let mut val: serde_json::Value = match &version.value {
                                         DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
                                         _ => continue,
@@ -1118,11 +1122,12 @@ pub fn execute<'a>(
                 let version_chain_arc = ctx.db.entry(schema_key.clone()).or_default().clone();
                 let mut version_chain = version_chain_arc.write().await;
 
-                if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| {
-                    v.expirer_txid == 0
-                        && ctx.tx_status_manager.get_status(v.creator_txid)
-                            == Some(crate::types::TransactionStatus::Committed)
-                }) {
+                let snapshot = crate::types::Snapshot::new(0, &ctx.tx_status_manager, &ctx.tx_id_manager);
+                if let Some(latest_version) = version_chain
+                    .iter_mut()
+                    .rev()
+                    .find(|v| snapshot.is_visible(v, &ctx.tx_status_manager))
+                {
                     latest_version.expirer_txid = txid;
                 }
 
@@ -1267,12 +1272,9 @@ pub fn execute<'a>(
                         let key = entry.key().clone();
                         drop(entry);
                         let version_chain = version_chain_arc.read().await;
-                        if let Some(latest_version) = version_chain.last() {
-                             if ctx.tx_status_manager.get_status(latest_version.creator_txid) != Some(crate::types::TransactionStatus::Committed) {
-                                continue;
-                             }
-
-                            let row_key = key.clone();
+                        let snapshot = crate::types::Snapshot::new(0, &ctx.tx_status_manager, &ctx.tx_id_manager);
+                        if let Some(latest_version) = version_chain.iter().rev().find(|v| snapshot.is_visible(v, &ctx.tx_status_manager)) {
+                             let row_key = key.clone();
                             let val: Value = match &latest_version.value {
                                 DbValue::Json(v) => v.clone(),
                                 DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
@@ -1307,7 +1309,7 @@ pub fn execute<'a>(
                 }
 
                 yield json!({ "status": format!("Index '{}' created and backfilled {} items.", statement.index_name, backfilled_count) });
-            },
+            }
             PhysicalPlan::SubqueryScan { alias, input } => {
                 let mut stream = execute(*input, ctx.clone(), outer_row, _working_tables, transaction_handle.clone());
                 while let Some(row_result) = stream.next().await {
@@ -1560,7 +1562,8 @@ pub fn execute<'a>(
                         } else {
                             Err(anyhow!("Transaction handle not provided for COMMIT"))?;
                         }
-                    }            PhysicalPlan::RollbackTransaction => {
+                    }
+            PhysicalPlan::RollbackTransaction => {
                 if let Some(handle) = transaction_handle {
                     let mut tx_guard = handle.write().await;
                     if let Some(tx) = tx_guard.take() {

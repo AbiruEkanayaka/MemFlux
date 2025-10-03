@@ -649,27 +649,8 @@ async fn handle_keys(
         .collect();
 
     for key in matching_keys {
-        if let Some(entry) = ctx.db.get(&key) {
-            let version_chain_arc = entry.value().clone();
-            drop(entry);
-            let version_chain = version_chain_arc.read().await;
-            for version in version_chain.iter().rev() {
-                if ctx.tx_status_manager.get_status(version.creator_txid)
-                    == Some(TransactionStatus::Committed)
-                {
-                    if version.expirer_txid == 0
-                        || ctx
-                            .tx_status_manager
-                            .get_status(version.expirer_txid)
-                            != Some(TransactionStatus::Committed)
-                    {
-                        keys.push(key.as_bytes().to_vec());
-                        break;
-                    } else {
-                        break;
-                    }
-                }
-            }
+        if get_visible_db_value(&key, &ctx, None).await.is_some() {
+            keys.push(key.as_bytes().to_vec());
         }
     }
     Response::MultiBytes(keys)
@@ -841,23 +822,20 @@ pub async fn handle_idx_create(command: Command, ctx: Arc<AppContext>) -> Respon
     let pointer = json_path_to_pointer(&json_path);
     let mut backfilled_count = 0;
 
+    let snapshot = crate::types::Snapshot::new(0, &ctx.tx_status_manager, &ctx.tx_id_manager);
     for entry in ctx.db.iter() {
         if entry.key().starts_with(pattern) {
             let version_chain_arc = entry.value().clone();
             let key = entry.key().clone();
             drop(entry);
             let version_chain = version_chain_arc.read().await;
-            if let Some(latest_version) = version_chain.last() {
-                if ctx.tx_status_manager.get_status(latest_version.creator_txid)
-                    != Some(TransactionStatus::Committed)
-                {
-                    continue;
-                }
 
-                let val = match &latest_version.value {
+            if let Some(version) = version_chain.iter().rev().find(|v| snapshot.is_visible(v, &ctx.tx_status_manager)) {
+                // This is the latest visible version for this key.
+                let val = match &version.value {
                     DbValue::Json(v) => v.clone(),
                     DbValue::JsonB(b) => serde_json::from_slice(&b).unwrap_or_default(),
-                    _ => continue,
+                    _ => continue, // Should not happen for JSON indexes, but good to be safe.
                 };
 
                 if let Some(indexed_val) = val.pointer(&pointer) {
@@ -1162,6 +1140,11 @@ async fn handle_rollback_to_savepoint(
             for item in saved_writes.iter() {
                 tx.writes.insert(item.key().clone(), item.value().clone());
             }
+
+            // Clear caches to prevent stale reads after rolling back writes.
+            tx.read_cache.clear();
+            tx.reads.clear();
+
             log_entries.push(LogEntry::RollbackToSavepoint { name: savepoint_name.clone() });
             println!("Transaction {} rolled back to savepoint '{}'.", tx.id, savepoint_name);
             Response::Ok

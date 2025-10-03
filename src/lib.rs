@@ -69,7 +69,12 @@ impl MemFluxDB {
         let tx_status_manager = Arc::new(TransactionStatusManager::new());
 
         let (logger, persistence_handle) = if config.persistence {
-            let (persistence_engine, logger) = PersistenceEngine::new(&config, db.clone(), tx_status_manager.clone());
+            let (persistence_engine, logger) = PersistenceEngine::new(
+                &config,
+                db.clone(),
+                tx_status_manager.clone(),
+                tx_id_manager.clone(),
+            );
             let handle = tokio::spawn(async move {
                 if let Err(e) = persistence_engine.run().await {
                     eprintln!("Fatal error in persistence engine: {}", e);
@@ -89,14 +94,14 @@ impl MemFluxDB {
         };
 
         let schema_cache = Arc::new(DashMap::new());
-        if let Err(e) = load_schemas_from_db(&db, &schema_cache, &tx_status_manager).await {
+        if let Err(e) = load_schemas_from_db(&db, &schema_cache, &tx_status_manager, &tx_id_manager).await {
             eprintln!("Warning: Could not load virtual schemas: {}.", e);
         } else if !schema_cache.is_empty() {
             println!("Loaded {} virtual schemas.", schema_cache.len());
         }
 
         let view_cache = Arc::new(DashMap::new());
-        if let Err(e) = load_views_from_db(&db, &view_cache, &tx_status_manager).await {
+        if let Err(e) = load_views_from_db(&db, &view_cache, &tx_status_manager, &tx_id_manager).await {
             eprintln!("Warning: Could not load views: {}.", e);
         } else if !view_cache.is_empty() {
             println!("Loaded {} views.", view_cache.len());
@@ -324,7 +329,13 @@ impl MemFluxDB {
 }
 
 /// Loads view definitions from the database.
-pub async fn load_views_from_db(db: &Db, view_cache: &ViewCache, tx_status_manager: &TransactionStatusManager) -> Result<()> {
+pub async fn load_views_from_db(
+    db: &Db,
+    view_cache: &ViewCache,
+    tx_status_manager: &TransactionStatusManager,
+    tx_id_manager: &TransactionIdManager,
+) -> Result<()> {
+    let startup_snapshot = types::Snapshot::new(0, tx_status_manager, tx_id_manager);
     let items_to_process: Vec<(String, types::VersionedValue)> = db
         .iter()
         .filter(|item| item.key().starts_with(VIEW_PREFIX))
@@ -333,10 +344,11 @@ pub async fn load_views_from_db(db: &Db, view_cache: &ViewCache, tx_status_manag
                 .try_read()
                 .ok()
                 .and_then(|guard| {
-                    guard.iter().rev().find(|version| {
-                        tx_status_manager.get_status(version.creator_txid) == Some(types::TransactionStatus::Committed) &&
-                        (version.expirer_txid == 0 || tx_status_manager.get_status(version.expirer_txid) != Some(types::TransactionStatus::Committed))
-                    }).cloned()
+                    guard
+                        .iter()
+                        .rev()
+                        .find(|version| startup_snapshot.is_visible(version, tx_status_manager))
+                        .cloned()
                 })
                 .map(|version| (item.key().clone(), version))
         })

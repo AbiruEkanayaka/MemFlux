@@ -10,7 +10,8 @@ use tokio::task::{self, JoinHandle};
 
 use crate::config::Config;
 use crate::types::{
-    Db, DbValue, LogEntry, PersistenceRequest, SerializableDbValue, SnapshotEntry, VersionedValue, TransactionStatusManager, TransactionStatus
+    Db, DbValue, LogEntry, PersistenceRequest, SerializableDbValue, Snapshot, SnapshotEntry,
+    TransactionIdManager, TransactionStatusManager, VersionedValue,
 };
 use tokio::sync::RwLock;
 use std::sync::Arc;
@@ -24,10 +25,16 @@ pub struct PersistenceEngine {
     wal_size_threshold_bytes: u64,
     db: Db,
     tx_status_manager: Arc<TransactionStatusManager>,
+    tx_id_manager: Arc<TransactionIdManager>,
 }
 
 impl PersistenceEngine {
-    pub fn new(config: &Config, db: Db, tx_status_manager: Arc<TransactionStatusManager>) -> (Self, mpsc::Sender<PersistenceRequest>) {
+    pub fn new(
+        config: &Config,
+        db: Db,
+        tx_status_manager: Arc<TransactionStatusManager>,
+        tx_id_manager: Arc<TransactionIdManager>,
+    ) -> (Self, mpsc::Sender<PersistenceRequest>) {
         let (tx, rx) = mpsc::channel(1024);
         let engine = PersistenceEngine {
             receiver: rx,
@@ -38,6 +45,7 @@ impl PersistenceEngine {
             wal_size_threshold_bytes: config.wal_size_threshold_mb * 1024 * 1024,
             db,
             tx_status_manager,
+            tx_id_manager,
         };
         (engine, tx)
     }
@@ -61,6 +69,7 @@ impl PersistenceEngine {
         snapshot_temp_path: String,
         wal_to_compact: String,
         tx_status_manager: Arc<TransactionStatusManager>,
+        tx_id_manager: Arc<TransactionIdManager>,
     ) -> JoinHandle<Result<String>> {
         tokio::spawn(async move {
             let temp_path = snapshot_temp_path.clone();
@@ -89,31 +98,26 @@ impl PersistenceEngine {
             });
 
             let reader_task = async move {
+                let snapshot = Snapshot::new(0, &tx_status_manager, &tx_id_manager);
                 let keys: Vec<String> = db_clone.iter().map(|item| item.key().clone()).collect();
                 for key in keys {
                     if let Some(item) = db_clone.get(&key) {
                         let version_chain_arc = item.value().clone();
                         drop(item);
                         let version_chain = version_chain_arc.read().await;
-                        for version in version_chain.iter().rev() {
-                            if tx_status_manager.get_status(version.creator_txid)
-                                == Some(TransactionStatus::Committed)
-                            {
-                                if version.expirer_txid == 0
-                                    || tx_status_manager.get_status(version.expirer_txid)
-                                        != Some(TransactionStatus::Committed)
-                                {
-                                    let serializable_value =
-                                        SerializableDbValue::from_db_value(&version.value).await;
-                                    let entry = SnapshotEntry {
-                                        key: key.clone(),
-                                        value: serializable_value,
-                                    };
-                                    if tx.send(entry).await.is_err() {
-                                        return;
-                                    }
-                                    break;
-                                }
+                        if let Some(version) = version_chain
+                            .iter()
+                            .rev()
+                            .find(|v| snapshot.is_visible(v, &tx_status_manager))
+                        {
+                            let serializable_value =
+                                SerializableDbValue::from_db_value(&version.value).await;
+                            let entry = SnapshotEntry {
+                                key: key.clone(),
+                                value: serializable_value,
+                            };
+                            if tx.send(entry).await.is_err() {
+                                return;
                             }
                         }
                     }
@@ -333,6 +337,7 @@ impl PersistenceEngine {
                             self.snapshot_temp_path.clone(),
                             wal_to_compact,
                             self.tx_status_manager.clone(),
+                            self.tx_id_manager.clone(),
                         ));
                     }
                 }
@@ -349,6 +354,7 @@ impl PersistenceEngine {
                         self.snapshot_temp_path.clone(),
                         wal_to_compact,
                         self.tx_status_manager.clone(),
+                        self.tx_id_manager.clone(),
                     ));
                 } else {
                     // This shouldn't happen, but as a safeguard, put it back.

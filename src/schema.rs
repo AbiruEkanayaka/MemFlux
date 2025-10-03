@@ -3,7 +3,9 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::types::{Db, DbValue, SchemaCache, VersionedValue, TransactionStatusManager, TransactionStatus};
+use crate::types::{
+    Db, DbValue, SchemaCache, TransactionIdManager, TransactionStatusManager, VersionedValue,
+};
 use crate::query_engine::logical_plan::Expression;
 use crate::query_engine::ast::{TableConstraint};
 
@@ -180,7 +182,13 @@ pub struct VirtualSchema {
     pub constraints: Vec<TableConstraint>,
 }
 
-pub async fn load_schemas_from_db(db: &Db, schema_cache: &SchemaCache, tx_status_manager: &TransactionStatusManager) -> Result<()> {
+pub async fn load_schemas_from_db(
+    db: &Db,
+    schema_cache: &SchemaCache,
+    tx_status_manager: &TransactionStatusManager,
+    tx_id_manager: &TransactionIdManager,
+) -> Result<()> {
+    let startup_snapshot = crate::types::Snapshot::new(0, tx_status_manager, tx_id_manager);
     let items_to_process: Vec<(String, VersionedValue)> = db
         .iter()
         .filter(|item| item.key().starts_with(SCHEMA_PREFIX))
@@ -189,10 +197,11 @@ pub async fn load_schemas_from_db(db: &Db, schema_cache: &SchemaCache, tx_status
                 .try_read()
                 .ok()
                 .and_then(|guard| {
-                    guard.iter().rev().find(|version| {
-                        tx_status_manager.get_status(version.creator_txid) == Some(TransactionStatus::Committed) &&
-                        (version.expirer_txid == 0 || tx_status_manager.get_status(version.expirer_txid) != Some(TransactionStatus::Committed))
-                    }).cloned()
+                    guard
+                        .iter()
+                        .rev()
+                        .find(|version| startup_snapshot.is_visible(version, tx_status_manager))
+                        .cloned()
                 })
                 .map(|version| (item.key().clone(), version))
         })
