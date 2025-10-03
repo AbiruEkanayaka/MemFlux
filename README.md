@@ -97,7 +97,7 @@ The primary interface for this is the Python library included in `libs/python/`.
 2.  **Use the `memflux` Python module in your script:**
 
     ```python
-    import libs.python.memflux # Provided python lib relative from project source.\
+    import libs.python.memflux as memflux # Provided python lib relative from project root
     import sys
 
     # Path to the compiled shared library
@@ -110,16 +110,16 @@ The primary interface for this is the Python library included in `libs/python/`.
 
     # Configuration for the database instance
     DB_CONFIG = {
-      "persistence": true,
-      "durability": "fsync",
-      "wal_file": "memflux.wal",
-      "wal_overflow_file": "memflux.wal.overflow",
-      "snapshot_file": "memflux.snapshot",
-      "snapshot_temp_file": "memflux.snapshot.tmp",
-      "wal_size_threshold_mb": 128,
-      "maxmemory_mb": 0,
-      "eviction_policy": "lru",
-      "isolation_level": "serializable",
+    "persistence": True,
+    "durability": "fsync",
+    "wal_file": "memflux.wal",
+    "wal_overflow_file": "memflux.wal.overflow",
+    "snapshot_file": "memflux.snapshot",
+    "snapshot_temp_file": "memflux.snapshot.tmp",
+    "wal_size_threshold_mb": 128,
+    "maxmemory_mb": 0,
+    "eviction_policy": "lru",
+    "isolation_level": "serializable",
     }
 
     # Connect to the database (loads it in-process)
@@ -127,7 +127,7 @@ The primary interface for this is the Python library included in `libs/python/`.
 
     with conn.cursor() as cur:
         cur.execute("SQL CREATE TABLE products (id INT, name TEXT, price REAL)")
-        cur.execute("SQL INSERT INTO products VALUES (?, ?, ?)", (1, "Laptop", 1200.50))
+        cur.execute("SQL INSERT INTO products VALUES (?, ?, ?)", (1, 'Laptop', 1200.50))
         
         cur.execute("SQL SELECT name, price FROM products WHERE price > ?", (1000,))
         product = cur.fetchone()

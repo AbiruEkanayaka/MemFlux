@@ -39,17 +39,25 @@ cur.execute("ROLLBACK") # The changes to key2 and key3 are discarded
 Here is a complete example of how to use the library.
 
 ```python
-import memflux
+import libs.python.memflux as memflux # Provided python lib relative from project root
 import os
+import sys
 
 # --- 1. Configuration ---
 # Path to the compiled dynamic library
-# This path may vary based on your OS and build profile (debug/release)
-LIB_PATH = "./target/debug/libmemflux.so"
+# This path may vary based on build profile (debug/release)
+if sys.platform == "win32":
+    LIB_PATH = "./target/release/memflux.dll"
+elif sys.platform == "darwin":
+    LIB_PATH = "./target/release/libmemflux.dylib"
+else:
+    LIB_PATH = "./target/release/libmemflux.so"
 
 # Configuration for the database instance.
 # These are the same settings as the persistence/memory sections of config.json
 DB_CONFIG = {
+  "persistence": True,
+  "durability": "fsync",
   "wal_file": "memflux.wal",
   "wal_overflow_file": "memflux.wal.overflow",
   "snapshot_file": "memflux.snapshot",
@@ -57,6 +65,7 @@ DB_CONFIG = {
   "wal_size_threshold_mb": 128,
   "maxmemory_mb": 0,
   "eviction_policy": "lru",
+  "isolation_level": "serializable",
 }
 
 # --- 2. Connecting to the Database ---
