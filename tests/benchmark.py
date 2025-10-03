@@ -22,10 +22,9 @@ def benchmark_ops_sec(sock, reader, parts, duration_sec, pipeline_size=1000):
     Benchmarks operations per second for a given command using pipelining.
     """
     print(f"Benchmarking ops/sec for {duration_sec} seconds (pipeline size: {pipeline_size})...")
-    
+
     # Send one command to make sure connection is ok and warm up
     try:
-        # Use send_resp_command for initial warm-up, it handles both socket and FFI
         send_resp_command(sock, reader, parts)
     except Exception as e:
         print(f"Initial command failed, aborting benchmark: {e}")
@@ -33,23 +32,49 @@ def benchmark_ops_sec(sock, reader, parts, duration_sec, pipeline_size=1000):
 
     start_time = time.time()
     ops_count = 0
-    
-    while time.time() - start_time < duration_sec:
-        # For FFI, pipelining means sending commands sequentially without waiting for
-        # the network roundtrip, but still waiting for the FFI call to complete.
-        # For socket, it means sending multiple commands before reading responses.
-        # To unify, we'll just call send_resp_command repeatedly.
-        try:
-            for _ in range(pipeline_size):
-                # send_resp_command handles both socket and FFI modes
+
+    # FFI mode (no reader)
+    if reader is None:
+        while time.time() - start_time < duration_sec:
+            try:
+                # For FFI, we just execute in a tight loop as there's no network batching.
                 send_resp_command(sock, reader, parts)
                 ops_count += 1
-        except Exception as e:
-            print(f"[ERROR] Command execution failed during benchmark: {e}")
-            break
+            except Exception as e:
+                print(f"[ERROR] Command execution failed during FFI benchmark: {e}")
+                break
+    # Socket mode (with reader)
+    else:
+        # Pre-encode the command to send
+        resp = f"*{len(parts)}\r\n"
+        for p in parts:
+            p_bytes = p.encode('utf-8')
+            resp += f"${len(p_bytes)}\r\n"
+            resp += p
+            resp += "\r\n"
+        command_bytes = resp.encode('utf-8')
+
+        while time.time() - start_time < duration_sec:
+            # Send a pipeline of commands
+            pipeline_data = command_bytes * pipeline_size
+            try:
+                sock.sendall(pipeline_data)
+            except BrokenPipeError:
+                print("[ERROR] Connection closed by server (Broken pipe).")
+                break
+                
+            # Read responses for the pipeline
+            try:
+                for _ in range(pipeline_size):
+                    read_resp_response(reader)
+                ops_count += pipeline_size
+            except Exception as e:
+                print(f"[ERROR] Failed to read/parse RESP response during benchmark: {e}")
+                # After a read error, the stream is likely out of sync.
+                # It's better to stop than to report incorrect numbers.
+                break
 
     end_time = time.time()
-    # The actual benchmark duration might be slightly different
     actual_duration = end_time - start_time
     ops_per_sec = ops_count / actual_duration if actual_duration > 0 else 0
 
