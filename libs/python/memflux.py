@@ -209,13 +209,18 @@ class Cursor:
             try:
                 param = next(param_iter)
                 if isinstance(param, str):
-                    quoted_param = shlex.quote(param)
+                    quoted_param = f"'{param.replace("'", "''")}'"
                 elif isinstance(param, (int, float)):
                     quoted_param = str(param)
                 elif param is None:
                     quoted_param = "NULL"
                 elif isinstance(param, bytes):
-                    quoted_param = shlex.quote(param.decode('utf-8'))
+                    try:
+                        decoded_param = param.decode('utf-8')
+                        quoted_param = f"'{decoded_param.replace("'", "''")}'"
+                    except UnicodeDecodeError:
+                        hex_param = param.hex()
+                        quoted_param = f"'\\x{hex_param}'"
                 else:
                     quoted_param = shlex.quote(str(param))
                 
