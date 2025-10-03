@@ -806,11 +806,6 @@ impl StorageExecutor {
             drop(tx_guard);
             let txid = self.ctx.tx_id_manager.new_txid();
             self.ctx.tx_status_manager.begin(txid);
-            let ack_response = log_to_wal(log_entry, &self.ctx).await;
-            if !matches!(ack_response, Response::Ok) {
-                self.ctx.tx_status_manager.abort(txid);
-                return ack_response;
-            }
             let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
             let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
             let mut version_chain = version_chain_arc.write().await;
@@ -837,7 +832,35 @@ impl StorageExecutor {
             } else {
                 VecDeque::new()
             };
-            if list_exists { for _ in 0..count { if let Some(val) = new_list.pop_front() { popped.push(val); } else { break; } } }
+            if list_exists {
+                for _ in 0..count {
+                    if let Some(val) = new_list.pop_front() {
+                        popped.push(val);
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            if popped.is_empty() {
+                if list_exists {
+                    if let Some(version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == txid) {
+                        version.expirer_txid = 0;
+                    }
+                }
+                self.ctx.tx_status_manager.abort(txid);
+                return Response::Nil;
+            }
+
+            let ack_response = log_to_wal(log_entry, &self.ctx).await;
+            if !matches!(ack_response, Response::Ok) {
+                if let Some(version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == txid) {
+                    version.expirer_txid = 0;
+                }
+                self.ctx.tx_status_manager.abort(txid);
+                return ack_response;
+            }
+
             let new_db_value = DbValue::List(RwLock::new(new_list));
             let new_size = key.len() as u64 + memory::estimate_db_value_size(&new_db_value).await;
             if self.ctx.memory.is_enabled() {
@@ -892,11 +915,6 @@ impl StorageExecutor {
             drop(tx_guard);
             let txid = self.ctx.tx_id_manager.new_txid();
             self.ctx.tx_status_manager.begin(txid);
-            let ack_response = log_to_wal(log_entry, &self.ctx).await;
-            if !matches!(ack_response, Response::Ok) {
-                self.ctx.tx_status_manager.abort(txid);
-                return ack_response;
-            }
             let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
             let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
             let mut version_chain = version_chain_arc.write().await;
@@ -923,7 +941,34 @@ impl StorageExecutor {
             } else {
                 VecDeque::new()
             };
-            if list_exists { for _ in 0..count { if let Some(val) = new_list.pop_back() { popped.push(val); } else { break; } } }
+            if list_exists {
+                for _ in 0..count {
+                    if let Some(val) = new_list.pop_back() {
+                        popped.push(val);
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if popped.is_empty() {
+                if list_exists {
+                    if let Some(version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == txid) {
+                        version.expirer_txid = 0;
+                    }
+                }
+                self.ctx.tx_status_manager.abort(txid);
+                return Response::Nil;
+            }
+            let ack_response = log_to_wal(log_entry, &self.ctx).await;
+            if !matches!(ack_response, Response::Ok) {
+                if list_exists {
+                    if let Some(version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == txid) {
+                        version.expirer_txid = 0;
+                    }
+                }
+                self.ctx.tx_status_manager.abort(txid);
+                return ack_response;
+            }
             let new_db_value = DbValue::List(RwLock::new(new_list));
             let new_size = key.len() as u64 + memory::estimate_db_value_size(&new_db_value).await;
             if self.ctx.memory.is_enabled() {
@@ -1063,11 +1108,6 @@ impl StorageExecutor {
         drop(tx_guard);
         let txid = self.ctx.tx_id_manager.new_txid();
         self.ctx.tx_status_manager.begin(txid);
-        let ack_response = log_to_wal(log_entry, &self.ctx).await;
-        if !matches!(ack_response, Response::Ok) {
-            self.ctx.tx_status_manager.abort(txid);
-            return ack_response;
-        }
         let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
         let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
         let mut version_chain = version_chain_arc.write().await;
@@ -1092,7 +1132,30 @@ impl StorageExecutor {
         } else {
             HashSet::new()
         };
-        for m in members { if new_set.remove(&m) { removed_count += 1; } }
+        for m in members {
+            if new_set.remove(&m) {
+                removed_count += 1;
+            }
+        }
+        if removed_count == 0 {
+            if old_size > 0 {
+                if let Some(version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == txid) {
+                    version.expirer_txid = 0;
+                }
+            }
+            self.ctx.tx_status_manager.abort(txid);
+            return Response::Integer(0);
+        }
+        let ack_response = log_to_wal(log_entry, &self.ctx).await;
+        if !matches!(ack_response, Response::Ok) {
+            if old_size > 0 {
+                if let Some(version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == txid) {
+                    version.expirer_txid = 0;
+                }
+            }
+            self.ctx.tx_status_manager.abort(txid);
+            return ack_response;
+        }
         let new_db_value = DbValue::Set(RwLock::new(new_set));
         let new_size = key.len() as u64 + memory::estimate_db_value_size(&new_db_value).await;
         if self.ctx.memory.is_enabled() {
@@ -1552,11 +1615,17 @@ impl StorageExecutor {
                                                 let txid = self.ctx.tx_id_manager.new_txid();
                                                 self.ctx.tx_status_manager.begin(txid);
                                                 let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
-                                                let (old_val_for_index, new_val) = {
-                                                    let old_val = match visible_value {
+                                                
+                                                let (old_val_for_index, new_val, old_size) = {
+                                                    let old_val = match &visible_value {
                                                         Some(DbValue::JsonB(b)) => serde_json::from_slice(&b)?,
                                                         Some(DbValue::Json(v)) => v.clone(),
                                                         _ => json!({}),
+                                                    };
+                                                    let old_size = if let Some(vv) = &visible_value {
+                                                        key.len() as u64 + memory::estimate_db_value_size(vv).await
+                                                    } else {
+                                                        0
                                                     };
                                                     let mut new_val = old_val.clone();
                                                     let excluded_row = json!({ "excluded": row_data.clone() });
@@ -1564,9 +1633,20 @@ impl StorageExecutor {
                                                         let val = expr.evaluate_with_context(&excluded_row, Some(&old_val), self.ctx.clone(), None).await?;
                                                         new_val[col] = val;
                                                     }
-                                                    (old_val, new_val)
+                                                    (old_val, new_val, old_size)
                                                 };
+
                                                 let new_val_bytes = serde_json::to_vec(&new_val)?;
+
+                                                if self.ctx.memory.is_enabled() {
+                                                    let new_size = key.len() as u64 + new_val_bytes.len() as u64;
+                                                    let needed = new_size.saturating_sub(old_size);
+                                                    if let Err(e) = self.ctx.memory.ensure_memory_for(needed, &self.ctx).await {
+                                                        self.ctx.tx_status_manager.abort(txid);
+                                                        return Err(anyhow!(e.to_string()));
+                                                    }
+                                                }
+
                                                 let log_entry = LogEntry::SetJsonB { key: key.clone(), value: new_val_bytes.clone() };
                                                 if let Response::Error(e) = log_to_wal(log_entry, &self.ctx).await {
                                                     self.ctx.tx_status_manager.abort(txid);
@@ -1581,8 +1661,16 @@ impl StorageExecutor {
                                                 {
                                                     latest_version.expirer_txid = txid;
                                                 }
-                                                let new_version = crate::types::VersionedValue { value: DbValue::JsonB(new_val_bytes), creator_txid: txid, expirer_txid: 0 };
+                                                let new_version = crate::types::VersionedValue { value: DbValue::JsonB(new_val_bytes.clone()), creator_txid: txid, expirer_txid: 0 };
                                                 version_chain.push(new_version);
+
+                                                if self.ctx.memory.is_enabled() {
+                                                    let new_size = key.len() as u64 + new_val_bytes.len() as u64;
+                                                    self.ctx.memory.decrease_memory(old_size);
+                                                    self.ctx.memory.increase_memory(new_size);
+                                                    self.ctx.memory.track_access(&key).await;
+                                                }
+
                                                 self.ctx.index_manager.remove_key_from_indexes(&key, &old_val_for_index).await;
                                                 self.ctx.index_manager.add_key_to_indexes(&key, &new_val).await;
                                                 self.ctx.tx_status_manager.commit(txid);
@@ -1593,7 +1681,17 @@ impl StorageExecutor {
                         } else {
                             return Err(anyhow!("PRIMARY KEY constraint failed. Key '{}' already exists.", key));
                         }
-                    }            let value_bytes = serde_json::to_vec(&row_data)?;
+                    }            
+            let value_bytes = serde_json::to_vec(&row_data)?;
+
+            if self.ctx.memory.is_enabled() {
+                let new_size = key.len() as u64 + value_bytes.len() as u64;
+                let needed = new_size.saturating_sub(0); // old_size is 0 for new insert
+                if let Err(e) = self.ctx.memory.ensure_memory_for(needed, &self.ctx).await {
+                    return Err(anyhow!(e.to_string()));
+                }
+            }
+
             let log_entry = LogEntry::SetJsonB { key: key.clone(), value: value_bytes.clone() };
             if let Response::Error(e) = log_to_wal(log_entry, &self.ctx).await {
                 return Err(anyhow!(e));
@@ -1601,10 +1699,17 @@ impl StorageExecutor {
             self.ctx.index_manager.add_key_to_indexes(&key, &row_data).await;
             let txid = self.ctx.tx_id_manager.new_txid();
             self.ctx.tx_status_manager.begin(txid);
-            let new_version = crate::types::VersionedValue { value: DbValue::JsonB(value_bytes), creator_txid: txid, expirer_txid: 0 };
+            let new_version = crate::types::VersionedValue { value: DbValue::JsonB(value_bytes.clone()), creator_txid: txid, expirer_txid: 0 };
             let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
             let mut version_chain = version_chain_arc.write().await;
             version_chain.push(new_version);
+
+            if self.ctx.memory.is_enabled() {
+                let new_size = key.len() as u64 + value_bytes.len() as u64;
+                self.ctx.memory.increase_memory(new_size);
+                self.ctx.memory.track_access(&key).await;
+            }
+
             self.ctx.tx_status_manager.commit(txid);
             inserted_rows.push(row_data);
         }
