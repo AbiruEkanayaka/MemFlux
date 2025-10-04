@@ -10,6 +10,7 @@ use tokio::task::JoinHandle;
 pub mod arc;
 pub mod commands;
 pub mod config;
+pub mod cypher_engine;
 pub mod indexing;
 pub mod memory;
 pub mod persistence;
@@ -33,6 +34,7 @@ use crate::types::{
     AppContext, Db, FunctionRegistry, PersistenceRequest, TransactionIdManager,
     TransactionStatusManager, ViewCache, ViewDefinition,
 };
+
 
 /// The main database instance, providing the primary API for interaction.
 pub struct MemFluxDB {
@@ -256,6 +258,34 @@ impl MemFluxDB {
         }
     }
 
+    pub fn execute_cypher_stream<'a>(
+        &'a self,
+        cypher: &'a str,
+        transaction_handle: TransactionHandle,
+    ) -> impl Stream<Item = Result<Value>> + Send + 'a {
+        use cypher_engine::{parser, logical_plan, physical_plan, execution};
+
+        async_stream::try_stream! {
+            let plan_result = (|| {
+                let ast = parser::parse_cypher(cypher)?;
+                let logical = logical_plan::ast_to_logical_plan(ast)?;
+                physical_plan::logical_to_physical_plan(logical, &self.app_context.index_manager)
+            })();
+
+            match plan_result {
+                Ok(physical_plan) => {
+                    let mut stream = Box::pin(execution::execute(physical_plan, self.app_context.clone(), transaction_handle));
+                    while let Some(row_result) = stream.next().await {
+                        yield row_result?;
+                    }
+                }
+                Err(e) => {
+                    yield Err(e)?;
+                }
+            }
+        }
+    }
+
     /// Executes a command, either SQL or a direct database command.
     pub async fn execute_command(
         &self,
@@ -322,6 +352,17 @@ impl MemFluxDB {
                     final_response
                 }
             }
+        } else if command.name == "CYPHER" {
+            let cypher = String::from_utf8_lossy(&command.args[1]).to_string();
+            let mut stream = Box::pin(self.execute_cypher_stream(&cypher, transaction_handle));
+            let mut rows = Vec::new();
+            while let Some(row_result) = stream.next().await {
+                match row_result {
+                    Ok(val) => rows.push(val.to_string().into_bytes()),
+                    Err(e) => return types::Response::Error(format!("Execution Error: {}", e)),
+                }
+            }
+            types::Response::MultiBytes(rows)
         } else {
             commands::process_command(command, self.app_context.clone(), transaction_handle).await
         }

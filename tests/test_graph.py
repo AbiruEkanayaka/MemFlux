@@ -120,3 +120,37 @@ def test_graph(sock, reader):
     assert_eq(resp, ":0", "DELETE on non-existent ID should return 0")
 
     print("[PASS] Deletion operations complete.")
+
+    # --- 5. Property Update ---
+    print("\n-- Phase 5: Property Update (SETNODEPROP) --")
+    
+    send(["BEGIN"])
+    # Add a node to modify
+    carol_props = '{"name": "Carol", "age": 40}'
+    resp = send(["GRAPH.ADDNODE", "Person", carol_props])
+    carol_id = resp.splitlines()[1]
+    print(f"[INFO] Created Node Carol with ID: {carol_id}")
+
+    # Update the age
+    resp = send(["GRAPH.SETNODEPROP", carol_id, "age", '41'])
+    assert_eq(resp, ":1", "SETNODEPROP should return 1 on success")
+
+    # Verify the update within the transaction
+    resp = send(["GRAPH.GETNODE", carol_id])
+    resp_json_intra_tx = extract_json_from_bulk(resp.encode('utf-8'))
+    assert_eq(resp_json_intra_tx.get("age"), 41, "GETNODE should retrieve the updated age for Carol inside the transaction")
+
+    send(["COMMIT"])
+
+    # Verify the update after commit
+    resp = send(["GRAPH.GETNODE", carol_id])
+    resp_json_post_tx = extract_json_from_bulk(resp.encode('utf-8'))
+    assert_eq(resp_json_post_tx.get("age"), 41, "GETNODE should retrieve the updated age for Carol after commit")
+
+    # Try to update a non-existent node
+    send(["BEGIN"])
+    resp = send(["GRAPH.SETNODEPROP", "non-existent-id", "age", "99"])
+    assert_eq(resp, ":0", "SETNODEPROP on non-existent ID should return 0")
+    send(["ROLLBACK"])
+
+    print("[PASS] Property update operations complete.")

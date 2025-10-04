@@ -211,6 +211,38 @@ async fn handle_graph_delete(
     executor.graph_delete(id).await
 }
 
+async fn handle_graph_setnodeprop(
+    command: Command,
+    ctx: Arc<AppContext>,
+    transaction_handle: TransactionHandle,
+) -> Response {
+    if command.args.len() != 4 {
+        return Response::Error(
+            "GRAPH.SETNODEPROP requires <id>, <property> and <value_json>".to_string(),
+        );
+    }
+    let node_id = match String::from_utf8(command.args[1].clone()) {
+        Ok(id) => id,
+        Err(_) => return Response::Error("Invalid node ID".to_string()),
+    };
+    let property = match String::from_utf8(command.args[2].clone()) {
+        Ok(p) => p,
+        Err(_) => return Response::Error("Invalid property name".to_string()),
+    };
+    let value_json = command.args[3].clone();
+
+    // Validate JSON
+    if serde_json::from_slice::<Value>(&value_json).is_err() {
+        return Response::Error("Invalid JSON value".to_string());
+    }
+
+    let executor = StorageExecutor::new(ctx, transaction_handle);
+    executor
+        .graph_set_node_property(node_id, property, value_json)
+        .await
+}
+
+
 pub async fn process_command(
     command: Command,
     ctx: Arc<AppContext>,
@@ -261,6 +293,7 @@ pub async fn process_command(
         "GRAPH.ADDREL" => handle_graph_addrel(command, ctx.clone(), transaction_handle).await,
         "GRAPH.GETRELS" => handle_graph_getrels(command, ctx.clone(), transaction_handle).await,
         "GRAPH.DELETE" => handle_graph_delete(command, ctx.clone(), transaction_handle).await,
+        "GRAPH.SETNODEPROP" => handle_graph_setnodeprop(command, ctx.clone(), transaction_handle).await,
         _ => Response::Error(format!("Unknown command: {}", command.name)),
     }
 }

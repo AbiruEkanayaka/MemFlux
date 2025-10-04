@@ -753,6 +753,40 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                 }
                 db.remove(&pk_key);
             }
+            LogEntry::SetNodeProperty { id, property, value } => {
+                let pk_key = format!("_pk_node:{}", id);
+                if let Some(entry) = db.get(&pk_key) {
+                    let version_chain_arc = entry.value().clone();
+                    drop(entry);
+                    let version_chain = version_chain_arc.read().await;
+                    if let Some(latest_version) = version_chain.last() {
+                        if let DbValue::Bytes(label_bytes) = &latest_version.value {
+                            if let Ok(label) = String::from_utf8(label_bytes.clone()) {
+                                let node_key = format!("_node:{}:{}", label, id);
+                                if let Some(node_entry) = db.get(&node_key) {
+                                    let node_vc_arc = node_entry.value().clone();
+                                    drop(node_entry);
+                                    let mut node_vc = node_vc_arc.write().await;
+                                    if let Some(node_latest_version) = node_vc.last_mut() {
+                                        if let DbValue::JsonB(bytes) = &node_latest_version.value {
+                                            if let Ok(mut props) = serde_json::from_slice::<serde_json::Value>(bytes) {
+                                                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&value) {
+                                                    if let Some(obj) = props.as_object_mut() {
+                                                        obj.insert(property, val);
+                                                        if let Ok(new_bytes) = serde_json::to_vec(&props) {
+                                                            node_latest_version.value = DbValue::JsonB(new_bytes);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             LogEntry::AddRelationship { id, start_node_id, end_node_id, rel_type, properties } => {
                 let out_key = format!("_edge:out:{}:{}:{}", start_node_id, rel_type, end_node_id);
                 let in_key = format!("_edge:in:{}:{}:{}", end_node_id, rel_type, start_node_id);

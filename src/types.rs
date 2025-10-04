@@ -291,6 +291,11 @@ pub enum LogEntry {
     DropNode {
         id: String,
     },
+    SetNodeProperty {
+        id: String,
+        property: String,
+        value: Vec<u8>,
+    },
     AddRelationship {
         id: String,
         start_node_id: String,
