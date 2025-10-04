@@ -282,6 +282,25 @@ pub enum LogEntry {
     Savepoint { name: String },
     RollbackToSavepoint { name: String },
     ReleaseSavepoint { name: String },
+    // Graph Operations
+    AddNode {
+        id: String,
+        label: String,
+        properties: Vec<u8>,
+    },
+    DropNode {
+        id: String,
+    },
+    AddRelationship {
+        id: String,
+        start_node_id: String,
+        end_node_id: String,
+        rel_type: String,
+        properties: Vec<u8>,
+    },
+    DropRelationship {
+        id: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]

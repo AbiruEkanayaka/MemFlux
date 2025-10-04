@@ -718,6 +718,87 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                     }
                 }
             }
+            LogEntry::AddNode { id, label, properties } => {
+                let node_key = format!("_node:{}:{}", label, id);
+                let pk_key = format!("_pk_node:{}", id);
+
+                let node_version = VersionedValue {
+                    value: DbValue::JsonB(properties),
+                    creator_txid: 0,
+                    expirer_txid: 0,
+                };
+                db.insert(node_key, Arc::new(RwLock::new(vec![node_version])));
+
+                let pk_version = VersionedValue {
+                    value: DbValue::Bytes(label.into_bytes()),
+                    creator_txid: 0,
+                    expirer_txid: 0,
+                };
+                db.insert(pk_key, Arc::new(RwLock::new(vec![pk_version])));
+            }
+            LogEntry::DropNode { id } => {
+                let pk_key = format!("_pk_node:{}", id);
+                if let Some(entry) = db.get(&pk_key) {
+                    let version_chain_arc = entry.value().clone();
+                    drop(entry);
+                    let version_chain = version_chain_arc.read().await;
+                    if let Some(latest_version) = version_chain.last() {
+                        if let DbValue::Bytes(label_bytes) = &latest_version.value {
+                            if let Ok(label) = String::from_utf8(label_bytes.clone()) {
+                                let node_key = format!("_node:{}:{}", label, id);
+                                db.remove(&node_key);
+                            }
+                        }
+                    }
+                }
+                db.remove(&pk_key);
+            }
+            LogEntry::AddRelationship { id, start_node_id, end_node_id, rel_type, properties } => {
+                let out_key = format!("_edge:out:{}:{}:{}", start_node_id, rel_type, end_node_id);
+                let in_key = format!("_edge:in:{}:{}:{}", end_node_id, rel_type, start_node_id);
+                let pk_key = format!("_pk_rel:{}", id);
+                let pk_val = format!("{}:{}:{}", start_node_id, rel_type, end_node_id);
+
+                let edge_version = VersionedValue {
+                    value: DbValue::JsonB(properties),
+                    creator_txid: 0,
+                    expirer_txid: 0,
+                };
+                db.insert(out_key, Arc::new(RwLock::new(vec![edge_version.clone()])));
+                db.insert(in_key, Arc::new(RwLock::new(vec![edge_version])));
+
+                let pk_version = VersionedValue {
+                    value: DbValue::Bytes(pk_val.into_bytes()),
+                    creator_txid: 0,
+                    expirer_txid: 0,
+                };
+                db.insert(pk_key, Arc::new(RwLock::new(vec![pk_version])));
+            }
+            LogEntry::DropRelationship { id } => {
+                let pk_key = format!("_pk_rel:{}", id);
+                if let Some(entry) = db.get(&pk_key) {
+                    let version_chain_arc = entry.value().clone();
+                    drop(entry);
+                    let version_chain = version_chain_arc.read().await;
+                    if let Some(latest_version) = version_chain.last() {
+                        if let DbValue::Bytes(pk_val_bytes) = &latest_version.value {
+                            if let Ok(pk_val) = String::from_utf8(pk_val_bytes.clone()) {
+                                let parts: Vec<&str> = pk_val.splitn(3, ':').collect();
+                                if parts.len() == 3 {
+                                    let start_node_id = parts[0];
+                                    let rel_type = parts[1];
+                                    let end_node_id = parts[2];
+                                    let out_key = format!("_edge:out:{}:{}:{}", start_node_id, rel_type, end_node_id);
+                                    let in_key = format!("_edge:in:{}:{}:{}", end_node_id, rel_type, start_node_id);
+                                    db.remove(&out_key);
+                                    db.remove(&in_key);
+                                }
+                            }
+                        }
+                    }
+                }
+                db.remove(&pk_key);
+            }
             _ => { /* Do nothing for transaction-related log entries during replay */ }
         }
     }

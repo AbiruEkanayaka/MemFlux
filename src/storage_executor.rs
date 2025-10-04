@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
+use uuid::Uuid;
 
 pub async fn log_to_wal(log_entry: LogEntry, ctx: &AppContext) -> Response {
     if ctx.config.durability == DurabilityLevel::None && ctx.config.persistence {
@@ -1714,5 +1715,254 @@ impl StorageExecutor {
             inserted_rows.push(row_data);
         }
         Ok(inserted_rows)
+    }
+
+    pub async fn graph_add_node(&self, label: String, properties: Vec<u8>) -> Response {
+        let node_id = Uuid::new_v4().to_string();
+        let log_entry = LogEntry::AddNode {
+            id: node_id.clone(),
+            label: label.clone(),
+            properties: properties.clone(),
+        };
+
+        // Transactional path
+        let mut tx_guard = self.transaction_handle.write().await;
+        if let Some(tx) = tx_guard.as_mut() {
+            tx.log_entries.write().await.push(log_entry);
+
+            let node_key = format!("_node:{}:{}", label, node_id);
+            let pk_key = format!("_pk_node:{}", node_id);
+
+            tx.writes
+                .insert(node_key, Some(DbValue::JsonB(properties)));
+            tx.writes
+                .insert(pk_key, Some(DbValue::Bytes(label.into_bytes())));
+
+            return Response::Bytes(node_id.into_bytes());
+        }
+        drop(tx_guard);
+
+        // Non-transactional path
+        let txid = self.ctx.tx_id_manager.new_txid();
+        self.ctx.tx_status_manager.begin(txid);
+
+        let ack_response = log_to_wal(log_entry, &self.ctx).await;
+        if !matches!(ack_response, Response::Ok) {
+            self.ctx.tx_status_manager.abort(txid);
+            return ack_response;
+        }
+
+        let node_key = format!("_node:{}:{}", label, node_id);
+        let pk_key = format!("_pk_node:{}", node_id);
+
+        let node_version = crate::types::VersionedValue {
+            value: DbValue::JsonB(properties),
+            creator_txid: txid,
+            expirer_txid: 0,
+        };
+        self.ctx
+            .db
+            .insert(node_key, Arc::new(RwLock::new(vec![node_version])));
+
+        let pk_version = crate::types::VersionedValue {
+            value: DbValue::Bytes(label.into_bytes()),
+            creator_txid: txid,
+            expirer_txid: 0,
+        };
+        self.ctx
+            .db
+            .insert(pk_key, Arc::new(RwLock::new(vec![pk_version])));
+
+        self.ctx.tx_status_manager.commit(txid);
+
+        Response::Bytes(node_id.into_bytes())
+    }
+
+    pub async fn graph_add_relationship(
+        &self,
+        start_node_id: String,
+        end_node_id: String,
+        rel_type: String,
+        properties: Vec<u8>,
+    ) -> Response {
+        let rel_id = Uuid::new_v4().to_string();
+
+        let mut props_val: Value = serde_json::from_slice(&properties).unwrap_or(json!({}));
+        if let Some(obj) = props_val.as_object_mut() {
+            obj.insert("_id".to_string(), json!(rel_id.clone()));
+        }
+        let final_properties = serde_json::to_vec(&props_val).unwrap();
+
+        let log_entry = LogEntry::AddRelationship {
+            id: rel_id.clone(),
+            start_node_id: start_node_id.clone(),
+            end_node_id: end_node_id.clone(),
+            rel_type: rel_type.clone(),
+            properties: final_properties.clone(),
+        };
+
+        // Transactional path
+        let mut tx_guard = self.transaction_handle.write().await;
+        if let Some(tx) = tx_guard.as_mut() {
+            tx.log_entries.write().await.push(log_entry);
+
+            let out_key = format!("_edge:out:{}:{}:{}", start_node_id, rel_type, end_node_id);
+            let in_key = format!("_edge:in:{}:{}:{}", end_node_id, rel_type, start_node_id);
+            let pk_key = format!("_pk_rel:{}", rel_id);
+            let pk_val = format!("{}:{}:{}", start_node_id, rel_type, end_node_id);
+
+            tx.writes
+                .insert(out_key, Some(DbValue::JsonB(final_properties.clone())));
+            tx.writes
+                .insert(in_key, Some(DbValue::JsonB(final_properties)));
+            tx.writes
+                .insert(pk_key, Some(DbValue::Bytes(pk_val.into_bytes())));
+
+            return Response::Bytes(rel_id.into_bytes());
+        }
+        drop(tx_guard);
+
+        // Non-transactional path
+        let txid = self.ctx.tx_id_manager.new_txid();
+        self.ctx.tx_status_manager.begin(txid);
+
+        let ack_response = log_to_wal(log_entry, &self.ctx).await;
+        if !matches!(ack_response, Response::Ok) {
+            self.ctx.tx_status_manager.abort(txid);
+            return ack_response;
+        }
+
+        let out_key = format!("_edge:out:{}:{}:{}", start_node_id, rel_type, end_node_id);
+        let in_key = format!("_edge:in:{}:{}:{}", end_node_id, rel_type, start_node_id);
+        let pk_key = format!("_pk_rel:{}", rel_id);
+        let pk_val = format!("{}:{}:{}", start_node_id, rel_type, end_node_id);
+
+        let edge_version = crate::types::VersionedValue {
+            value: DbValue::JsonB(final_properties),
+            creator_txid: txid,
+            expirer_txid: 0,
+        };
+        self.ctx
+            .db
+            .insert(out_key, Arc::new(RwLock::new(vec![edge_version.clone()])));
+        self.ctx
+            .db
+            .insert(in_key, Arc::new(RwLock::new(vec![edge_version])));
+
+        let pk_version = crate::types::VersionedValue {
+            value: DbValue::Bytes(pk_val.into_bytes()),
+            creator_txid: txid,
+            expirer_txid: 0,
+        };
+        self.ctx
+            .db
+            .insert(pk_key, Arc::new(RwLock::new(vec![pk_version])));
+
+        self.ctx.tx_status_manager.commit(txid);
+
+        Response::Bytes(rel_id.into_bytes())
+    }
+
+    pub async fn graph_delete(&self, id: String) -> Response {
+        // Try deleting as a node first
+        let pk_node_key = format!("_pk_node:{}", id);
+        let mut tx_guard = self.transaction_handle.write().await;
+
+        if let Some(tx) = tx_guard.as_mut() {
+            // Transactional path for node
+            if let Some(DbValue::Bytes(label_bytes)) =
+                get_visible_db_value(&pk_node_key, &self.ctx, Some(tx)).await
+            {
+                let label = String::from_utf8(label_bytes).unwrap_or_default();
+                let node_key = format!("_node:{}:{}", label, id);
+                tx.log_entries
+                    .write()
+                    .await
+                    .push(LogEntry::DropNode { id: id.clone() });
+                tx.writes.insert(node_key, None);
+                tx.writes.insert(pk_node_key, None);
+                return Response::Integer(1);
+            }
+        } else {
+            // Non-transactional path for node
+            if let Some(DbValue::Bytes(label_bytes)) =
+                get_visible_db_value(&pk_node_key, &self.ctx, None).await
+            {
+                let label = String::from_utf8(label_bytes).unwrap_or_default();
+                let node_key = format!("_node:{}:{}", label, id);
+                let txid = self.ctx.tx_id_manager.new_txid();
+                self.ctx.tx_status_manager.begin(txid);
+                let log_entry = LogEntry::DropNode { id: id.clone() };
+                if !matches!(log_to_wal(log_entry, &self.ctx).await, Response::Ok) {
+                    self.ctx.tx_status_manager.abort(txid);
+                    return Response::Error("WAL write error".to_string());
+                }
+                for key in vec![node_key, pk_node_key] {
+                    if let Some(vcl) = self.ctx.db.get(&key) {
+                        let mut vc = vcl.write().await;
+                        if let Some(v) = vc.iter_mut().rev().find(|v| v.expirer_txid == 0) {
+                            v.expirer_txid = txid;
+                        }
+                    }
+                }
+                self.ctx.tx_status_manager.commit(txid);
+                return Response::Integer(1);
+            }
+        }
+
+        // If not a node, try deleting as a relationship
+        let pk_rel_key = format!("_pk_rel:{}", id);
+        if let Some(tx) = tx_guard.as_mut() {
+            // Transactional path for relationship
+            if let Some(DbValue::Bytes(pk_val_bytes)) =
+                get_visible_db_value(&pk_rel_key, &self.ctx, Some(tx)).await
+            {
+                let pk_val = String::from_utf8(pk_val_bytes).unwrap_or_default();
+                let parts: Vec<&str> = pk_val.splitn(3, ':').collect();
+                if parts.len() == 3 {
+                    let out_key = format!("_edge:out:{}", pk_val);
+                    let in_key = format!("_edge:in:{}:{}:{}", parts[2], parts[1], parts[0]);
+                    tx.log_entries
+                        .write()
+                        .await
+                        .push(LogEntry::DropRelationship { id: id.clone() });
+                    tx.writes.insert(out_key, None);
+                    tx.writes.insert(in_key, None);
+                    tx.writes.insert(pk_rel_key, None);
+                    return Response::Integer(1);
+                }
+            }
+        } else {
+            // Non-transactional path for relationship
+            if let Some(DbValue::Bytes(pk_val_bytes)) =
+                get_visible_db_value(&pk_rel_key, &self.ctx, None).await
+            {
+                let pk_val = String::from_utf8(pk_val_bytes).unwrap_or_default();
+                let parts: Vec<&str> = pk_val.splitn(3, ':').collect();
+                if parts.len() == 3 {
+                    let out_key = format!("_edge:out:{}", pk_val);
+                    let in_key = format!("_edge:in:{}:{}:{}", parts[2], parts[1], parts[0]);
+                    let txid = self.ctx.tx_id_manager.new_txid();
+                    self.ctx.tx_status_manager.begin(txid);
+                    let log_entry = LogEntry::DropRelationship { id: id.clone() };
+                    if !matches!(log_to_wal(log_entry, &self.ctx).await, Response::Ok) {
+                        self.ctx.tx_status_manager.abort(txid);
+                        return Response::Error("WAL write error".to_string());
+                    }
+                    for key in vec![out_key, in_key, pk_rel_key] {
+                        if let Some(vcl) = self.ctx.db.get(&key) {
+                            let mut vc = vcl.write().await;
+                            if let Some(v) = vc.iter_mut().rev().find(|v| v.expirer_txid == 0) {
+                                v.expirer_txid = txid;
+                            }
+                        }
+                    }
+                    self.ctx.tx_status_manager.commit(txid);
+                    return Response::Integer(1);
+                }
+            }
+        }
+
+        Response::Integer(0)
     }
 }

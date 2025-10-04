@@ -11,7 +11,205 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 use crate::indexing::Index;
 
+async fn handle_graph_addnode(
+    command: Command,
+    ctx: Arc<AppContext>,
+    transaction_handle: TransactionHandle,
+) -> Response {
+    if command.args.len() != 3 {
+        return Response::Error(
+            "GRAPH.ADDNODE requires <label> and <properties_json>".to_string(),
+        );
+    }
+    let label = match String::from_utf8(command.args[1].clone()) {
+        Ok(l) => l,
+        Err(_) => return Response::Error("Invalid label".to_string()),
+    };
+    let properties_json = &command.args[2];
 
+    // Validate JSON
+    if serde_json::from_slice::<Value>(properties_json).is_err() {
+        return Response::Error("Invalid JSON properties".to_string());
+    }
+
+    let executor = StorageExecutor::new(ctx, transaction_handle);
+    executor
+        .graph_add_node(label, properties_json.clone())
+        .await
+}
+
+async fn handle_graph_getnode(
+    command: Command,
+    ctx: Arc<AppContext>,
+    transaction_handle: TransactionHandle,
+) -> Response {
+    if command.args.len() != 2 {
+        return Response::Error("GRAPH.GETNODE requires <id>".to_string());
+    }
+    let node_id = match String::from_utf8(command.args[1].clone()) {
+        Ok(id) => id,
+        Err(_) => return Response::Error("Invalid node ID".to_string()),
+    };
+
+    let tx_guard = transaction_handle.read().await;
+    let pk_key = format!("_pk_node:{}", node_id);
+
+    match get_visible_db_value(&pk_key, &ctx, tx_guard.as_ref()).await {
+        Some(DbValue::Bytes(label_bytes)) => {
+            let label = match String::from_utf8(label_bytes) {
+                Ok(l) => l,
+                Err(_) => return Response::Error("Invalid label stored in PK index".to_string()),
+            };
+            let node_key = format!("_node:{}:{}", label, node_id);
+            match get_visible_db_value(&node_key, &ctx, tx_guard.as_ref()).await {
+                Some(DbValue::JsonB(props)) => Response::Bytes(props),
+                Some(_) => Response::Error("WRONGTYPE: Node data is not JSONB".to_string()),
+                None => Response::Nil, // Should be inconsistent state if PK exists but node doesn't
+            }
+        }
+        Some(_) => Response::Error("WRONGTYPE: Node PK index is not Bytes".to_string()),
+        None => Response::Nil,
+    }
+}
+
+async fn handle_graph_addrel(
+    command: Command,
+    ctx: Arc<AppContext>,
+    transaction_handle: TransactionHandle,
+) -> Response {
+    if command.args.len() != 5 {
+        return Response::Error(
+            "GRAPH.ADDREL requires <start_id> <end_id> <type> <properties_json>".to_string(),
+        );
+    }
+    let start_id = match String::from_utf8(command.args[1].clone()) {
+        Ok(id) => id,
+        Err(_) => return Response::Error("Invalid start_id".to_string()),
+    };
+    let end_id = match String::from_utf8(command.args[2].clone()) {
+        Ok(id) => id,
+        Err(_) => return Response::Error("Invalid end_id".to_string()),
+    };
+    let rel_type = match String::from_utf8(command.args[3].clone()) {
+        Ok(t) => t,
+        Err(_) => return Response::Error("Invalid type".to_string()),
+    };
+    let properties_json = &command.args[4];
+
+    // Validate JSON
+    if serde_json::from_slice::<Value>(properties_json).is_err() {
+        return Response::Error("Invalid JSON properties".to_string());
+    }
+
+    let executor = StorageExecutor::new(ctx, transaction_handle);
+    executor
+        .graph_add_relationship(start_id, end_id, rel_type, properties_json.clone())
+        .await
+}
+
+async fn handle_graph_getrels(
+    command: Command,
+    ctx: Arc<AppContext>,
+    transaction_handle: TransactionHandle,
+) -> Response {
+    if command.args.len() < 2 || command.args.len() > 4 {
+        return Response::Error("GRAPH.GETRELS requires <node_id> [OUT|IN|BOTH] [type]".to_string());
+    }
+    let node_id = match String::from_utf8(command.args[1].clone()) {
+        Ok(id) => id,
+        Err(_) => return Response::Error("Invalid node ID".to_string()),
+    };
+    let direction = if command.args.len() > 2 {
+        match String::from_utf8_lossy(&command.args[2])
+            .to_uppercase()
+            .as_str()
+        {
+            "OUT" => "OUT",
+            "IN" => "IN",
+            "BOTH" => "BOTH",
+            _ => return Response::Error("Invalid direction, must be OUT, IN, or BOTH".to_string()),
+        }
+    } else {
+        "BOTH"
+    };
+    let rel_type_filter = if command.args.len() > 3 {
+        match String::from_utf8(command.args[3].clone()) {
+            Ok(t) => Some(t),
+            Err(_) => return Response::Error("Invalid type filter".to_string()),
+        }
+    } else {
+        None
+    };
+
+    let mut results = Vec::new();
+    let tx_guard = transaction_handle.read().await;
+
+    let prefixes = match direction {
+        "OUT" => vec![format!("_edge:out:{}:", node_id)],
+        "IN" => vec![format!("_edge:in:{}:", node_id)],
+        "BOTH" => vec![
+            format!("_edge:out:{}:", node_id),
+            format!("_edge:in:{}:", node_id),
+        ],
+        _ => unreachable!(),
+    };
+
+    for prefix in prefixes {
+        let mut keys_to_process: HashSet<String> = HashSet::new();
+        if let Some(tx) = tx_guard.as_ref() {
+            for r in ctx.db.iter() {
+                if r.key().starts_with(&prefix) {
+                    keys_to_process.insert(r.key().clone());
+                }
+            }
+            for item in tx.writes.iter() {
+                if item.key().starts_with(&prefix) {
+                    keys_to_process.insert(item.key().clone());
+                }
+            }
+        } else {
+            for r in ctx.db.iter() {
+                if r.key().starts_with(&prefix) {
+                    keys_to_process.insert(r.key().clone());
+                }
+            }
+        }
+
+        for key in keys_to_process {
+            if let Some(ref t) = rel_type_filter {
+                let key_parts: Vec<&str> = key.split(':').collect();
+                if key_parts.len() < 4 || key_parts[3] != t.as_str() {
+                    continue;
+                }
+            }
+
+            if let Some(DbValue::JsonB(props)) =
+                get_visible_db_value(&key, &ctx, tx_guard.as_ref()).await
+            {
+                results.push(props);
+            }
+        }
+    }
+
+    Response::MultiBytes(results)
+}
+
+async fn handle_graph_delete(
+    command: Command,
+    ctx: Arc<AppContext>,
+    transaction_handle: TransactionHandle,
+) -> Response {
+    if command.args.len() != 2 {
+        return Response::Error("GRAPH.DELETE requires an ID".to_string());
+    }
+    let id = match String::from_utf8(command.args[1].clone()) {
+        Ok(id) => id,
+        Err(_) => return Response::Error("Invalid ID".to_string()),
+    };
+
+    let executor = StorageExecutor::new(ctx, transaction_handle);
+    executor.graph_delete(id).await
+}
 
 pub async fn process_command(
     command: Command,
@@ -51,9 +249,18 @@ pub async fn process_command(
         "COMMIT" => handle_commit(command, ctx.clone(), transaction_handle).await,
         "ROLLBACK" => handle_rollback(command, ctx.clone(), transaction_handle).await,
         "SAVEPOINT" => handle_savepoint(command, ctx.clone(), transaction_handle).await,
-        "ROLLBACK_TO_SAVEPOINT" => handle_rollback_to_savepoint(command, ctx.clone(), transaction_handle).await,
-        "RELEASE_SAVEPOINT" => handle_release_savepoint(command, ctx.clone(), transaction_handle).await,
+        "ROLLBACK_TO_SAVEPOINT" => {
+            handle_rollback_to_savepoint(command, ctx.clone(), transaction_handle).await
+        }
+        "RELEASE_SAVEPOINT" => {
+            handle_release_savepoint(command, ctx.clone(), transaction_handle).await
+        }
         "VACUUM" => handle_vacuum(ctx.clone()).await,
+        "GRAPH.ADDNODE" => handle_graph_addnode(command, ctx.clone(), transaction_handle).await,
+        "GRAPH.GETNODE" => handle_graph_getnode(command, ctx.clone(), transaction_handle).await,
+        "GRAPH.ADDREL" => handle_graph_addrel(command, ctx.clone(), transaction_handle).await,
+        "GRAPH.GETRELS" => handle_graph_getrels(command, ctx.clone(), transaction_handle).await,
+        "GRAPH.DELETE" => handle_graph_delete(command, ctx.clone(), transaction_handle).await,
         _ => Response::Error(format!("Unknown command: {}", command.name)),
     }
 }
