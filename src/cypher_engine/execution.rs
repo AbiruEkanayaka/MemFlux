@@ -211,6 +211,38 @@ pub fn execute<'a>(
     try_stream! {
         match plan {
             PhysicalPlan::NodeScan { variable, label } => {
+                if let Some(schema) = ctx.schema_cache.get(&label) {
+                    if schema.source == crate::schema::SchemaSource::Native {
+                        let prefix = format!("{}:", label);
+                        let tx_guard = transaction_handle.read().await;
+                        let tx_opt = tx_guard.as_ref();
+
+                        let mut keys_to_process: std::collections::HashSet<String> = std::collections::HashSet::new();
+                        for r in ctx.db.iter() { if r.key().starts_with(&prefix) { keys_to_process.insert(r.key().clone()); } }
+                        if let Some(tx) = tx_opt {
+                            for item in tx.writes.iter() { if item.key().starts_with(&prefix) { keys_to_process.insert(item.key().clone()); } }
+                        }
+
+                        for key in keys_to_process {
+                            if let Some(db_val) = get_visible_db_value(&key, &ctx, tx_opt).await {
+                                if let DbValue::JsonB(bytes) = db_val {
+                                    if let Ok(mut props) = serde_json::from_slice::<Value>(&bytes) {
+                                        let id = key.split(':').last().unwrap_or("");
+                                        if let Some(obj) = props.as_object_mut() {
+                                            obj.insert("_id".to_string(), json!(id));
+                                            obj.insert("_label".to_string(), json!(label.clone()));
+                                        }
+                                        let mut row = json!({});
+                                        row[variable.clone()] = props;
+                                        yield row;
+                                    }
+                                }
+                            }
+                        }
+                        return;
+                    }
+                }
+
                 let prefix = format!("_node:{}:", label);
                 let tx_guard = transaction_handle.read().await;
                 let tx_opt = tx_guard.as_ref();

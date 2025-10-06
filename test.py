@@ -33,6 +33,7 @@ from tests.test_cypher_writes import test_cypher_writes
 from tests.test_cypher_advanced import test_cypher_advanced
 from tests.test_cypher_functions_and_paths import test_cypher_functions_and_paths
 from tests.test_sql_cypher_interop import test_sql_cypher_interop
+from tests.test_data_interop import test_data_interoperability
 
 
 # Add prompt_toolkit for better interactive input
@@ -112,6 +113,8 @@ def unit_test(conn, reader, mode, ffi_path=None):
         test_cypher_functions_and_paths(conn, reader)
     if mode in ("interop", "all"):
         test_sql_cypher_interop(conn, reader)
+    if mode in ("data_interop", "all"):
+        test_data_interoperability(conn, reader)
     
     return conn, reader
 
@@ -195,7 +198,7 @@ if __name__ == "__main__":
                         print(f"Send: {send:.2f}ms, Latency: {lat:.2f}ms, Total: {tot:.2f}ms")
             elif parsed_args.command == "unit":
                 if not parsed_args.args:
-                    print("Usage: python test.py unit {json,byte,lists,sets,sql,snapshot,types,schema,aliases,case,like,functions,union,advanced,operators,indexing,recovery,wrongtype,constraints,ddl_enhancements,dml_enhancements,dql_enhancements,cte,transactions,vacuum,graph,cypher,cypher_writes,cypher_advanced,cypher_features,interop,all}")
+                    print("Usage: python test.py unit {json,byte,lists,sets,sql,snapshot,types,schema,aliases,case,like,functions,union,advanced,operators,indexing,recovery,wrongtype,constraints,ddl_enhancements,dml_enhancements,dql_enhancements,cte,transactions,vacuum,graph,cypher,cypher_writes,cypher_advanced,cypher_features,interop,data_interop,all}")
                     sys.exit(1)
                 mode = parsed_args.args[0]
                 try:

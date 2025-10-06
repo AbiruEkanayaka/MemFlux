@@ -294,8 +294,16 @@ pub async fn process_command(
         "GRAPH.GETRELS" => handle_graph_getrels(command, ctx.clone(), transaction_handle).await,
         "GRAPH.DELETE" => handle_graph_delete(command, ctx.clone(), transaction_handle).await,
         "GRAPH.SETNODEPROP" => handle_graph_setnodeprop(command, ctx.clone(), transaction_handle).await,
+        "_REFRESH_GRAPH_SCHEMAS" => handle_refresh_graph_schemas(ctx.clone()).await,
         _ => Response::Error(format!("Unknown command: {}", command.name)),
     }
+}
+
+async fn handle_refresh_graph_schemas(ctx: Arc<AppContext>) -> Response {
+    if let Err(e) = crate::load_graph_schemas_from_db(&ctx.db, &ctx.schema_cache, &ctx.tx_status_manager, &ctx.tx_id_manager).await {
+        return Response::Error(format!("Failed to refresh graph schemas: {}", e));
+    }
+    Response::Ok
 }
 
 async fn handle_vacuum(ctx: Arc<AppContext>) -> Response {

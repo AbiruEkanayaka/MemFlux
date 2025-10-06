@@ -28,12 +28,13 @@ use crate::indexing::IndexManager;
 use crate::memory::MemoryManager;
 use crate::persistence::{load_db_from_disk, PersistenceEngine};
 use crate::query_engine::functions;
-use crate::schema::{load_schemas_from_db, VIEW_PREFIX};
+use crate::schema::{load_schemas_from_db, VIEW_PREFIX, VirtualSchema, ColumnDefinition, DataType, SchemaSource};
 use crate::transaction::TransactionHandle;
 use crate::types::{
     AppContext, Db, FunctionRegistry, PersistenceRequest, TransactionIdManager,
-    TransactionStatusManager, ViewCache, ViewDefinition,
+    TransactionStatusManager, ViewCache, ViewDefinition, DbValue, SchemaCache,
 };
+use std::collections::{BTreeMap, HashSet};
 
 
 /// The main database instance, providing the primary API for interaction.
@@ -100,6 +101,10 @@ impl MemFluxDB {
             eprintln!("Warning: Could not load virtual schemas: {}.", e);
         } else if !schema_cache.is_empty() {
             println!("Loaded {} virtual schemas.", schema_cache.len());
+        }
+
+        if let Err(e) = load_graph_schemas_from_db(&db, &schema_cache, &tx_status_manager, &tx_id_manager).await {
+            eprintln!("Warning: Could not load graph virtual schemas: {}.", e);
         }
 
         let view_cache = Arc::new(DashMap::new());
@@ -421,5 +426,106 @@ pub async fn load_views_from_db(
             }
         }
     }
+    Ok(())
+}
+
+pub async fn load_graph_schemas_from_db(
+    db: &Db,
+    schema_cache: &SchemaCache,
+    tx_status_manager: &TransactionStatusManager,
+    tx_id_manager: &TransactionIdManager,
+) -> Result<()> {
+    let startup_snapshot = crate::types::Snapshot::new(0, tx_status_manager, tx_id_manager);
+    let mut node_labels = HashSet::new();
+    let mut rel_types = HashSet::new();
+
+    let keys: Vec<String> = db.iter().map(|item| item.key().clone()).collect();
+
+    for key in keys {
+        if key.starts_with("_pk_node:") {
+            if let Some(version_chain_lock) = db.get(&key) {
+                let version_chain = version_chain_lock.read().await;
+                if let Some(version) = version_chain.iter().rev().find(|v| startup_snapshot.is_visible(v, tx_status_manager)) {
+                    if let DbValue::Bytes(label_bytes) = &version.value {
+                        if let Ok(label) = String::from_utf8(label_bytes.clone()) {
+                            node_labels.insert(label);
+                        }
+                    }
+                }
+            }
+        } else if key.starts_with("_edge:out:") {
+             let parts: Vec<&str> = key.split(':').collect();
+             if parts.len() >= 4 {
+                 rel_types.insert(parts[3].to_string());
+             }
+        }
+    }
+
+    for label in node_labels {
+        if schema_cache.contains_key(&label) {
+            continue; // Don't overwrite native schemas
+        }
+        let mut columns = BTreeMap::new();
+        columns.insert("_id".to_string(), ColumnDefinition {
+            data_type: DataType::Text,
+            nullable: false,
+            default: None,
+        });
+        // All node properties are treated as JSONB for now. We can infer this later.
+        // A generic 'properties' column is a good start.
+        columns.insert("properties".to_string(), ColumnDefinition {
+            data_type: DataType::JsonB,
+            nullable: true,
+            default: None,
+        });
+
+        let schema = VirtualSchema {
+            table_name: label.clone(),
+            columns,
+            column_order: vec!["_id".to_string(), "properties".to_string()],
+            constraints: vec![],
+            source: SchemaSource::GraphNode,
+        };
+        println!("Registering virtual table for graph node label: {}", label);
+        schema_cache.insert(label, Arc::new(schema));
+    }
+
+    for rel_type in rel_types {
+        if schema_cache.contains_key(&rel_type) {
+            continue; // Don't overwrite
+        }
+        let mut columns = BTreeMap::new();
+        columns.insert("_id".to_string(), ColumnDefinition {
+            data_type: DataType::Text,
+            nullable: false,
+            default: None,
+        });
+        columns.insert("_from_id".to_string(), ColumnDefinition {
+            data_type: DataType::Text,
+            nullable: false,
+            default: None,
+        });
+        columns.insert("_to_id".to_string(), ColumnDefinition {
+            data_type: DataType::Text,
+            nullable: false,
+            default: None,
+        });
+        columns.insert("properties".to_string(), ColumnDefinition {
+            data_type: DataType::JsonB,
+            nullable: true,
+            default: None,
+        });
+
+        let schema = VirtualSchema {
+            table_name: rel_type.clone(),
+            columns,
+            column_order: vec!["_id".to_string(), "_from_id".to_string(), "_to_id".to_string(), "properties".to_string()],
+            constraints: vec![],
+            source: SchemaSource::GraphRelationship,
+        };
+        println!("Registering virtual table for graph relationship type: {}", rel_type);
+        schema_cache.insert(rel_type, Arc::new(schema));
+    }
+
     Ok(())
 }

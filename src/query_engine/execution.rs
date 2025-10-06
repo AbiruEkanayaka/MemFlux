@@ -14,7 +14,7 @@ use tokio::sync::{oneshot, RwLock};
 use super::ast::{AlterTableAction, TableConstraint};
 use super::logical_plan::{cast_value_to_type, Expression, JoinType, LogicalOperator, LogicalPlan, Operator};
 use super::physical_plan::PhysicalPlan;
-use crate::schema::{ColumnDefinition, DataType, VirtualSchema, SCHEMA_PREFIX, VIEW_PREFIX};
+use crate::schema::{ColumnDefinition, DataType, VirtualSchema, SCHEMA_PREFIX, VIEW_PREFIX, SchemaSource};
 use crate::types::{AppContext, Command, DbValue, LogEntry, LogRequest, PersistenceRequest, Response, SchemaCache, ViewDefinition};
 
 pub const SCHEMALIST_PREFIX: &str = "_internal:schemalist:";
@@ -186,6 +186,74 @@ pub fn execute<'a>(
 ) -> Pin<Box<dyn Stream<Item = Result<Row>> + Send + 'a>> {
     Box::pin(try_stream! {        match plan {
             PhysicalPlan::TableScan { prefix } => {
+                let table_name = prefix.strip_suffix(':').unwrap_or(&prefix).to_string();
+
+                if let Some(schema) = ctx.schema_cache.get(&table_name) {
+                    match schema.source {
+                        SchemaSource::GraphNode => {
+                            let node_prefix = format!("_node:{}:", table_name);
+                            let tx_guard_read = if let Some(handle) = &transaction_handle { Some(handle.read().await) } else { None };
+                            let tx_opt = tx_guard_read.as_ref().map(|g| g.as_ref()).flatten();
+
+                            let mut keys_to_process: HashSet<String> = HashSet::new();
+                            for r in ctx.db.iter() { if r.key().starts_with(&node_prefix) { keys_to_process.insert(r.key().clone()); } }
+                            if let Some(tx) = tx_opt {
+                                for item in tx.writes.iter() { if item.key().starts_with(&node_prefix) { keys_to_process.insert(item.key().clone()); } }
+                            }
+
+                            for key in keys_to_process {
+                                if let Some(DbValue::JsonB(props_bytes)) = crate::storage_executor::get_visible_db_value(&key, &ctx, tx_opt).await {
+                                    let props: Value = serde_json::from_slice(&props_bytes)?;
+                                    let id = key.split(':').last().unwrap_or("");
+
+                                    let mut row_content = json!({});
+                                    row_content["_id"] = json!(id);
+                                    row_content["properties"] = props;
+
+                                    let mut new_row = json!({});
+                                    new_row[table_name.clone()] = row_content;
+                                    yield new_row;
+                                }
+                            }
+                            return;
+                        },
+                        SchemaSource::GraphRelationship => {
+                            let tx_guard_read = if let Some(handle) = &transaction_handle { Some(handle.read().await) } else { None };
+                            let tx_opt = tx_guard_read.as_ref().map(|g| g.as_ref()).flatten();
+
+                            let mut keys_to_process: HashSet<String> = HashSet::new();
+                            for r in ctx.db.iter() { if r.key().starts_with("_edge:out:") && r.key().split(':').nth(3) == Some(&table_name) { keys_to_process.insert(r.key().clone()); } }
+                            if let Some(tx) = tx_opt {
+                                for item in tx.writes.iter() { if item.key().starts_with("_edge:out:") && item.key().split(':').nth(3) == Some(&table_name) { keys_to_process.insert(item.key().clone()); } }
+                            }
+
+                            for key in keys_to_process {
+                                if let Some(DbValue::JsonB(props_bytes)) = crate::storage_executor::get_visible_db_value(&key, &ctx, tx_opt).await {
+                                    let props: Value = serde_json::from_slice(&props_bytes)?;
+                                    let parts: Vec<&str> = key.split(':').collect();
+                                    if parts.len() >= 5 {
+                                        let from_id = parts[2];
+                                        let to_id = parts[4];
+                                        let rel_id = props.get("_id").cloned().unwrap_or(Value::Null);
+
+                                        let mut row_content = json!({});
+                                        row_content["_id"] = rel_id;
+                                        row_content["_from_id"] = json!(from_id);
+                                        row_content["_to_id"] = json!(to_id);
+                                        row_content["properties"] = props;
+
+                                        let mut new_row = json!({});
+                                        new_row[table_name.clone()] = row_content;
+                                        yield new_row;
+                                    }
+                                }
+                            }
+                            return;
+                        },
+                        SchemaSource::Native => { /* Fall through */ }
+                    }
+                }
+
                 let table_name = prefix.strip_suffix(':').unwrap_or(&prefix).to_string();
 
                 let tx_guard_read = if let Some(handle) = &transaction_handle {
@@ -611,6 +679,7 @@ pub fn execute<'a>(
                     columns: cols,
                     column_order,
                     constraints, // Store all constraints
+                    source: SchemaSource::Native,
                 };
 
                 // Validate foreign keys (using the populated foreign_key_clauses)

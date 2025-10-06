@@ -14,6 +14,20 @@ use std::fmt;
 pub const SCHEMA_PREFIX: &str = "_internal:schemas:";
 pub const VIEW_PREFIX: &str = "_internal:views:";
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SchemaSource {
+    Native,
+    GraphNode,
+    GraphRelationship,
+}
+
+impl Default for SchemaSource {
+    fn default() -> Self {
+        SchemaSource::Native
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataType {
     SmallInt,
@@ -180,6 +194,8 @@ pub struct VirtualSchema {
     pub column_order: Vec<String>,
     #[serde(default)]
     pub constraints: Vec<TableConstraint>,
+    #[serde(default)]
+    pub source: SchemaSource,
 }
 
 pub async fn load_schemas_from_db(
