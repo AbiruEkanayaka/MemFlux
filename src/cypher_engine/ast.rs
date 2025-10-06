@@ -34,7 +34,7 @@ pub struct RemoveClause {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MatchQuery {
-    pub pattern: Pattern,
+    pub patterns: Vec<Pattern>,
     pub where_clause: Option<Expression>,
 }
 
@@ -57,6 +57,7 @@ pub struct DeleteClause {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Pattern {
+    pub variable: Option<String>,
     pub parts: Vec<PatternPart>,
 }
 
@@ -111,6 +112,11 @@ pub enum Expression {
         op: String,
         right: Box<Expression>,
     },
+    FunctionCall {
+        func: String,
+        args: Vec<Expression>,
+    },
+    ShortestPath(Box<Pattern>),
 }
 
 impl fmt::Display for Expression {
@@ -124,6 +130,11 @@ impl fmt::Display for Expression {
                 write!(f, "{{{}}}", items.join(", "))
             }
             Expression::BinaryOp { left, op, right } => write!(f, "{} {} {}", left, op, right),
+            Expression::FunctionCall { func, args } => {
+                let items: Vec<String> = args.iter().map(|arg| format!("{}", arg)).collect();
+                write!(f, "{}({})", func, items.join(", "))
+            }
+            Expression::ShortestPath(pattern) => write!(f, "shortestPath({})", pattern),
         }
     }
 }
@@ -142,5 +153,63 @@ impl fmt::Display for LiteralValue {
             LiteralValue::Integer(i) => write!(f, "{}", i),
             LiteralValue::Boolean(b) => write!(f, "{}", b),
         }
+    }
+}
+
+impl fmt::Display for Pattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(var) = &self.variable {
+            write!(f, "{} = ", var)?;
+        }
+        // Iterate through parts and format them
+        for part in &self.parts {
+            match part {
+                PatternPart::Node(node_pattern) => {
+                    write!(f, "(")?;
+                    if let Some(var) = &node_pattern.variable {
+                        write!(f, "{}", var)?;
+                    }
+                    if !node_pattern.labels.is_empty() {
+                        write!(f, ":{}", node_pattern.labels.join(":"))?;
+                    }
+                    if let Some(props) = &node_pattern.properties {
+                        write!(f, "{}", props)?;
+                    }
+                    write!(f, ")")?;
+                }
+                PatternPart::Relationship(rel_pattern) => {
+                    match rel_pattern.direction {
+                        RelationshipDirection::Incoming => write!(f, "<-")?,
+                        _ => {} // Outgoing and Both start with -
+                    }
+                    write!(f, "-[")?;
+                    if let Some(var) = &rel_pattern.variable {
+                        write!(f, "{}", var)?;
+                    }
+                    if !rel_pattern.types.is_empty() {
+                        write!(f, ":{}", rel_pattern.types.join(":"))?;
+                    }
+                    if let Some(props) = &rel_pattern.properties {
+                        write!(f, "{}", props)?;
+                    }
+                    if let Some((min, max)) = &rel_pattern.range {
+                        write!(f, "*")?;
+                        if let Some(m) = min {
+                            write!(f, "{}", m)?;
+                        }
+                        write!(f, "..")?;
+                        if let Some(m) = max {
+                            write!(f, "{}", m)?;
+                        }
+                    }
+                    write!(f, "]-")?;
+                    match rel_pattern.direction {
+                        RelationshipDirection::Outgoing => write!(f, ">")?,
+                        _ => {} // Incoming and Both end with -
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }

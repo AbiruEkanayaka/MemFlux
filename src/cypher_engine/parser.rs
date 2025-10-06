@@ -108,7 +108,12 @@ impl CypherParser {
 
     fn parse_match_clause(&mut self) -> Result<MatchQuery> {
         self.expect("MATCH")?;
-        let pattern = self.parse_pattern()?;
+        let mut patterns = Vec::new();
+        patterns.push(self.parse_pattern()?);
+        while self.current() == Some(",") {
+            self.advance(); // consume comma
+            patterns.push(self.parse_pattern()?);
+        }
 
         let where_clause = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("WHERE")) {
             self.advance();
@@ -117,7 +122,7 @@ impl CypherParser {
             None
         };
 
-        Ok(MatchQuery { pattern, where_clause })
+        Ok(MatchQuery { patterns, where_clause })
     }
 
     fn parse_merge_clause(&mut self) -> Result<MergeClause> {
@@ -232,12 +237,20 @@ impl CypherParser {
     }
 
     fn parse_pattern(&mut self) -> Result<Pattern> {
+        let variable = if self.tokens.get(self.pos + 1) == Some(&"=".to_string()) {
+            let var = self.parse_identifier()?;
+            self.expect("=")?;
+            Some(var)
+        } else {
+            None
+        };
+
         let mut parts = vec![self.parse_node_pattern()?];
         while self.current() == Some("-") || self.current() == Some("<") {
             parts.push(self.parse_relationship_pattern()?);
             parts.push(self.parse_node_pattern()?);
         }
-        Ok(Pattern { parts })
+        Ok(Pattern { parts, variable })
     }
 
     fn parse_node_pattern(&mut self) -> Result<PatternPart> {
@@ -419,10 +432,45 @@ impl CypherParser {
         } else if token == "{" {
             return self.parse_map_literal();
         } else {
-            let var = self.parse_identifier()?;
-            return Ok(Expression::Variable(var));
+            let identifier = self.parse_identifier()?;
+            if self.current() == Some("(") {
+                self.advance(); // consume (
+
+                if identifier.eq_ignore_ascii_case("shortestPath") {
+                    let pattern = self.parse_pattern()?;
+                    self.expect(")")?;
+                    return Ok(Expression::ShortestPath(Box::new(pattern)));
+                }
+
+                let args = self.parse_argument_list()?;
+                self.expect(")")?;
+                Ok(Expression::FunctionCall {
+                    func: identifier,
+                    args,
+                })
+            } else {
+                Ok(Expression::Variable(identifier))
+            }
         }
     }
+
+    fn parse_argument_list(&mut self) -> Result<Vec<Expression>> {
+        let mut args = Vec::new();
+        if self.current() == Some(")") {
+            return Ok(args);
+        }
+        loop {
+            args.push(self.parse_expression()?);
+            if self.current() == Some(",") {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(args)
+    }
+
+
 
     pub fn parse(&mut self) -> Result<CypherQuery> {
         let mut query = CypherQuery::default();

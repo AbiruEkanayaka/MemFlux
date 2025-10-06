@@ -1,5 +1,5 @@
 use crate::cypher_engine::ast::{self, Row};
-use crate::cypher_engine::logical_plan::{LogicalPlan};
+use crate::cypher_engine::logical_plan::{LogicalPlan, JoinType};
 use anyhow::Result;
 use crate::indexing::IndexManager;
 use serde_json::Value;
@@ -22,6 +22,7 @@ pub enum PhysicalPlan {
         end_node_var: String,
         rel_type: String,
         direction: ast::RelationshipDirection,
+        path_variable: Option<String>,
         input: Box<PhysicalPlan>,
         is_optional: bool,
         range: Option<(Option<u32>, Option<u32>)>,
@@ -33,6 +34,12 @@ pub enum PhysicalPlan {
     Projection {
         expressions: Vec<(ast::Expression, Option<String>)>, // expr, alias
         input: Box<PhysicalPlan>,
+    },
+    Join {
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+        condition: ast::Expression,
+        join_type: JoinType,
     },
     Create {
         pattern: ast::Pattern,
@@ -113,13 +120,14 @@ pub fn logical_to_physical_plan(
                 input: Box::new(logical_to_physical_plan(*input, index_manager)?),
             })
         }
-        LogicalPlan::Expand { start_node_var, rel_var, end_node_var, rel_type, direction, input, is_optional, range } => {
+        LogicalPlan::Expand { start_node_var, rel_var, end_node_var, rel_type, direction, path_variable, input, is_optional, range } => {
             Ok(PhysicalPlan::Expand {
                 start_node_var,
                 rel_var,
                 end_node_var,
                 rel_type,
                 direction,
+                path_variable,
                 input: Box::new(logical_to_physical_plan(*input, index_manager)?),
                 is_optional,
                 range,
@@ -129,6 +137,14 @@ pub fn logical_to_physical_plan(
             Ok(PhysicalPlan::Projection {
                 expressions,
                 input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+            })
+        }
+        LogicalPlan::Join { left, right, condition, join_type } => {
+            Ok(PhysicalPlan::Join {
+                left: Box::new(logical_to_physical_plan(*left, index_manager)?),
+                right: Box::new(logical_to_physical_plan(*right, index_manager)?),
+                condition,
+                join_type,
             })
         }
         LogicalPlan::Create { pattern, input } => {

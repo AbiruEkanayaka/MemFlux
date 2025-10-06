@@ -9,7 +9,7 @@ use futures::stream::{Stream, StreamExt, TryStreamExt};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-async fn evaluate_expression(expr: &ast::Expression, row: &Row) -> Result<Value> {
+async fn evaluate_expression(expr: &ast::Expression, row: &Row, ctx: Arc<AppContext>, transaction_handle: TransactionHandle) -> Result<Value> {
     match expr {
         ast::Expression::Literal(lit) => match lit {
             ast::LiteralValue::String(s) => Ok(Value::String(s.clone())),
@@ -18,23 +18,186 @@ async fn evaluate_expression(expr: &ast::Expression, row: &Row) -> Result<Value>
         },
         ast::Expression::Variable(var) => Ok(row.get(var).cloned().unwrap_or(Value::Null)),
         ast::Expression::Property(expr, prop_name) => {
-            let obj = Box::pin(evaluate_expression(expr, row)).await?;
+            let obj = Box::pin(evaluate_expression(expr, row, ctx, transaction_handle)).await?;
             Ok(obj.get(prop_name).cloned().unwrap_or(Value::Null))
         }
         ast::Expression::Map(props) => {
             let mut map = serde_json::Map::new();
             for (key, value_expr) in props {
-                let value = Box::pin(evaluate_expression(value_expr, row)).await?;
+                let value = Box::pin(evaluate_expression(value_expr, row, ctx.clone(), transaction_handle.clone())).await?;
                 map.insert(key.clone(), value);
             }
             Ok(Value::Object(map))
         }
         ast::Expression::BinaryOp { left, op, right } => {
-            let left_val = Box::pin(evaluate_expression(left, row)).await?;
-            let right_val = Box::pin(evaluate_expression(right, row)).await?;
+            let left_val = Box::pin(evaluate_expression(left, row, ctx.clone(), transaction_handle.clone())).await?;
+            let right_val = Box::pin(evaluate_expression(right, row, ctx, transaction_handle)).await?;
             match op.as_str() {
                 "=" => Ok(json!(left_val == right_val)),
                 _ => Err(anyhow!("Unsupported operator: {}", op)),
+            }
+        }
+        ast::Expression::FunctionCall { func, args } => {
+            let mut evaluated_args = Vec::new();
+            for arg in args {
+                evaluated_args.push(Box::pin(evaluate_expression(arg, row, ctx.clone(), transaction_handle.clone())).await?);
+            }
+
+            match func.to_lowercase().as_str() {
+                "id" => {
+                    if evaluated_args.len() != 1 { return Err(anyhow!("id() expects 1 argument")); }
+                    let entity = &evaluated_args[0];
+                    if let Some(id) = entity.get("_id").and_then(|v| v.as_str()) {
+                        Ok(json!(id))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
+                "labels" => {
+                    if evaluated_args.len() != 1 { return Err(anyhow!("labels() expects 1 argument")); }
+                    let entity = &evaluated_args[0];
+                    if let Some(label) = entity.get("_label").and_then(|v| v.as_str()) {
+                        Ok(json!([label]))
+                    } else {
+                        Ok(json!([]))
+                    }
+                }
+                "type" => {
+                    if evaluated_args.len() != 1 { return Err(anyhow!("type() expects 1 argument")); }
+                    let entity = &evaluated_args[0];
+                    if let Some(rel_type) = entity.get("_type").and_then(|v| v.as_str()) {
+                        Ok(json!(rel_type))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
+                "properties" => {
+                    if evaluated_args.len() != 1 { return Err(anyhow!("properties() expects 1 argument")); }
+                    let entity = &evaluated_args[0];
+                    if let Some(obj) = entity.as_object() {
+                        let mut new_obj = obj.clone();
+                        new_obj.retain(|k, _| !k.starts_with('_'));
+                        Ok(Value::Object(new_obj))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
+                "size" => {
+                    if evaluated_args.len() != 1 { return Err(anyhow!("size() expects 1 argument")); }
+                    let arg = &evaluated_args[0];
+                    if let Some(s) = arg.as_str() {
+                        Ok(json!(s.len() as i64))
+                    } else if let Some(arr) = arg.as_array() {
+                        Ok(json!(arr.len() as i64))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
+                _ => Err(anyhow!("Unsupported function: {}", func)),
+            }
+        }
+        ast::Expression::ShortestPath(pattern) => {
+            // 1. Extract start and end node variables from the pattern.
+            let start_node_pattern = pattern.parts.get(0).and_then(|p| if let ast::PatternPart::Node(n) = p { Some(n) } else { None }).ok_or_else(|| anyhow!("shortestPath pattern must start with a node"))?;
+            let end_node_pattern = pattern.parts.get(2).and_then(|p| if let ast::PatternPart::Node(n) = p { Some(n) } else { None }).ok_or_else(|| anyhow!("shortestPath pattern must have an end node"))?;
+            let rel_pattern = pattern.parts.get(1).and_then(|p| if let ast::PatternPart::Relationship(r) = p { Some(r) } else { None }).ok_or_else(|| anyhow!("shortestPath pattern must have a relationship"))?;
+
+            let start_var = start_node_pattern.variable.as_ref().ok_or_else(|| anyhow!("shortestPath start node must be a bound variable"))?;
+            let end_var = end_node_pattern.variable.as_ref().ok_or_else(|| anyhow!("shortestPath end node must be a bound variable"))?;
+
+            // 2. Get node IDs from the current row context.
+            let start_node_obj = row.get(start_var).ok_or_else(|| anyhow!("Start node variable '{}' not found in row", start_var))?;
+            let end_node_obj = row.get(end_var).ok_or_else(|| anyhow!("End node variable '{}' not found in row", end_var))?;
+            let start_id = start_node_obj.get("_id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("Start node ID not found"))?.to_string();
+            let end_id = end_node_obj.get("_id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("End node ID not found"))?.to_string();
+
+            if start_id == end_id {
+                return Ok(json!([start_node_obj]));
+            }
+
+            // 3. Perform BFS.
+            let mut q: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+            q.push_back(start_id.clone());
+
+            let mut predecessors: std::collections::HashMap<String, (String, Value)> = std::collections::HashMap::new();
+            let mut visited = std::collections::HashSet::new();
+            visited.insert(start_id.clone());
+
+            let tx_guard = transaction_handle.read().await;
+            let tx_opt = tx_guard.as_ref();
+
+            let mut found = false;
+
+            let rel_type_filter = if rel_pattern.types.is_empty() {
+                "*".to_string()
+            } else {
+                rel_pattern.types[0].clone()
+            };
+
+            while let Some(current_node_id) = q.pop_front() {
+                if current_node_id == end_id {
+                    found = true;
+                    break;
+                }
+
+                let out_prefix_base = format!("_edge:out:{}:", current_node_id);
+                for entry in ctx.db.iter() {
+                    if entry.key().starts_with(&out_prefix_base) {
+                        let parts: Vec<&str> = entry.key().split(':').collect();
+                        if parts.len() < 5 { continue; } // _edge:out:start_id:type:end_id
+
+                        let rel_type_in_db = parts[3]; // The actual relationship type in the DB
+
+                        if rel_type_filter == "*" || rel_type_filter == rel_type_in_db {
+                            // This is a match
+                            let neighbor_id = parts[4].to_string();
+
+                            if !visited.contains(&neighbor_id) {
+                                visited.insert(neighbor_id.clone());
+                                if let Some(DbValue::JsonB(rel_bytes)) = get_visible_db_value(entry.key(), &ctx, tx_opt).await {
+                                    let mut rel_props = serde_json::from_slice::<Value>(&rel_bytes)?;
+                                    if let Some(obj) = rel_props.as_object_mut() {
+                                        obj.insert("_start_id".to_string(), json!(current_node_id));
+                                        obj.insert("_end_id".to_string(), json!(neighbor_id));
+                                    }
+
+                                    predecessors.insert(neighbor_id.clone(), (current_node_id.clone(), rel_props));
+                                    q.push_back(neighbor_id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 4. Reconstruct path.
+            if found {
+                let mut path = std::collections::VecDeque::new();
+                let mut current_id = end_id;
+
+                while current_id != start_id {
+                    let (predecessor_id, rel_obj) = predecessors.get(&current_id).ok_or_else(|| anyhow!("Path reconstruction failed"))?;
+                    
+                    // Fetch the node object for the current ID
+                    let pk_key = format!("_pk_node:{}", current_id);
+                    let label = String::from_utf8(get_visible_db_value(&pk_key, &ctx, tx_opt).await.and_then(|v| if let DbValue::Bytes(b) = v { Some(b) } else { None }).unwrap_or_default())?;
+                    let node_key = format!("_node:{}:{}", label, current_id);
+                    let node_bytes = get_visible_db_value(&node_key, &ctx, tx_opt).await.and_then(|v| if let DbValue::JsonB(b) = v { Some(b) } else { None }).unwrap_or_default();
+                    let mut node_obj = serde_json::from_slice::<Value>(&node_bytes)?;
+                    if let Some(obj) = node_obj.as_object_mut() {
+                        obj.insert("_id".to_string(), json!(current_id));
+                        obj.insert("_label".to_string(), json!(label));
+                    }
+
+                    path.push_front(node_obj);
+                    path.push_front(rel_obj.clone());
+                    
+                    current_id = predecessor_id.clone();
+                }
+                path.push_front(start_node_obj.clone());
+                Ok(json!(path))
+            } else {
+                Ok(Value::Null)
             }
         }
     }
@@ -117,18 +280,21 @@ pub fn execute<'a>(
                     // Fallback to a full scan if index doesn't exist, though planner should prevent this.
                 }
             }
-            PhysicalPlan::Expand { start_node_var, rel_var, end_node_var, rel_type, direction, input, is_optional, range } => {
+            PhysicalPlan::Expand { start_node_var, rel_var, end_node_var, rel_type, direction, path_variable, input, is_optional, range } => {
                 let mut stream = Box::pin(execute(*input, ctx.clone(), transaction_handle.clone()));
                 while let Some(start_row_result) = stream.next().await {
                     let start_row = start_row_result?;
                     let start_node_obj = start_row.get(&start_node_var).ok_or_else(|| anyhow!("Start node variable '{}' not found", start_node_var))?;
-                    
+
                     if start_node_obj.is_null() {
                         if is_optional {
                             let mut null_row = start_row.clone();
                             if let Some(obj) = null_row.as_object_mut() {
                                 obj.insert(end_node_var.clone(), Value::Null);
                                 obj.insert(rel_var.clone(), Value::Null);
+                                if let Some(path_var) = &path_variable {
+                                    obj.insert(path_var.clone(), Value::Null);
+                                }
                             }
                             yield null_row;
                         }
@@ -144,13 +310,13 @@ pub fn execute<'a>(
                         let min_depth = min_raw.unwrap_or(1);
                         let max_depth = max_raw.unwrap_or(5); // Default max depth to 5 if unbounded to prevent explosions
 
-                        let mut q: std::collections::VecDeque<(String, u32)> = std::collections::VecDeque::new();
-                        q.push_back((start_node_id.to_string(), 0));
-                        
+                        let mut q: std::collections::VecDeque<(String, u32, Vec<Value>)> = std::collections::VecDeque::new();
+                        q.push_back((start_node_id.to_string(), 0, vec![start_node_obj.clone()]));
+
                         let mut visited_nodes = std::collections::HashSet::new();
                         visited_nodes.insert(start_node_id.to_string());
 
-                        while let Some((current_id, current_depth)) = q.pop_front() {
+                        while let Some((current_id, current_depth, current_path)) = q.pop_front() {
                             if current_depth >= max_depth {
                                 continue;
                             }
@@ -178,24 +344,35 @@ pub fn execute<'a>(
 
                                             if let Some(DbValue::JsonB(end_node_bytes)) = get_visible_db_value(&end_node_key, &ctx, tx_guard.as_ref()).await {
                                                 let next_depth = current_depth + 1;
+
+                                                let mut end_node_props = serde_json::from_slice::<Value>(&end_node_bytes)?;
+                                                if let Some(obj) = end_node_props.as_object_mut() {
+                                                    obj.insert("_id".to_string(), json!(end_node_id));
+                                                    obj.insert("_label".to_string(), json!(end_node_label.clone()));
+                                                }
+                                                let mut rel_props = serde_json::from_slice::<Value>(&rel_bytes)?;
+                                                if let Some(obj) = rel_props.as_object_mut() {
+                                                    obj.insert("_type".to_string(), json!(rel_type));
+                                                }
+
+                                                let mut new_path = current_path.clone();
+                                                new_path.push(rel_props.clone());
+                                                new_path.push(end_node_props.clone());
+
                                                 if next_depth >= min_depth {
                                                     matched_once = true;
-                                                    let mut end_node_props = serde_json::from_slice::<Value>(&end_node_bytes)?;
-                                                    if let Some(obj) = end_node_props.as_object_mut() {
-                                                        obj.insert("_id".to_string(), json!(end_node_id));
-                                                        obj.insert("_label".to_string(), json!(end_node_label.clone()));
-                                                    }
-                                                    let rel_props = serde_json::from_slice::<Value>(&rel_bytes)?;
-
                                                     let mut new_row = start_row.clone();
                                                     if let Some(obj) = new_row.as_object_mut() {
-                                                        obj.insert(end_node_var.clone(), end_node_props);
-                                                        // Simplified: rel_var is just the last rel in the path
-                                                        obj.insert(rel_var.clone(), rel_props);
+                                                        obj.insert(end_node_var.clone(), end_node_props.clone());
+                                                        obj.insert(rel_var.clone(), rel_props.clone());
+                                                        if let Some(path_var) = &path_variable {
+                                                            obj.insert(path_var.clone(), json!(new_path));
+                                                        }
                                                     }
                                                     yield new_row;
                                                 }
-                                                q.push_back((end_node_id.to_string(), next_depth));
+
+                                                q.push_back((end_node_id.to_string(), next_depth, new_path));
                                                 visited_nodes.insert(end_node_id.to_string());
                                             }
                                         }
@@ -244,8 +421,13 @@ pub fn execute<'a>(
                                             matched_once = true;
                                             let mut new_row = start_row.clone();
                                             if let Some(obj) = new_row.as_object_mut() {
-                                                obj.insert(end_node_var.clone(), end_node_props);
-                                                obj.insert(rel_var.clone(), rel_props); // Insert rel properties
+                                                obj.insert(end_node_var.clone(), end_node_props.clone());
+                                                obj.insert(rel_var.clone(), rel_props.clone()); // Insert rel properties
+
+                                                if let Some(path_var) = &path_variable {
+                                                    let path_list = vec![start_node_obj.clone(), rel_props, end_node_props];
+                                                    obj.insert(path_var.clone(), json!(path_list));
+                                                }
                                             }
                                             yield new_row;
                                         }
@@ -260,6 +442,9 @@ pub fn execute<'a>(
                         if let Some(obj) = new_row.as_object_mut() {
                             obj.insert(end_node_var.clone(), Value::Null);
                             obj.insert(rel_var.clone(), Value::Null);
+                            if let Some(path_var) = &path_variable {
+                                obj.insert(path_var.clone(), Value::Null);
+                            }
                         }
                         yield new_row;
                     }
@@ -269,7 +454,7 @@ pub fn execute<'a>(
                 let mut stream = Box::pin(execute(*input, ctx.clone(), transaction_handle.clone()));
                 while let Some(row_result) = stream.next().await {
                     let row = row_result?;
-                    if evaluate_expression(&predicate, &row).await?.as_bool().unwrap_or(false) {
+                    if evaluate_expression(&predicate, &row, ctx.clone(), transaction_handle.clone()).await?.as_bool().unwrap_or(false) {
                         yield row;
                     }
                 }
@@ -280,7 +465,7 @@ pub fn execute<'a>(
                     let row = row_result?;
                     let mut new_row = json!({});
                     for (expr, alias) in &expressions {
-                        let value = evaluate_expression(expr, &row).await?;
+                        let value = evaluate_expression(expr, &row, ctx.clone(), transaction_handle.clone()).await?;
                         let key = match alias {
                             Some(a) => a.clone(),
                             None => match expr {
@@ -357,7 +542,7 @@ pub fn execute<'a>(
                             // This is a new node to create.
                             let label = node_pattern.labels.get(0).cloned().unwrap_or_default();
                             let properties_val = if let Some(props_expr) = &node_pattern.properties {
-                                evaluate_expression(props_expr, &input_row).await?
+                                evaluate_expression(props_expr, &input_row, ctx.clone(), transaction_handle.clone()).await?
                             } else {
                                 json!({})
                             };
@@ -419,7 +604,7 @@ pub fn execute<'a>(
 
                             let rel_type = rel_pattern.types.get(0).cloned().unwrap_or_default();
                             let properties_val = if let Some(props_expr) = &rel_pattern.properties {
-                                evaluate_expression(props_expr, &input_row).await?
+                                evaluate_expression(props_expr, &input_row, ctx.clone(), transaction_handle.clone()).await?
                             } else {
                                 json!({})
                             };
@@ -441,7 +626,7 @@ pub fn execute<'a>(
                                 let entity_val = row.get(var_name).ok_or_else(|| anyhow!("Variable '{}' not found for SET", var_name))?;
                                 let entity_id = entity_val.get("_id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("Entity ID not found for variable '{}'", var_name))?;
                                 
-                                let value_to_set = evaluate_expression(&item.expression, &row).await?;
+                                let value_to_set = evaluate_expression(&item.expression, &row, ctx.clone(), transaction_handle.clone()).await?;
                                 let value_bytes = serde_json::to_vec(&value_to_set)?;
 
                                 // Check if it's a node or relationship. Nodes have a _label.
@@ -576,6 +761,22 @@ pub fn execute<'a>(
                         let mut stream = Box::pin(execute(create_plan, ctx.clone(), transaction_handle.clone()));
                         while let Some(row) = stream.next().await {
                             yield row?;
+                        }
+                    }
+                }
+            }
+            PhysicalPlan::Join { left, right, condition, join_type: _ } => {
+                let left_rows: Vec<Row> = Box::pin(execute(*left, ctx.clone(), transaction_handle.clone())).try_collect().await?;
+                let right_rows: Vec<Row> = Box::pin(execute(*right, ctx.clone(), transaction_handle.clone())).try_collect().await?;
+
+                for l_row in left_rows {
+                    for r_row in &right_rows {
+                        let mut combined = l_row.as_object().unwrap().clone();
+                        combined.extend(r_row.as_object().unwrap().clone());
+                        let combined_row = json!(combined);
+
+                        if evaluate_expression(&condition, &combined_row, ctx.clone(), transaction_handle.clone()).await?.as_bool().unwrap_or(false) {
+                            yield combined_row;
                         }
                     }
                 }

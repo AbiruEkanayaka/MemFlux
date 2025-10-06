@@ -28,9 +28,8 @@ from tests.test_cte import test_cte
 from tests.test_transactions import test_transactions
 from tests.test_vacuum import test_vacuum
 from tests.test_graph import test_graph
-from tests.test_cypher import test_cypher
-from tests.test_cypher_writes import test_cypher_writes
 from tests.test_cypher_advanced import test_cypher_advanced
+from tests.test_cypher_functions_and_paths import test_cypher_functions_and_paths
 
 
 # Add prompt_toolkit for better interactive input
@@ -96,16 +95,18 @@ def unit_test(conn, reader, mode, ffi_path=None):
         test_cte(conn, reader)
     if mode in ("transactions", "all"):
         test_transactions(conn, reader, ffi_path=ffi_path)
-    if mode in ("vacuum", "all"): # Add this block
+    if mode in ("vacuum", "all"):
         test_vacuum(conn, reader, ffi_path=ffi_path)
-    if mode in ("graph", "all"): # Add this block
+    if mode in ("graph", "all"):
         test_graph(conn, reader)
-    if mode in ("cypher", "all"): # Add this block
+    if mode in ("cypher", "all"):
         test_cypher(conn, reader)
-    if mode in ("cypher_writes", "all"): # Add this block
+    if mode in ("cypher_writes", "all"):
         test_cypher_writes(conn, reader)
-    if mode in ("cypher_advanced", "all"): # Add this block
+    if mode in ("cypher_advanced", "all"):
         test_cypher_advanced(conn, reader)
+    if mode in ("cypher_features", "all"):
+        test_cypher_functions_and_paths(conn, reader)
     
     return conn, reader
 
@@ -189,7 +190,7 @@ if __name__ == "__main__":
                         print(f"Send: {send:.2f}ms, Latency: {lat:.2f}ms, Total: {tot:.2f}ms")
             elif parsed_args.command == "unit":
                 if not parsed_args.args:
-                    print("Usage: python test.py unit {json,byte,lists,sets,sql,snapshot,types,schema,aliases,case,like,functions,union,advanced,operators,indexing,recovery,wrongtype,constraints,ddl_enhancements,dml_enhancements,dql_enhancements,cte,transactions,vacuum,graph,cypher,cypher_writes,cypher_advanced,all}")
+                    print("Usage: python test.py unit {json,byte,lists,sets,sql,snapshot,types,schema,aliases,case,like,functions,union,advanced,operators,indexing,recovery,wrongtype,constraints,ddl_enhancements,dml_enhancements,dql_enhancements,cte,transactions,vacuum,graph,cypher,cypher_writes,cypher_advanced,cypher_features,all}")
                     sys.exit(1)
                 mode = parsed_args.args[0]
                 try:
