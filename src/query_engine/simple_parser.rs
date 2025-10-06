@@ -1352,6 +1352,43 @@ impl Parser {
             };
 
             Ok(super::ast::TableReference::Subquery(Box::new(subquery), alias))
+        } else if self.current().map_or(false, |t| t.eq_ignore_ascii_case("GRAPH_MATCH")) {
+            self.advance(); // consume GRAPH_MATCH
+            self.expect("(")?;
+            let query = self.current().ok_or_else(|| anyhow!("Expected Cypher query string literal"))?;
+            if !query.starts_with('\'') || !query.ends_with('\'') {
+                return Err(anyhow!("Cypher query must be a string literal"));
+            }
+            let query_str = query[1..query.len() - 1].to_string();
+            self.advance();
+            self.expect(")")?;
+
+            self.expect("RETURNS")?;
+            self.expect("(")?;
+            let mut returns = Vec::new();
+            loop {
+                let cypher_var = self.parse_qualified_name()?; // e.g., p.name
+                self.expect("AS")?;
+                let sql_col = self.parse_identifier()?;
+                returns.push((cypher_var, sql_col));
+                if self.current() == Some(",") {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            self.expect(")")?;
+
+            if self.current().map_or(false, |t| t.eq_ignore_ascii_case("AS")) {
+                self.advance()
+            };
+            let alias_name = self.parse_identifier().map_err(|_| anyhow!("GRAPH_MATCH clause must have an alias"))?;
+
+            Ok(super::ast::TableReference::GraphMatch {
+                query: query_str,
+                returns,
+                alias: alias_name,
+            })
         } else {
             let table_name = self.parse_qualified_name()?;
             let mut alias = None;

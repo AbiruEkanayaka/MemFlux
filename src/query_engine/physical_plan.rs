@@ -10,6 +10,11 @@ pub enum PhysicalPlan {
     TableScan {
         prefix: String,
     },
+    GraphMatch {
+        query: String,
+        returns: Vec<(String, String)>,
+        alias: String,
+    },
     IndexScan {
         index_name: String,
         key: Value,
@@ -319,6 +324,9 @@ pub fn logical_to_physical_plan(
             union_all,
         }),
         LogicalPlan::WorkingTableScan { cte_name, alias } => Ok(PhysicalPlan::WorkingTableScan { cte_name, alias }),
+        LogicalPlan::GraphMatch { query, returns, alias } => {
+            Ok(PhysicalPlan::GraphMatch { query, returns, alias })
+        },
         LogicalPlan::BeginTransaction => Ok(PhysicalPlan::BeginTransaction),
         LogicalPlan::CommitTransaction => Ok(PhysicalPlan::CommitTransaction),
         LogicalPlan::RollbackTransaction => Ok(PhysicalPlan::RollbackTransaction),

@@ -13,6 +13,11 @@ pub enum SimpleValue {
 pub enum TableReference {
     Table { name: String, alias: Option<String> },
     Subquery(Box<SelectStatement>, String), // Subquery and its alias
+    GraphMatch {
+        query: String,
+        returns: Vec<(String, String)>, // (cypher_variable, sql_column_name)
+        alias: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]

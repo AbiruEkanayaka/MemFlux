@@ -1344,6 +1344,28 @@ pub fn execute<'a>(
                     }
                 }
             }
+            PhysicalPlan::GraphMatch { query, returns, alias } => {
+                let ast = crate::cypher_engine::parser::parse_cypher(&query)?;
+                let logical_plan = crate::cypher_engine::logical_plan::ast_to_logical_plan(ast, &ctx.index_manager)?;
+                let physical_plan = crate::cypher_engine::physical_plan::logical_to_physical_plan(logical_plan, &ctx.index_manager)?;
+
+                let handle = transaction_handle.clone().expect("GRAPH_MATCH requires an active transaction");
+                let mut cypher_stream = Box::pin(crate::cypher_engine::execution::execute(physical_plan, ctx.clone(), handle));
+
+                while let Some(cypher_row_result) = cypher_stream.next().await {
+                    let cypher_row = cypher_row_result?;
+                    let mut sql_sub_row = json!({});
+
+                    for (cypher_var, sql_col) in &returns {
+                        let val = cypher_row.get(cypher_var).cloned().unwrap_or(Value::Null);
+                        sql_sub_row[sql_col.clone()] = val;
+                    }
+
+                    let mut sql_row = json!({});
+                    sql_row[alias.clone()] = sql_sub_row;
+                    yield sql_row;
+                }
+            }
             PhysicalPlan::RecursiveCteScan { alias, column_aliases, non_recursive, recursive, union_all } => {
                 let get_projection_columns = |plan: &PhysicalPlan| -> Option<Vec<String>> {
                     let mut current_plan = plan;

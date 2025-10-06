@@ -690,6 +690,11 @@ impl fmt::Display for Operator {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LogicalPlan {
     TableScan { table_name: String },
+    GraphMatch {
+        query: String,
+        returns: Vec<(String, String)>,
+        alias: String,
+    },
     SubqueryScan { alias: String, input: Box<LogicalPlan> },
     RecursiveCteScan {
         alias: String,
@@ -1103,6 +1108,9 @@ fn ast_to_logical_plan_inner(
                     // Subquery validation is complex; we'd need to infer its output schema.
                     // For now, we skip validation for columns coming from a subquery.
                 }
+                TableReference::GraphMatch {..} => {
+                    // Validation for GRAPH_MATCH columns is handled by the cypher engine.
+                }
             }
 
             for join in &statement.joins {
@@ -1166,6 +1174,9 @@ fn ast_to_logical_plan_inner(
                         input: Box::new(sub_plan),
                     }
                 }
+                TableReference::GraphMatch { query, returns, alias } => {
+                    LogicalPlan::GraphMatch { query, returns, alias }
+                }
             };
 
             for join in statement.joins {
@@ -1204,6 +1215,9 @@ fn ast_to_logical_plan_inner(
                             alias,
                             input: Box::new(sub_plan),
                         }
+                    }
+                    TableReference::GraphMatch { query, returns, alias } => {
+                        LogicalPlan::GraphMatch { query, returns, alias }
                     }
                 };
 
