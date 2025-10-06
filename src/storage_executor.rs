@@ -1910,7 +1910,72 @@ impl StorageExecutor {
                 Err(_) => Response::Error("Failed to serialize updated properties".to_string()),
             }
         } else {
-            Response::Error("REMOVE must be used within a transaction".to_string())
+            // Non-transactional path (auto-commit)
+            drop(tx_guard);
+            let txid = self.ctx.tx_id_manager.new_txid();
+            self.ctx.tx_status_manager.begin(txid);
+
+            let pk_key = format!("_pk_node:{}", node_id);
+            let label = match get_visible_db_value(&pk_key, &self.ctx, None).await {
+                Some(DbValue::Bytes(label_bytes)) => String::from_utf8(label_bytes).unwrap_or_default(),
+                _ => { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+            };
+            if label.is_empty() { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+
+            let node_key = format!("_node:{}:{}", label, node_id);
+            let version_chain_arc = match self.ctx.db.get(&node_key) {
+                Some(vc) => vc.clone(),
+                None => { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+            };
+
+            let mut version_chain = version_chain_arc.write().await;
+            let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
+
+            if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager)) {
+                let current_props_bytes = match &latest_version.value {
+                    DbValue::JsonB(bytes) => bytes.clone(),
+                    _ => { self.ctx.tx_status_manager.abort(txid); return Response::Error("WRONGTYPE: Node data is not JSONB".to_string()); }
+                };
+
+                let mut props: Value = match serde_json::from_slice(&current_props_bytes) {
+                    Ok(p) => p,
+                    Err(_) => { self.ctx.tx_status_manager.abort(txid); return Response::Error("Failed to deserialize node properties".to_string()); }
+                };
+
+                if let Some(obj) = props.as_object_mut() {
+                    if obj.remove(&property).is_none() {
+                        self.ctx.tx_status_manager.abort(txid);
+                        return Response::Integer(0);
+                    }
+                } else {
+                    self.ctx.tx_status_manager.abort(txid);
+                    return Response::Error("Node properties are not a JSON object".to_string());
+                }
+
+                match serde_json::to_vec(&props) {
+                    Ok(new_props_bytes) => {
+                        let log_entry = LogEntry::RemoveNodeProperty { id: node_id, property };
+                        if !matches!(log_to_wal(log_entry, &self.ctx).await, Response::Ok) {
+                            self.ctx.tx_status_manager.abort(txid);
+                            return Response::Error("WAL write error".to_string());
+                        }
+
+                        latest_version.expirer_txid = txid;
+                        let new_version = crate::types::VersionedValue {
+                            value: DbValue::JsonB(new_props_bytes),
+                            creator_txid: txid,
+                            expirer_txid: 0,
+                        };
+                        version_chain.push(new_version);
+                        self.ctx.tx_status_manager.commit(txid);
+                        Response::Integer(1)
+                    }
+                    Err(_) => { self.ctx.tx_status_manager.abort(txid); Response::Error("Failed to serialize updated properties".to_string()) }
+                }
+            } else {
+                self.ctx.tx_status_manager.abort(txid);
+                Response::Integer(0)
+            }
         }
     }
 
@@ -1966,7 +2031,88 @@ impl StorageExecutor {
                 Err(_) => Response::Error("Failed to serialize updated properties".to_string()),
             }
         } else {
-            Response::Error("REMOVE must be used within a transaction".to_string())
+            // Non-transactional path (auto-commit)
+            drop(tx_guard);
+            let txid = self.ctx.tx_id_manager.new_txid();
+            self.ctx.tx_status_manager.begin(txid);
+
+            let pk_key = format!("_pk_rel:{}", rel_id);
+            let pk_val = match get_visible_db_value(&pk_key, &self.ctx, None).await {
+                Some(DbValue::Bytes(pk_val_bytes)) => String::from_utf8(pk_val_bytes).unwrap_or_default(),
+                _ => { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+            };
+            if pk_val.is_empty() { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+
+            let parts: Vec<&str> = pk_val.splitn(3, ':').collect();
+            if parts.len() != 3 { self.ctx.tx_status_manager.abort(txid); return Response::Error("Invalid relationship PK value".to_string()); }
+
+            let out_key = format!("_edge:out:{}", pk_val);
+            let in_key = format!("_edge:in:{}:{}:{}", parts[2], parts[1], parts[0]);
+
+            let out_version_chain_arc = match self.ctx.db.get(&out_key) {
+                Some(vc) => vc.clone(),
+                None => { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+            };
+            let in_version_chain_arc = match self.ctx.db.get(&in_key) {
+                Some(vc) => vc.clone(),
+                None => { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+            };
+
+            let mut out_version_chain = out_version_chain_arc.write().await;
+            let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
+
+            if let Some(latest_version) = out_version_chain.iter_mut().rev().find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager)) {
+                let current_props_bytes = match &latest_version.value {
+                    DbValue::JsonB(bytes) => bytes.clone(),
+                    _ => { self.ctx.tx_status_manager.abort(txid); return Response::Error("WRONGTYPE: Rel data is not JSONB".to_string()); }
+                };
+
+                let mut props: Value = match serde_json::from_slice(&current_props_bytes) {
+                    Ok(p) => p,
+                    Err(_) => { self.ctx.tx_status_manager.abort(txid); return Response::Error("Failed to deserialize rel properties".to_string()); }
+                };
+
+                if let Some(obj) = props.as_object_mut() {
+                    if obj.remove(&property).is_none() {
+                        self.ctx.tx_status_manager.abort(txid);
+                        return Response::Integer(0);
+                    }
+                } else {
+                    self.ctx.tx_status_manager.abort(txid);
+                    return Response::Error("Rel properties are not a JSON object".to_string());
+                }
+
+                match serde_json::to_vec(&props) {
+                    Ok(new_props_bytes) => {
+                        let log_entry = LogEntry::RemoveRelationshipProperty { id: rel_id, property };
+                        if !matches!(log_to_wal(log_entry, &self.ctx).await, Response::Ok) {
+                            self.ctx.tx_status_manager.abort(txid);
+                            return Response::Error("WAL write error".to_string());
+                        }
+
+                        latest_version.expirer_txid = txid;
+                        let new_version = crate::types::VersionedValue {
+                            value: DbValue::JsonB(new_props_bytes.clone()),
+                            creator_txid: txid,
+                            expirer_txid: 0,
+                        };
+                        out_version_chain.push(new_version.clone());
+
+                        let mut in_version_chain = in_version_chain_arc.write().await;
+                        if let Some(in_latest) = in_version_chain.iter_mut().rev().find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager)) {
+                            in_latest.expirer_txid = txid;
+                        }
+                        in_version_chain.push(new_version);
+
+                        self.ctx.tx_status_manager.commit(txid);
+                        Response::Integer(1)
+                    }
+                    Err(_) => { self.ctx.tx_status_manager.abort(txid); Response::Error("Failed to serialize updated properties".to_string()) }
+                }
+            } else {
+                self.ctx.tx_status_manager.abort(txid);
+                Response::Integer(0)
+            }
         }
     }
 
@@ -2027,7 +2173,90 @@ impl StorageExecutor {
                 Err(_) => Response::Error("Failed to serialize updated properties".to_string()),
             }
         } else {
-            Response::Error("SET must be used within a transaction".to_string())
+            // Non-transactional path (auto-commit)
+            drop(tx_guard);
+            let txid = self.ctx.tx_id_manager.new_txid();
+            self.ctx.tx_status_manager.begin(txid);
+
+            let pk_key = format!("_pk_rel:{}", rel_id);
+            let pk_val = match get_visible_db_value(&pk_key, &self.ctx, None).await {
+                Some(DbValue::Bytes(pk_val_bytes)) => String::from_utf8(pk_val_bytes).unwrap_or_default(),
+                _ => { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+            };
+            if pk_val.is_empty() { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+
+            let parts: Vec<&str> = pk_val.splitn(3, ':').collect();
+            if parts.len() != 3 { self.ctx.tx_status_manager.abort(txid); return Response::Error("Invalid relationship PK value".to_string()); }
+
+            let out_key = format!("_edge:out:{}", pk_val);
+            let in_key = format!("_edge:in:{}:{}:{}", parts[2], parts[1], parts[0]);
+
+            let out_version_chain_arc = match self.ctx.db.get(&out_key) {
+                Some(vc) => vc.clone(),
+                None => { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+            };
+            let in_version_chain_arc = match self.ctx.db.get(&in_key) {
+                Some(vc) => vc.clone(),
+                None => { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+            };
+
+            let mut out_version_chain = out_version_chain_arc.write().await;
+            let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
+
+            if let Some(latest_version) = out_version_chain.iter_mut().rev().find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager)) {
+                let current_props_bytes = match &latest_version.value {
+                    DbValue::JsonB(bytes) => bytes.clone(),
+                    _ => { self.ctx.tx_status_manager.abort(txid); return Response::Error("WRONGTYPE: Rel data is not JSONB".to_string()); }
+                };
+
+                let mut props: Value = match serde_json::from_slice(&current_props_bytes) {
+                    Ok(p) => p,
+                    Err(_) => { self.ctx.tx_status_manager.abort(txid); return Response::Error("Failed to deserialize rel properties".to_string()); }
+                };
+                let new_value: Value = match serde_json::from_slice(&value_bytes) {
+                    Ok(v) => v,
+                    Err(_) => { self.ctx.tx_status_manager.abort(txid); return Response::Error("Invalid JSON format for value".to_string()); }
+                };
+
+                if let Some(obj) = props.as_object_mut() {
+                    obj.insert(property.clone(), new_value);
+                } else {
+                    self.ctx.tx_status_manager.abort(txid);
+                    return Response::Error("Rel properties are not a JSON object".to_string());
+                }
+
+                match serde_json::to_vec(&props) {
+                    Ok(new_props_bytes) => {
+                        let log_entry = LogEntry::SetRelationshipProperty { id: rel_id, property, value: value_bytes };
+                        if !matches!(log_to_wal(log_entry, &self.ctx).await, Response::Ok) {
+                            self.ctx.tx_status_manager.abort(txid);
+                            return Response::Error("WAL write error".to_string());
+                        }
+
+                        latest_version.expirer_txid = txid;
+                        let new_version = crate::types::VersionedValue {
+                            value: DbValue::JsonB(new_props_bytes.clone()),
+                            creator_txid: txid,
+                            expirer_txid: 0,
+                        };
+                        out_version_chain.push(new_version.clone());
+
+                        // Also update the IN edge
+                        let mut in_version_chain = in_version_chain_arc.write().await;
+                        if let Some(in_latest) = in_version_chain.iter_mut().rev().find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager)) {
+                            in_latest.expirer_txid = txid;
+                        }
+                        in_version_chain.push(new_version);
+
+                        self.ctx.tx_status_manager.commit(txid);
+                        Response::Integer(1)
+                    }
+                    Err(_) => { self.ctx.tx_status_manager.abort(txid); Response::Error("Failed to serialize updated properties".to_string()) }
+                }
+            } else {
+                self.ctx.tx_status_manager.abort(txid);
+                Response::Integer(0) // No visible version of the relationship found
+            }
         }
     }
 
@@ -2087,8 +2316,73 @@ impl StorageExecutor {
                 Err(_) => Response::Error("Failed to serialize updated properties".to_string()),
             }
         } else {
-            // Non-transactional context not supported for this operation for simplicity
-            Response::Error("SETNODEPROP must be used within a transaction".to_string())
+            // Non-transactional path (auto-commit)
+            drop(tx_guard);
+            let txid = self.ctx.tx_id_manager.new_txid();
+            self.ctx.tx_status_manager.begin(txid);
+
+            let pk_key = format!("_pk_node:{}", node_id);
+            let label = match get_visible_db_value(&pk_key, &self.ctx, None).await {
+                Some(DbValue::Bytes(label_bytes)) => String::from_utf8(label_bytes).unwrap_or_default(),
+                _ => { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+            };
+            if label.is_empty() { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+
+            let node_key = format!("_node:{}:{}", label, node_id);
+            let version_chain_arc = match self.ctx.db.get(&node_key) {
+                Some(vc) => vc.clone(),
+                None => { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+            };
+
+            let mut version_chain = version_chain_arc.write().await;
+            let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
+
+            if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager)) {
+                let current_props_bytes = match &latest_version.value {
+                    DbValue::JsonB(bytes) => bytes.clone(),
+                    _ => { self.ctx.tx_status_manager.abort(txid); return Response::Error("WRONGTYPE: Node data is not JSONB".to_string()); }
+                };
+
+                let mut props: Value = match serde_json::from_slice(&current_props_bytes) {
+                    Ok(p) => p,
+                    Err(_) => { self.ctx.tx_status_manager.abort(txid); return Response::Error("Failed to deserialize node properties".to_string()); }
+                };
+                let new_value: Value = match serde_json::from_slice(&value_bytes) {
+                    Ok(v) => v,
+                    Err(_) => { self.ctx.tx_status_manager.abort(txid); return Response::Error("Invalid JSON format for value".to_string()); }
+                };
+
+                if let Some(obj) = props.as_object_mut() {
+                    obj.insert(property.clone(), new_value);
+                } else {
+                    self.ctx.tx_status_manager.abort(txid);
+                    return Response::Error("Node properties are not a JSON object".to_string());
+                }
+
+                match serde_json::to_vec(&props) {
+                    Ok(new_props_bytes) => {
+                        let log_entry = LogEntry::SetNodeProperty { id: node_id, property, value: value_bytes };
+                        if !matches!(log_to_wal(log_entry, &self.ctx).await, Response::Ok) {
+                            self.ctx.tx_status_manager.abort(txid);
+                            return Response::Error("WAL write error".to_string());
+                        }
+
+                        latest_version.expirer_txid = txid;
+                        let new_version = crate::types::VersionedValue {
+                            value: DbValue::JsonB(new_props_bytes),
+                            creator_txid: txid,
+                            expirer_txid: 0,
+                        };
+                        version_chain.push(new_version);
+                        self.ctx.tx_status_manager.commit(txid);
+                        Response::Integer(1)
+                    }
+                    Err(_) => { self.ctx.tx_status_manager.abort(txid); Response::Error("Failed to serialize updated properties".to_string()) }
+                }
+            } else {
+                self.ctx.tx_status_manager.abort(txid);
+                Response::Integer(0) // No visible version of the node found
+            }
         }
     }
 

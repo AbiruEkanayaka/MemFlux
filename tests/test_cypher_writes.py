@@ -76,7 +76,6 @@ def test_cypher_writes(sock, reader):
 
     # --- 3. SET Clause ---
     print("\n-- Phase 3: SET Clause --")
-    send(["BEGIN"]) # Start transaction
     # Set a property on a node
     results = send_and_parse(["CYPHER", f'MATCH (p:Person) WHERE p._id = "{alice_id}" SET p.age = 31 RETURN p.age'], "SET property on a node")
     assert_eq(results[0]['p.age'], 31, "SET should update node property")
@@ -84,15 +83,12 @@ def test_cypher_writes(sock, reader):
     # Set a property on a relationship
     results = send_and_parse(["CYPHER", f'MATCH (a:Person)-[r:KNOWS]->(b:Person) WHERE a._id = "{alice_id}" SET r.since = 2023 RETURN r.since'], "SET property on a relationship")
     assert_eq(results[0]['r.since'], 2023, "SET should update relationship property")
-    send(["COMMIT"]) # Commit transaction
     print("[PASS] SET clause tests complete.")
 
     # --- 4. REMOVE Clause ---
     print("\n-- Phase 4: REMOVE Clause --")
-    send(["BEGIN"]) # Start transaction
     # Remove a property from a node
     send_and_parse(["CYPHER", f'MATCH (p:Person) WHERE p._id = "{alice_id}" REMOVE p.age'], "REMOVE property from a node")
-    send(["COMMIT"]) # Commit transaction
     results = send_and_parse(["CYPHER", f'MATCH (p:Person) WHERE p._id = "{alice_id}" RETURN p'], "Verify REMOVE property")
     assert_eq('age' in results[0]['p'], False, "'age' property should be removed")
     print("[PASS] REMOVE clause tests complete.")
@@ -121,7 +117,6 @@ def test_cypher_writes(sock, reader):
 
     # --- 6. MERGE Clause ---
     print("\n-- Phase 6: MERGE Clause --")
-    send(["BEGIN"]) # Start transaction for MERGE tests
     # Test MERGE on a non-existent node (should CREATE)
     results = send_and_parse(["CYPHER", 'MERGE (p:Person {name: "Charlie"}) ON CREATE SET p.created = true RETURN p.name, p.created'], "MERGE on non-existent node")
     assert_eq(len(results), 1, "MERGE CREATE should return 1 row")
@@ -138,7 +133,6 @@ def test_cypher_writes(sock, reader):
     # Verify only one "Charlie" node exists
     results = send_and_parse(["CYPHER", 'MATCH (p:Person {name: "Charlie"}) RETURN p'], "Verify only one node was created")
     assert_eq(len(results), 1, "There should be only one node with name Charlie")
-    send(["COMMIT"]) # Commit transaction
     print("[PASS] MERGE clause tests complete.")
 
     # --- 7. Cleanup ---
