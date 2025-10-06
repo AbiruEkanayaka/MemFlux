@@ -115,6 +115,38 @@ impl CypherParser {
         Ok(MatchQuery { pattern, where_clause })
     }
 
+    fn parse_merge_clause(&mut self) -> Result<MergeClause> {
+        self.expect("MERGE")?;
+        let pattern = self.parse_pattern()?;
+        let mut on_match = None;
+        let mut on_create = None;
+
+        loop {
+            if self.current().map_or(false, |t| t.eq_ignore_ascii_case("ON")) {
+                self.advance(); // Consume ON
+                if self.current().map_or(false, |t| t.eq_ignore_ascii_case("MATCH")) {
+                    self.advance(); // Consume MATCH
+                    if on_match.is_some() {
+                        return Err(anyhow!("Cannot specify ON MATCH more than once"));
+                    }
+                    on_match = Some(self.parse_set_clause()?);
+                } else if self.current().map_or(false, |t| t.eq_ignore_ascii_case("CREATE")) {
+                    self.advance(); // Consume CREATE
+                    if on_create.is_some() {
+                        return Err(anyhow!("Cannot specify ON CREATE more than once"));
+                    }
+                    on_create = Some(self.parse_set_clause()?);
+                } else {
+                    return Err(anyhow!("Expected MATCH or CREATE after ON"));
+                }
+            } else {
+                break;
+            }
+        }
+
+        Ok(MergeClause { pattern, on_match, on_create })
+    }
+
     fn parse_create_clause(&mut self) -> Result<Pattern> {
         self.expect("CREATE")?;
         self.parse_pattern()
@@ -333,6 +365,12 @@ impl CypherParser {
         } else if let Ok(num) = token.parse::<i64>() {
             self.advance();
             return Ok(Expression::Literal(LiteralValue::Integer(num)));
+        } else if token.eq_ignore_ascii_case("true") {
+            self.advance();
+            return Ok(Expression::Literal(LiteralValue::Boolean(true)));
+        } else if token.eq_ignore_ascii_case("false") {
+            self.advance();
+            return Ok(Expression::Literal(LiteralValue::Boolean(false)));
         } else if token == "{" {
             return self.parse_map_literal();
         } else {
@@ -348,6 +386,7 @@ impl CypherParser {
             match token.as_deref() {
                 Some("MATCH") => query.clauses.push(Clause::Match(self.parse_match_clause()?)),
                 Some("CREATE") => query.clauses.push(Clause::Create(self.parse_create_clause()?)),
+                Some("MERGE") => query.clauses.push(Clause::Merge(self.parse_merge_clause()?)),
                 Some("REMOVE") => query.clauses.push(Clause::Remove(self.parse_remove_clause()?)),
                 Some("SET") => query.clauses.push(Clause::Set(self.parse_set_clause()?)),
                 Some("DELETE") | Some("DETACH") => query.clauses.push(Clause::Delete(self.parse_delete_clause()?)),

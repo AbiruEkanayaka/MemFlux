@@ -28,6 +28,12 @@ pub enum LogicalPlan {
         pattern: ast::Pattern,
         input: Box<LogicalPlan>,
     },
+    Merge {
+        pattern: ast::Pattern,
+        on_create: Option<ast::SetClause>,
+        on_match: Option<ast::SetClause>,
+        input: Box<LogicalPlan>,
+    },
     Remove {
         items: Vec<ast::Expression>,
         input: Box<LogicalPlan>,
@@ -56,6 +62,20 @@ pub fn ast_to_logical_plan(query: CypherQuery) -> Result<LogicalPlan> {
                 LogicalPlan::Create {
                     pattern,
                     input: Box::new(plan),
+                }
+            }
+            ast::Clause::Merge(merge_clause) => {
+                // A MERGE is like an optional MATCH, followed by a conditional CREATE.
+                // First, build a plan to find the things that already exist.
+                let match_plan = build_plan_from_match(ast::MatchQuery { pattern: merge_clause.pattern.clone(), where_clause: None }, plan)?;
+
+                // The Merge plan itself will contain the logic to either use the matched data
+                // or create the new data.
+                LogicalPlan::Merge {
+                    pattern: merge_clause.pattern,
+                    on_create: merge_clause.on_create,
+                    on_match: merge_clause.on_match,
+                    input: Box::new(match_plan),
                 }
             }
             ast::Clause::Remove(remove_clause) => {
@@ -100,6 +120,7 @@ fn build_plan_from_match(query: ast::MatchQuery, input_plan: LogicalPlan) -> Res
 
     let mut plan: Option<LogicalPlan> = None;
     let mut bound_variables = HashMap::new();
+    let mut predicates: Vec<ast::Expression> = Vec::new();
 
     for part in &query.pattern.parts {
         match part {
@@ -109,7 +130,21 @@ fn build_plan_from_match(query: ast::MatchQuery, input_plan: LogicalPlan) -> Res
                 bound_variables.insert(var.clone(), label.clone());
 
                 if plan.is_none() {
-                    plan = Some(LogicalPlan::NodeByLabelScan { variable: var, label });
+                    plan = Some(LogicalPlan::NodeByLabelScan { variable: var.clone(), label });
+                }
+
+                if let Some(ast::Expression::Map(props)) = &node_pattern.properties {
+                    for (prop_name, prop_expr) in props {
+                        let predicate = ast::Expression::BinaryOp {
+                            left: Box::new(ast::Expression::Property(
+                                Box::new(ast::Expression::Variable(var.clone())),
+                                prop_name.clone(),
+                            )),
+                            op: "=".to_string(),
+                            right: Box::new(prop_expr.clone()),
+                        };
+                        predicates.push(predicate);
+                    }
                 }
             }
             PatternPart::Relationship(rel_pattern) => {
@@ -141,6 +176,13 @@ fn build_plan_from_match(query: ast::MatchQuery, input_plan: LogicalPlan) -> Res
     }
 
     let mut final_plan = plan.ok_or_else(|| anyhow!("Could not build a plan from the MATCH clause"))?;
+
+    for p in predicates {
+        final_plan = LogicalPlan::Filter {
+            predicate: p,
+            input: Box::new(final_plan),
+        };
+    }
 
     if let Some(predicate) = query.where_clause {
         final_plan = LogicalPlan::Filter {

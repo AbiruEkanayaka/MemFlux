@@ -1,4 +1,4 @@
-use crate::cypher_engine::ast;
+use crate::cypher_engine::ast::{self, Row};
 use crate::cypher_engine::logical_plan::{LogicalPlan};
 use anyhow::Result;
 use crate::indexing::IndexManager;
@@ -36,6 +36,12 @@ pub enum PhysicalPlan {
         pattern: ast::Pattern,
         input: Box<PhysicalPlan>,
     },
+    Merge {
+        pattern: ast::Pattern,
+        on_create: Option<ast::SetClause>,
+        on_match: Option<ast::SetClause>,
+        input: Box<PhysicalPlan>,
+    },
     Remove {
         items: Vec<ast::Expression>,
         input: Box<PhysicalPlan>,
@@ -50,6 +56,7 @@ pub enum PhysicalPlan {
         input: Box<PhysicalPlan>,
     },
     Dummy,
+    Values(Vec<Row>),
 }
 
 pub fn logical_to_physical_plan(
@@ -74,6 +81,7 @@ pub fn logical_to_physical_plan(
                                     let json_val = match val {
                                         ast::LiteralValue::String(s) => Value::String(s.clone()),
                                         ast::LiteralValue::Integer(i) => serde_json::json!(i),
+                                        ast::LiteralValue::Boolean(b) => serde_json::json!(b),
                                     };
 
                                     // We found a pattern like: MATCH (n:Label) WHERE n.prop = value
@@ -122,6 +130,14 @@ pub fn logical_to_physical_plan(
         LogicalPlan::Create { pattern, input } => {
             Ok(PhysicalPlan::Create {
                 pattern,
+                input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+            })
+        }
+        LogicalPlan::Merge { pattern, on_create, on_match, input } => {
+            Ok(PhysicalPlan::Merge {
+                pattern,
+                on_create,
+                on_match,
                 input: Box::new(logical_to_physical_plan(*input, index_manager)?),
             })
         }

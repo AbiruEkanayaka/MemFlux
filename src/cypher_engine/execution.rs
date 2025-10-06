@@ -1,4 +1,4 @@
-use crate::cypher_engine::ast;
+use crate::cypher_engine::ast::{self, Row};
 use crate::cypher_engine::physical_plan::PhysicalPlan;
 use crate::storage_executor::get_visible_db_value;
 use crate::transaction::TransactionHandle;
@@ -9,13 +9,12 @@ use futures::stream::{Stream, StreamExt, TryStreamExt};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-type Row = Value;
-
 async fn evaluate_expression(expr: &ast::Expression, row: &Row) -> Result<Value> {
     match expr {
         ast::Expression::Literal(lit) => match lit {
             ast::LiteralValue::String(s) => Ok(Value::String(s.clone())),
             ast::LiteralValue::Integer(i) => Ok(json!(i)),
+            ast::LiteralValue::Boolean(b) => Ok(json!(b)),
         },
         ast::Expression::Variable(var) => Ok(row.get(var).cloned().unwrap_or(Value::Null)),
         ast::Expression::Property(expr, prop_name) => {
@@ -51,22 +50,39 @@ pub fn execute<'a>(
             PhysicalPlan::NodeScan { variable, label } => {
                 let prefix = format!("_node:{}:", label);
                 let tx_guard = transaction_handle.read().await;
+                let tx_opt = tx_guard.as_ref();
 
+                let mut keys_to_process: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+                // Get keys from main DB
                 for entry in ctx.db.iter() {
                     if entry.key().starts_with(&prefix) {
-                        if let Some(db_val) = get_visible_db_value(entry.key(), &ctx, tx_guard.as_ref()).await {
-                             if let DbValue::JsonB(bytes) = db_val {
-                                if let Ok(mut props) = serde_json::from_slice::<Value>(&bytes) {
-                                    let id = entry.key().split(':').last().unwrap_or("");
-                                    if let Some(obj) = props.as_object_mut() {
-                                        obj.insert("_id".to_string(), json!(id));
-                                        obj.insert("_label".to_string(), json!(label.clone()));
-                                    }
+                        keys_to_process.insert(entry.key().clone());
+                    }
+                }
 
-                                    let mut row = json!({});
-                                    row[variable.clone()] = props;
-                                    yield row;
+                // Get keys from transaction writeset
+                if let Some(tx) = tx_opt {
+                    for entry in tx.writes.iter() {
+                        if entry.key().starts_with(&prefix) {
+                            keys_to_process.insert(entry.key().clone());
+                        }
+                    }
+                }
+
+                for key in keys_to_process {
+                    if let Some(db_val) = get_visible_db_value(&key, &ctx, tx_opt).await {
+                         if let DbValue::JsonB(bytes) = db_val {
+                            if let Ok(mut props) = serde_json::from_slice::<Value>(&bytes) {
+                                let id = key.split(':').last().unwrap_or("");
+                                if let Some(obj) = props.as_object_mut() {
+                                    obj.insert("_id".to_string(), json!(id));
+                                    obj.insert("_label".to_string(), json!(label.clone()));
                                 }
+
+                                let mut row = json!({});
+                                row[variable.clone()] = props;
+                                yield row;
                             }
                         }
                     }
@@ -194,6 +210,11 @@ pub fn execute<'a>(
             PhysicalPlan::Dummy => {
                 // Yield a single empty row to kickstart pipelines that don't start with a scan (e.g., CREATE only).
                 yield json!({});
+            }
+            PhysicalPlan::Values(rows) => {
+                for row in rows {
+                    yield row;
+                }
             }
             PhysicalPlan::Create { pattern, input } => {
                 let input_rows: Vec<Row> = Box::pin(execute(*input, ctx.clone(), transaction_handle.clone())).try_collect().await?;
@@ -434,6 +455,40 @@ pub fn execute<'a>(
                             if let crate::types::Response::Error(e) = response {
                                 Err(anyhow!("Failed to delete: {}", e))?;
                             }
+                        }
+                    }
+                }
+            }
+            PhysicalPlan::Merge { pattern, on_create, on_match, input } => {
+                let matched_rows: Vec<Row> = Box::pin(execute(*input, ctx.clone(), transaction_handle.clone())).try_collect().await?;
+
+                if !matched_rows.is_empty() {
+                    // ON MATCH
+                    if let Some(set_clause) = on_match {
+                        let input_plan = Box::new(PhysicalPlan::Values(matched_rows));
+                        let set_plan = PhysicalPlan::Set { items: set_clause.items, input: input_plan };
+                        let mut stream = Box::pin(execute(set_plan, ctx.clone(), transaction_handle.clone()));
+                        while let Some(row) = stream.next().await {
+                            yield row?;
+                        }
+                    } else {
+                        for row in matched_rows {
+                            yield row;
+                        }
+                    }
+                } else {
+                    // ON CREATE
+                    let create_plan = PhysicalPlan::Create { pattern, input: Box::new(PhysicalPlan::Dummy) };
+                    if let Some(set_clause) = on_create {
+                        let set_plan = PhysicalPlan::Set { items: set_clause.items, input: Box::new(create_plan) };
+                        let mut stream = Box::pin(execute(set_plan, ctx.clone(), transaction_handle.clone()));
+                        while let Some(row) = stream.next().await {
+                            yield row?;
+                        }
+                    } else {
+                        let mut stream = Box::pin(execute(create_plan, ctx.clone(), transaction_handle.clone()));
+                        while let Some(row) = stream.next().await {
+                            yield row?;
                         }
                     }
                 }

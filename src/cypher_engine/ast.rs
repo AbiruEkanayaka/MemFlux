@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+pub type Row = serde_json::Value;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct CypherQuery {
     pub clauses: Vec<Clause>,
@@ -10,10 +12,18 @@ pub struct CypherQuery {
 pub enum Clause {
     Match(MatchQuery),
     Create(Pattern),
+    Merge(MergeClause),
     Set(SetClause),
     Remove(RemoveClause),
     Delete(DeleteClause),
     Return(ReturnClause),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MergeClause {
+    pub pattern: Pattern,
+    pub on_match: Option<SetClause>,
+    pub on_create: Option<SetClause>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -120,6 +130,7 @@ impl fmt::Display for Expression {
 pub enum LiteralValue {
     String(String),
     Integer(i64),
+    Boolean(bool),
 }
 
 impl fmt::Display for LiteralValue {
@@ -127,6 +138,7 @@ impl fmt::Display for LiteralValue {
         match self {
             LiteralValue::String(s) => write!(f, "'{}'", s),
             LiteralValue::Integer(i) => write!(f, "{}", i),
+            LiteralValue::Boolean(b) => write!(f, "{}", b),
         }
     }
 }

@@ -119,7 +119,29 @@ def test_cypher_writes(sock, reader):
     assert_eq(len(results), 0, "Relationships to Bob should be gone after DETACH DELETE")
     print("[PASS] DELETE and DETACH DELETE tests complete.")
 
-    # --- 6. Cleanup ---
-    print("\n-- Phase 6: Cleanup --")
+    # --- 6. MERGE Clause ---
+    print("\n-- Phase 6: MERGE Clause --")
+    send(["BEGIN"]) # Start transaction for MERGE tests
+    # Test MERGE on a non-existent node (should CREATE)
+    results = send_and_parse(["CYPHER", 'MERGE (p:Person {name: "Charlie"}) ON CREATE SET p.created = true RETURN p.name, p.created'], "MERGE on non-existent node")
+    assert_eq(len(results), 1, "MERGE CREATE should return 1 row")
+    assert_eq(results[0].get('p.name'), "Charlie", "MERGE CREATE should create the node with correct name")
+    assert_eq(results[0].get('p.created'), True, "MERGE CREATE should execute ON CREATE SET")
+
+    # Test MERGE on an existing node (should MATCH)
+    results = send_and_parse(["CYPHER", 'MERGE (p:Person {name: "Charlie"}) ON MATCH SET p.matched = true RETURN p.name, p.created, p.matched'], "MERGE on existing node")
+    assert_eq(len(results), 1, "MERGE MATCH should return 1 row")
+    assert_eq(results[0].get('p.name'), "Charlie", "MERGE MATCH should find the correct node")
+    assert_eq(results[0].get('p.created'), True, "MERGE MATCH should not execute ON CREATE SET")
+    assert_eq(results[0].get('p.matched'), True, "MERGE MATCH should execute ON MATCH SET")
+
+    # Verify only one "Charlie" node exists
+    results = send_and_parse(["CYPHER", 'MATCH (p:Person {name: "Charlie"}) RETURN p'], "Verify only one node was created")
+    assert_eq(len(results), 1, "There should be only one node with name Charlie")
+    send(["COMMIT"]) # Commit transaction
+    print("[PASS] MERGE clause tests complete.")
+
+    # --- 7. Cleanup ---
+    print("\n-- Phase 7: Cleanup --")
     send(["FLUSHDB"])
     print("[PASS] Cleanup complete.")
