@@ -15,6 +15,8 @@ pub enum LogicalPlan {
         rel_type: String,
         direction: ast::RelationshipDirection,
         input: Box<LogicalPlan>,
+        is_optional: bool,
+        range: Option<(Option<u32>, Option<u32>)>,
     },
     Filter {
         predicate: ast::Expression,
@@ -56,7 +58,10 @@ pub fn ast_to_logical_plan(query: CypherQuery) -> Result<LogicalPlan> {
     for clause in query.clauses {
         plan = match clause {
             ast::Clause::Match(match_query) => {
-                build_plan_from_match(match_query, plan)?
+                build_plan_from_match(match_query, plan, false)?
+            }
+            ast::Clause::OptionalMatch(match_query) => {
+                build_plan_from_match(match_query, plan, true)?
             }
             ast::Clause::Create(pattern) => {
                 LogicalPlan::Create {
@@ -67,7 +72,7 @@ pub fn ast_to_logical_plan(query: CypherQuery) -> Result<LogicalPlan> {
             ast::Clause::Merge(merge_clause) => {
                 // A MERGE is like an optional MATCH, followed by a conditional CREATE.
                 // First, build a plan to find the things that already exist.
-                let match_plan = build_plan_from_match(ast::MatchQuery { pattern: merge_clause.pattern.clone(), where_clause: None }, plan)?;
+                let match_plan = build_plan_from_match(ast::MatchQuery { pattern: merge_clause.pattern.clone(), where_clause: None }, plan, true)?;
 
                 // The Merge plan itself will contain the logic to either use the matched data
                 // or create the new data.
@@ -112,13 +117,12 @@ pub fn ast_to_logical_plan(query: CypherQuery) -> Result<LogicalPlan> {
     Ok(plan)
 }
 
-fn build_plan_from_match(query: ast::MatchQuery, input_plan: LogicalPlan) -> Result<LogicalPlan> {
-    // For now, MATCH must be the first clause.
-    if !matches!(input_plan, LogicalPlan::Dummy) {
-        return Err(anyhow!("MATCH must be the first clause in a query"));
-    }
-
-    let mut plan: Option<LogicalPlan> = None;
+fn build_plan_from_match(query: ast::MatchQuery, input_plan: LogicalPlan, is_optional: bool) -> Result<LogicalPlan> {
+    let mut plan: Option<LogicalPlan> = if matches!(input_plan, LogicalPlan::Dummy) {
+        None
+    } else {
+        Some(input_plan)
+    };
     let mut bound_variables = HashMap::new();
     let mut predicates: Vec<ast::Expression> = Vec::new();
 
@@ -170,6 +174,8 @@ fn build_plan_from_match(query: ast::MatchQuery, input_plan: LogicalPlan) -> Res
                     rel_type,
                     direction: rel_pattern.direction.clone(),
                     input: Box::new(plan.take().unwrap()),
+                    is_optional,
+                    range: rel_pattern.range.clone(),
                 });
             }
         }

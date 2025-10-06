@@ -38,7 +38,7 @@ fn tokenize(sql: &str) -> Vec<String> {
                     current_token.clear();
                 }
             }
-            '=' | ',' | '(' | ')' | '{' | '}' | ':' | '[' | ']' | '.' | '-' | '>' | '<' => {
+            '=' | ',' | '(' | ')' | '{' | '}' | ':' | '[' | ']' | '.' | '-' | '>' | '<' | '*' => {
                 if !current_token.is_empty() {
                     tokens.push(current_token.clone());
                     current_token.clear();
@@ -99,6 +99,11 @@ impl CypherParser {
         } else {
             Err(anyhow!("Invalid identifier: {}", token))
         }
+    }
+
+    fn parse_optional_match_clause(&mut self) -> Result<MatchQuery> {
+        self.expect("OPTIONAL")?;
+        self.parse_match_clause()
     }
 
     fn parse_match_clause(&mut self) -> Result<MatchQuery> {
@@ -267,7 +272,7 @@ impl CypherParser {
         self.expect("-")?;
 
         self.expect("[")?;
-        let variable = if self.current() != Some(":") && self.current() != Some("]") && self.current() != Some("{") {
+        let variable = if self.current() != Some(":") && self.current() != Some("]") && self.current() != Some("{") && self.current() != Some("*") {
             Some(self.parse_identifier()?)
         } else {
             None
@@ -282,6 +287,46 @@ impl CypherParser {
         } else {
             None
         };
+
+        let range = if self.current() == Some("*") {
+            self.advance(); // consume *
+            let mut min = None;
+            let mut max = None;
+
+            // Case: * or *.. or *N.. or *..N or *M..N
+            if self.current().map_or(false, |t| t.chars().all(char::is_numeric) || t == ".") {
+                 // Case: *N.. or *N
+                if self.current().map_or(false, |t| t.chars().all(char::is_numeric)) {
+                    let num = self.current().unwrap().parse::<u32>()?;
+                    self.advance();
+                    min = Some(num);
+
+                    // Case: *N..M or *N..
+                    if self.current() == Some(".") {
+                        self.advance();
+                        self.expect(".")?;
+                        if self.current().map_or(false, |t| t.chars().all(char::is_numeric)) {
+                            max = Some(self.current().unwrap().parse::<u32>()?);
+                            self.advance();
+                        }
+                    } else {
+                        // Case: *N (exact length)
+                        max = Some(num);
+                    }
+                }
+                // Case: *..M
+                else if self.current() == Some(".") {
+                    self.advance();
+                    self.expect(".")?;
+                    max = Some(self.current().ok_or_else(|| anyhow!("Expected a number after *.."))?.parse::<u32>()?);
+                    self.advance();
+                }
+            }
+            Some((min, max))
+        } else {
+            None
+        };
+
         self.expect("]")?;
 
         self.expect("-")?;
@@ -300,7 +345,7 @@ impl CypherParser {
             (true, true) => return Err(anyhow!("Invalid relationship pattern: <-->")),
         };
 
-        Ok(PatternPart::Relationship(RelationshipPattern { direction, variable, types, properties }))
+        Ok(PatternPart::Relationship(RelationshipPattern { direction, variable, types, properties, range }))
     }
 
     fn parse_return_clause(&mut self) -> Result<ReturnClause> {
@@ -384,6 +429,7 @@ impl CypherParser {
         loop {
             let token = self.current().map(|s| s.to_uppercase());
             match token.as_deref() {
+                Some("OPTIONAL") => query.clauses.push(Clause::OptionalMatch(self.parse_optional_match_clause()?)),
                 Some("MATCH") => query.clauses.push(Clause::Match(self.parse_match_clause()?)),
                 Some("CREATE") => query.clauses.push(Clause::Create(self.parse_create_clause()?)),
                 Some("MERGE") => query.clauses.push(Clause::Merge(self.parse_merge_clause()?)),

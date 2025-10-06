@@ -11,6 +11,7 @@ pub struct CypherQuery {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Clause {
     Match(MatchQuery),
+    OptionalMatch(MatchQuery),
     Create(Pattern),
     Merge(MergeClause),
     Set(SetClause),
@@ -78,6 +79,7 @@ pub struct RelationshipPattern {
     pub variable: Option<String>,
     pub types: Vec<String>,
     pub properties: Option<Expression>,
+    pub range: Option<(Option<u32>, Option<u32>)>, // Added for variable-length paths
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

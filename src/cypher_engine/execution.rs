@@ -117,64 +117,151 @@ pub fn execute<'a>(
                     // Fallback to a full scan if index doesn't exist, though planner should prevent this.
                 }
             }
-            PhysicalPlan::Expand { start_node_var, rel_var, end_node_var, rel_type, direction, input } => {
+            PhysicalPlan::Expand { start_node_var, rel_var, end_node_var, rel_type, direction, input, is_optional, range } => {
                 let mut stream = Box::pin(execute(*input, ctx.clone(), transaction_handle.clone()));
                 while let Some(start_row_result) = stream.next().await {
                     let start_row = start_row_result?;
-                    let start_node_obj = start_row.get(&start_node_var).ok_or_else(|| anyhow!("Start node variable '{} ' not found", start_node_var))?;
+                    let start_node_obj = start_row.get(&start_node_var).ok_or_else(|| anyhow!("Start node variable '{}' not found", start_node_var))?;
+                    
+                    if start_node_obj.is_null() {
+                        if is_optional {
+                            let mut null_row = start_row.clone();
+                            if let Some(obj) = null_row.as_object_mut() {
+                                obj.insert(end_node_var.clone(), Value::Null);
+                                obj.insert(rel_var.clone(), Value::Null);
+                            }
+                            yield null_row;
+                        }
+                        continue;
+                    }
+
                     let start_node_id = start_node_obj.get("_id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("Start node ID not found"))?;
 
-                    let edge_prefix = match direction {
-                        ast::RelationshipDirection::Outgoing => format!("_edge:out:{}:{}:", start_node_id, rel_type),
-                        ast::RelationshipDirection::Incoming => format!("_edge:in:{}:{}:", start_node_id, rel_type),
-                        ast::RelationshipDirection::Both => format!("_edge:out:{}:{}:", start_node_id, rel_type), // Simplified for now
-                    };
+                    let mut matched_once = false;
 
-                    let tx_guard = transaction_handle.read().await;
-                    for entry in ctx.db.iter() {
-                        if entry.key().starts_with(&edge_prefix) {
-                            let parts: Vec<&str> = entry.key().split(':').collect();
-                            if parts.len() < 4 { continue; }
+                    if let Some((min_raw, max_raw)) = range {
+                        // Variable-length path traversal using BFS
+                        let min_depth = min_raw.unwrap_or(1);
+                        let max_depth = max_raw.unwrap_or(5); // Default max depth to 5 if unbounded to prevent explosions
 
-                            let end_node_id = match direction {
-                                ast::RelationshipDirection::Outgoing => parts.last().unwrap(),
-                                ast::RelationshipDirection::Incoming => parts.last().unwrap(),
-                                ast::RelationshipDirection::Both => parts.last().unwrap(),
+                        let mut q: std::collections::VecDeque<(String, u32)> = std::collections::VecDeque::new();
+                        q.push_back((start_node_id.to_string(), 0));
+                        
+                        let mut visited_nodes = std::collections::HashSet::new();
+                        visited_nodes.insert(start_node_id.to_string());
+
+                        while let Some((current_id, current_depth)) = q.pop_front() {
+                            if current_depth >= max_depth {
+                                continue;
+                            }
+
+                            let edge_prefix = match direction {
+                                ast::RelationshipDirection::Outgoing => format!("_edge:out:{}:{}:", current_id, rel_type),
+                                ast::RelationshipDirection::Incoming => format!("_edge:in:{}:{}:", current_id, rel_type),
+                                ast::RelationshipDirection::Both => format!("_edge:out:{}:{}:", current_id, rel_type), // Simplified
                             };
 
-                            // Fetch the end node
-                            let pk_key = format!("_pk_node:{}", end_node_id);
-                            if let Some(DbValue::Bytes(label_bytes)) = get_visible_db_value(&pk_key, &ctx, tx_guard.as_ref()).await {
-                                let end_node_label = String::from_utf8(label_bytes)?;
-                                let end_node_key = format!("_node:{}:{}", end_node_label, end_node_id);
+                            let tx_guard = transaction_handle.read().await;
+                            for entry in ctx.db.iter() {
+                                if entry.key().starts_with(&edge_prefix) {
+                                    let parts: Vec<&str> = entry.key().split(':').collect();
+                                    if parts.len() < 5 { continue; }
+                                    let end_node_id = parts[4];
 
-                                if let Some(DbValue::JsonB(end_node_bytes)) = get_visible_db_value(&end_node_key, &ctx, tx_guard.as_ref()).await {
-                                    let mut end_node_props = serde_json::from_slice::<Value>(&end_node_bytes)?;
-                                    if let Some(obj) = end_node_props.as_object_mut() {
-                                        obj.insert("_id".to_string(), json!(end_node_id));
-                                        obj.insert("_label".to_string(), json!(end_node_label.clone()));
-                                    }
+                                    if visited_nodes.contains(end_node_id) { continue; }
 
-                                    // Fetch the relationship properties
                                     if let Some(DbValue::JsonB(rel_bytes)) = get_visible_db_value(entry.key(), &ctx, tx_guard.as_ref()).await {
-                                        let mut rel_props = serde_json::from_slice::<Value>(&rel_bytes)?;
-                                        if let Some(obj) = rel_props.as_object_mut() {
-                                            // The _id is already in rel_props from graph_add_relationship
-                                            obj.insert("_type".to_string(), json!(rel_type));
-                                            obj.insert("_start_id".to_string(), json!(start_node_id));
-                                            obj.insert("_end_id".to_string(), json!(end_node_id));
-                                        }
+                                        let pk_key = format!("_pk_node:{}", end_node_id);
+                                        if let Some(DbValue::Bytes(label_bytes)) = get_visible_db_value(&pk_key, &ctx, tx_guard.as_ref()).await {
+                                            let end_node_label = String::from_utf8(label_bytes)?;
+                                            let end_node_key = format!("_node:{}:{}", end_node_label, end_node_id);
 
-                                        let mut new_row = start_row.clone();
-                                        if let Some(obj) = new_row.as_object_mut() {
-                                            obj.insert(end_node_var.clone(), end_node_props);
-                                            obj.insert(rel_var.clone(), rel_props); // Insert rel properties
+                                            if let Some(DbValue::JsonB(end_node_bytes)) = get_visible_db_value(&end_node_key, &ctx, tx_guard.as_ref()).await {
+                                                let next_depth = current_depth + 1;
+                                                if next_depth >= min_depth {
+                                                    matched_once = true;
+                                                    let mut end_node_props = serde_json::from_slice::<Value>(&end_node_bytes)?;
+                                                    if let Some(obj) = end_node_props.as_object_mut() {
+                                                        obj.insert("_id".to_string(), json!(end_node_id));
+                                                        obj.insert("_label".to_string(), json!(end_node_label.clone()));
+                                                    }
+                                                    let rel_props = serde_json::from_slice::<Value>(&rel_bytes)?;
+
+                                                    let mut new_row = start_row.clone();
+                                                    if let Some(obj) = new_row.as_object_mut() {
+                                                        obj.insert(end_node_var.clone(), end_node_props);
+                                                        // Simplified: rel_var is just the last rel in the path
+                                                        obj.insert(rel_var.clone(), rel_props);
+                                                    }
+                                                    yield new_row;
+                                                }
+                                                q.push_back((end_node_id.to_string(), next_depth));
+                                                visited_nodes.insert(end_node_id.to_string());
+                                            }
                                         }
-                                        yield new_row;
                                     }
                                 }
                             }
                         }
+                    } else {
+                        // Single-step expansion
+                        let edge_prefix = match direction {
+                            ast::RelationshipDirection::Outgoing => format!("_edge:out:{}:{}:", start_node_id, rel_type),
+                            ast::RelationshipDirection::Incoming => format!("_edge:in:{}:{}:", start_node_id, rel_type),
+                            ast::RelationshipDirection::Both => format!("_edge:out:{}:{}:", start_node_id, rel_type), // Simplified for now
+                        };
+
+                        let tx_guard = transaction_handle.read().await;
+                        for entry in ctx.db.iter() {
+                            if entry.key().starts_with(&edge_prefix) {
+                                let parts: Vec<&str> = entry.key().split(':').collect();
+                                if parts.len() < 5 { continue; }
+
+                                let end_node_id = parts[4];
+
+                                // Fetch the end node
+                                let pk_key = format!("_pk_node:{}", end_node_id);
+                                if let Some(DbValue::Bytes(label_bytes)) = get_visible_db_value(&pk_key, &ctx, tx_guard.as_ref()).await {
+                                    let end_node_label = String::from_utf8(label_bytes)?;
+                                    let end_node_key = format!("_node:{}:{}", end_node_label, end_node_id);
+
+                                    if let Some(DbValue::JsonB(end_node_bytes)) = get_visible_db_value(&end_node_key, &ctx, tx_guard.as_ref()).await {
+                                        let mut end_node_props = serde_json::from_slice::<Value>(&end_node_bytes)?;
+                                        if let Some(obj) = end_node_props.as_object_mut() {
+                                            obj.insert("_id".to_string(), json!(end_node_id));
+                                            obj.insert("_label".to_string(), json!(end_node_label.clone()));
+                                        }
+
+                                        // Fetch the relationship properties
+                                        if let Some(DbValue::JsonB(rel_bytes)) = get_visible_db_value(entry.key(), &ctx, tx_guard.as_ref()).await {
+                                            let mut rel_props = serde_json::from_slice::<Value>(&rel_bytes)?;
+                                            if let Some(obj) = rel_props.as_object_mut() {
+                                                obj.insert("_type".to_string(), json!(rel_type));
+                                                obj.insert("_start_id".to_string(), json!(start_node_id));
+                                                obj.insert("_end_id".to_string(), json!(end_node_id));
+                                            }
+
+                                            matched_once = true;
+                                            let mut new_row = start_row.clone();
+                                            if let Some(obj) = new_row.as_object_mut() {
+                                                obj.insert(end_node_var.clone(), end_node_props);
+                                                obj.insert(rel_var.clone(), rel_props); // Insert rel properties
+                                            }
+                                            yield new_row;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !matched_once && is_optional {
+                        let mut new_row = start_row.clone();
+                        if let Some(obj) = new_row.as_object_mut() {
+                            obj.insert(end_node_var.clone(), Value::Null);
+                            obj.insert(rel_var.clone(), Value::Null);
+                        }
+                        yield new_row;
                     }
                 }
             }

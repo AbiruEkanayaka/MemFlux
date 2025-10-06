@@ -23,6 +23,8 @@ pub enum PhysicalPlan {
         rel_type: String,
         direction: ast::RelationshipDirection,
         input: Box<PhysicalPlan>,
+        is_optional: bool,
+        range: Option<(Option<u32>, Option<u32>)>,
     },
     Filter {
         predicate: ast::Expression,
@@ -111,7 +113,7 @@ pub fn logical_to_physical_plan(
                 input: Box::new(logical_to_physical_plan(*input, index_manager)?),
             })
         }
-        LogicalPlan::Expand { start_node_var, rel_var, end_node_var, rel_type, direction, input } => {
+        LogicalPlan::Expand { start_node_var, rel_var, end_node_var, rel_type, direction, input, is_optional, range } => {
             Ok(PhysicalPlan::Expand {
                 start_node_var,
                 rel_var,
@@ -119,6 +121,8 @@ pub fn logical_to_physical_plan(
                 rel_type,
                 direction,
                 input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+                is_optional,
+                range,
             })
         }
         LogicalPlan::Projection { expressions, input } => {
