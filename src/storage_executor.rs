@@ -1863,6 +1863,174 @@ impl StorageExecutor {
         Response::Bytes(rel_id.into_bytes())
     }
 
+    pub async fn graph_remove_node_property(
+        &self,
+        node_id: String,
+        property: String,
+    ) -> Response {
+        let mut tx_guard = self.transaction_handle.write().await;
+        if let Some(tx) = tx_guard.as_mut() {
+            let pk_key = format!("_pk_node:{}", node_id);
+
+            let label = match get_visible_db_value(&pk_key, &self.ctx, Some(tx)).await {
+                Some(DbValue::Bytes(label_bytes)) => String::from_utf8(label_bytes).unwrap_or_default(),
+                _ => return Response::Integer(0), // Node not found
+            };
+            if label.is_empty() { return Response::Integer(0); }
+
+            let node_key = format!("_node:{}:{}", label, node_id);
+            let current_props_bytes = match get_visible_db_value(&node_key, &self.ctx, Some(tx)).await {
+                Some(DbValue::JsonB(bytes)) => bytes,
+                _ => return Response::Integer(0),
+            };
+
+            let mut props: Value = match serde_json::from_slice(&current_props_bytes) {
+                Ok(p) => p,
+                Err(_) => return Response::Error("Failed to deserialize node properties".to_string()),
+            };
+
+            if let Some(obj) = props.as_object_mut() {
+                if obj.remove(&property).is_none() {
+                    return Response::Integer(0); // Property did not exist
+                }
+            } else {
+                return Response::Error("Node properties are not a JSON object".to_string());
+            }
+
+            match serde_json::to_vec(&props) {
+                Ok(new_props_bytes) => {
+                    let log_entry = LogEntry::RemoveNodeProperty {
+                        id: node_id,
+                        property,
+                    };
+                    tx.log_entries.write().await.push(log_entry);
+                    tx.writes.insert(node_key, Some(DbValue::JsonB(new_props_bytes)));
+                    Response::Integer(1)
+                }
+                Err(_) => Response::Error("Failed to serialize updated properties".to_string()),
+            }
+        } else {
+            Response::Error("REMOVE must be used within a transaction".to_string())
+        }
+    }
+
+    pub async fn graph_remove_relationship_property(
+        &self,
+        rel_id: String,
+        property: String,
+    ) -> Response {
+        let mut tx_guard = self.transaction_handle.write().await;
+        if let Some(tx) = tx_guard.as_mut() {
+            let pk_key = format!("_pk_rel:{}", rel_id);
+
+            let pk_val = match get_visible_db_value(&pk_key, &self.ctx, Some(tx)).await {
+                Some(DbValue::Bytes(pk_val_bytes)) => String::from_utf8(pk_val_bytes).unwrap_or_default(),
+                _ => return Response::Integer(0),
+            };
+            if pk_val.is_empty() { return Response::Integer(0); }
+
+            let parts: Vec<&str> = pk_val.splitn(3, ':').collect();
+            if parts.len() != 3 { return Response::Error("Invalid relationship PK value".to_string()); }            
+            let out_key = format!("_edge:out:{}", pk_val);
+            let in_key = format!("_edge:in:{}:{}:{}", parts[2], parts[1], parts[0]);
+
+            let current_props_bytes = match get_visible_db_value(&out_key, &self.ctx, Some(tx)).await {
+                Some(DbValue::JsonB(bytes)) => bytes,
+                _ => return Response::Integer(0),
+            };
+
+            let mut props: Value = match serde_json::from_slice(&current_props_bytes) {
+                Ok(p) => p,
+                Err(_) => return Response::Error("Failed to deserialize rel properties".to_string()),
+            };
+
+            if let Some(obj) = props.as_object_mut() {
+                if obj.remove(&property).is_none() {
+                    return Response::Integer(0);
+                }
+            } else {
+                return Response::Error("Rel properties are not a JSON object".to_string());
+            }
+
+            match serde_json::to_vec(&props) {
+                Ok(new_props_bytes) => {
+                    let log_entry = LogEntry::RemoveRelationshipProperty {
+                        id: rel_id,
+                        property,
+                    };
+                    tx.log_entries.write().await.push(log_entry);
+                    tx.writes.insert(out_key, Some(DbValue::JsonB(new_props_bytes.clone())));
+                    tx.writes.insert(in_key, Some(DbValue::JsonB(new_props_bytes)));
+                    Response::Integer(1)
+                }
+                Err(_) => Response::Error("Failed to serialize updated properties".to_string()),
+            }
+        } else {
+            Response::Error("REMOVE must be used within a transaction".to_string())
+        }
+    }
+
+    pub async fn graph_set_relationship_property(
+        &self,
+        rel_id: String,
+        property: String,
+        value_bytes: Vec<u8>,
+    ) -> Response {
+        let mut tx_guard = self.transaction_handle.write().await;
+        if let Some(tx) = tx_guard.as_mut() {
+            let pk_key = format!("_pk_rel:{}", rel_id);
+
+            let pk_val = match get_visible_db_value(&pk_key, &self.ctx, Some(tx)).await {
+                Some(DbValue::Bytes(pk_val_bytes)) => String::from_utf8(pk_val_bytes).unwrap_or_default(),
+                _ => return Response::Integer(0), // Relationship not found
+            };
+            if pk_val.is_empty() { return Response::Integer(0); }
+
+            let parts: Vec<&str> = pk_val.splitn(3, ':').collect();
+            if parts.len() != 3 { return Response::Error("Invalid relationship PK value".to_string()); }
+            
+            let out_key = format!("_edge:out:{}", pk_val);
+            let in_key = format!("_edge:in:{}:{}:{}", parts[2], parts[1], parts[0]);
+
+            let current_props_bytes = match get_visible_db_value(&out_key, &self.ctx, Some(tx)).await {
+                Some(DbValue::JsonB(bytes)) => bytes,
+                _ => return Response::Integer(0), // Rel data not found or wrong type
+            };
+
+            let mut props: Value = match serde_json::from_slice(&current_props_bytes) {
+                Ok(p) => p,
+                Err(_) => return Response::Error("Failed to deserialize rel properties".to_string()),
+            };
+            let new_value: Value = match serde_json::from_slice(&value_bytes) {
+                Ok(v) => v,
+                Err(_) => return Response::Error("Invalid JSON format for value".to_string()),
+            };
+
+            if let Some(obj) = props.as_object_mut() {
+                obj.insert(property.clone(), new_value);
+            } else {
+                return Response::Error("Rel properties are not a JSON object".to_string());
+            }
+
+            match serde_json::to_vec(&props) {
+                Ok(new_props_bytes) => {
+                    let log_entry = LogEntry::SetRelationshipProperty {
+                        id: rel_id,
+                        property,
+                        value: value_bytes,
+                    };
+                    tx.log_entries.write().await.push(log_entry);
+                    tx.writes.insert(out_key, Some(DbValue::JsonB(new_props_bytes.clone())));
+                    tx.writes.insert(in_key, Some(DbValue::JsonB(new_props_bytes)));
+                    Response::Integer(1)
+                }
+                Err(_) => Response::Error("Failed to serialize updated properties".to_string()),
+            }
+        } else {
+            Response::Error("SET must be used within a transaction".to_string())
+        }
+    }
+
     pub async fn graph_set_node_property(
         &self,
         node_id: String,

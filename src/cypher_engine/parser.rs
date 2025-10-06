@@ -101,7 +101,7 @@ impl CypherParser {
         }
     }
 
-    fn parse_match_query(&mut self) -> Result<MatchQuery> {
+    fn parse_match_clause(&mut self) -> Result<MatchQuery> {
         self.expect("MATCH")?;
         let pattern = self.parse_pattern()?;
 
@@ -112,9 +112,86 @@ impl CypherParser {
             None
         };
 
-        let return_clause = self.parse_return_clause()?;
+        Ok(MatchQuery { pattern, where_clause })
+    }
 
-        Ok(MatchQuery { pattern, where_clause, return_clause })
+    fn parse_create_clause(&mut self) -> Result<Pattern> {
+        self.expect("CREATE")?;
+        self.parse_pattern()
+    }
+
+    fn parse_set_clause(&mut self) -> Result<SetClause> {
+        self.expect("SET")?;
+        let mut items = Vec::new();
+        loop {
+            let property = self.parse_property_access_expression()?;
+            self.expect("=")?;
+            let expression = self.parse_expression()?;
+            items.push(SetItem { property, expression });
+            if self.current() == Some(",") {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(SetClause { items })
+    }
+
+    fn parse_delete_clause(&mut self) -> Result<DeleteClause> {
+        let detach = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("DETACH")) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        self.expect("DELETE")?;
+
+        let mut expressions = Vec::new();
+        loop {
+            expressions.push(self.parse_expression()?);
+            if self.current() == Some(",") {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(DeleteClause { expressions, detach })
+    }
+
+    fn parse_remove_clause(&mut self) -> Result<RemoveClause> {
+        self.expect("REMOVE")?;
+        let mut items = Vec::new();
+        loop {
+            items.push(self.parse_expression()?);
+            if self.current() == Some(",") {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(RemoveClause { items })
+    }
+
+    fn parse_map_literal(&mut self) -> Result<Expression> {
+        self.expect("{")?;
+        let mut props = Vec::new();
+        if self.current() == Some("}") {
+            self.advance();
+            return Ok(Expression::Map(props));
+        }
+        loop {
+            let key = self.parse_identifier()?;
+            self.expect(":")?;
+            let value = self.parse_expression()?;
+            props.push((key, value));
+            if self.current() == Some(",") {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect("}")?;
+        Ok(Expression::Map(props))
     }
 
     fn parse_pattern(&mut self) -> Result<Pattern> {
@@ -128,7 +205,7 @@ impl CypherParser {
 
     fn parse_node_pattern(&mut self) -> Result<PatternPart> {
         self.expect("(")?;
-        let variable = if self.current() != Some(":") && self.current() != Some(")") {
+        let variable = if self.current() != Some(":") && self.current() != Some(")") && self.current() != Some("{") {
             Some(self.parse_identifier()?)
         } else {
             None
@@ -138,8 +215,13 @@ impl CypherParser {
             self.advance();
             labels.push(self.parse_identifier()?);
         }
+        let properties = if self.current() == Some("{") {
+            Some(self.parse_map_literal()?)
+        } else {
+            None
+        };
         self.expect(")")?;
-        Ok(PatternPart::Node(NodePattern { variable, labels, properties: None }))
+        Ok(PatternPart::Node(NodePattern { variable, labels, properties }))
     }
 
     fn parse_relationship_pattern(&mut self) -> Result<PatternPart> {
@@ -153,7 +235,7 @@ impl CypherParser {
         self.expect("-")?;
 
         self.expect("[")?;
-        let variable = if self.current() != Some(":") && self.current() != Some("]") {
+        let variable = if self.current() != Some(":") && self.current() != Some("]") && self.current() != Some("{") {
             Some(self.parse_identifier()?)
         } else {
             None
@@ -163,6 +245,11 @@ impl CypherParser {
             self.advance();
             types.push(self.parse_identifier()?);
         }
+        let properties = if self.current() == Some("{") {
+            Some(self.parse_map_literal()?)
+        } else {
+            None
+        };
         self.expect("]")?;
 
         self.expect("-")?;
@@ -181,7 +268,7 @@ impl CypherParser {
             (true, true) => return Err(anyhow!("Invalid relationship pattern: <-->")),
         };
 
-        Ok(PatternPart::Relationship(RelationshipPattern { direction, variable, types, properties: None }))
+        Ok(PatternPart::Relationship(RelationshipPattern { direction, variable, types, properties }))
     }
 
     fn parse_return_clause(&mut self) -> Result<ReturnClause> {
@@ -210,16 +297,29 @@ impl CypherParser {
     }
 
     fn parse_expression(&mut self) -> Result<Expression> {
+        self.parse_comparison_expression()
+    }
+
+    fn parse_comparison_expression(&mut self) -> Result<Expression> {
+        let mut left = self.parse_property_access_expression()?;
+        if self.current() == Some("=") {
+            self.advance();
+            let right = self.parse_comparison_expression()?;
+            left = Expression::BinaryOp {
+                left: Box::new(left),
+                op: "=".to_string(),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_property_access_expression(&mut self) -> Result<Expression> {
         let mut expr = self.parse_primary_expression()?;
         while self.current() == Some(".") {
             self.advance();
             let prop = self.parse_identifier()?;
             expr = Expression::Property(Box::new(expr), prop);
-        }
-        if self.current() == Some("=") {
-            self.advance();
-            let right = self.parse_primary_expression()?;
-            expr = Expression::BinaryOp { left: Box::new(expr), op: "=".to_string(), right: Box::new(right) };
         }
         Ok(expr)
     }
@@ -233,6 +333,8 @@ impl CypherParser {
         } else if let Ok(num) = token.parse::<i64>() {
             self.advance();
             return Ok(Expression::Literal(LiteralValue::Integer(num)));
+        } else if token == "{" {
+            return self.parse_map_literal();
         } else {
             let var = self.parse_identifier()?;
             return Ok(Expression::Variable(var));
@@ -240,10 +342,24 @@ impl CypherParser {
     }
 
     pub fn parse(&mut self) -> Result<CypherQuery> {
-        match self.current().map(|s| s.to_uppercase()).as_deref() {
-            Some("MATCH") => Ok(CypherQuery::Match(self.parse_match_query()?)),
-            _ => Err(anyhow!("Unsupported query type, expected MATCH"))
+        let mut query = CypherQuery::default();
+        loop {
+            let token = self.current().map(|s| s.to_uppercase());
+            match token.as_deref() {
+                Some("MATCH") => query.clauses.push(Clause::Match(self.parse_match_clause()?)),
+                Some("CREATE") => query.clauses.push(Clause::Create(self.parse_create_clause()?)),
+                Some("REMOVE") => query.clauses.push(Clause::Remove(self.parse_remove_clause()?)),
+                Some("SET") => query.clauses.push(Clause::Set(self.parse_set_clause()?)),
+                Some("DELETE") | Some("DETACH") => query.clauses.push(Clause::Delete(self.parse_delete_clause()?)),
+                Some("RETURN") => query.clauses.push(Clause::Return(self.parse_return_clause()?)),
+                Some(other) => return Err(anyhow!("Unsupported clause: {}", other)),
+                None => break,
+            }
         }
+        if query.clauses.is_empty() {
+            return Err(anyhow!("Query is empty"));
+        }
+        Ok(query)
     }
 }
 

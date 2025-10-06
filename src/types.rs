@@ -296,6 +296,19 @@ pub enum LogEntry {
         property: String,
         value: Vec<u8>,
     },
+    SetRelationshipProperty {
+        id: String,
+        property: String,
+        value: Vec<u8>,
+    },
+    RemoveNodeProperty {
+        id: String,
+        property: String,
+    },
+    RemoveRelationshipProperty {
+        id: String,
+        property: String,
+    },
     AddRelationship {
         id: String,
         start_node_id: String,

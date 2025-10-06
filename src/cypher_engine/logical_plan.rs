@@ -1,4 +1,4 @@
-use crate::cypher_engine::ast::{self, CypherQuery, MatchQuery, PatternPart};
+use crate::cypher_engine::ast::{self, CypherQuery, PatternPart};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 
@@ -24,23 +24,88 @@ pub enum LogicalPlan {
         expressions: Vec<(ast::Expression, Option<String>)>, // expr, alias
         input: Box<LogicalPlan>,
     },
+    Create {
+        pattern: ast::Pattern,
+        input: Box<LogicalPlan>,
+    },
+    Remove {
+        items: Vec<ast::Expression>,
+        input: Box<LogicalPlan>,
+    },
+    Set {
+        items: Vec<ast::SetItem>,
+        input: Box<LogicalPlan>,
+    },
+    Delete {
+        expressions: Vec<ast::Expression>,
+        detach: bool,
+        input: Box<LogicalPlan>,
+    },
+    Dummy,
 }
 
 pub fn ast_to_logical_plan(query: CypherQuery) -> Result<LogicalPlan> {
-    match query {
-        CypherQuery::Match(match_query) => build_plan_from_match(match_query),
+    let mut plan: LogicalPlan = LogicalPlan::Dummy;
+
+    for clause in query.clauses {
+        plan = match clause {
+            ast::Clause::Match(match_query) => {
+                build_plan_from_match(match_query, plan)?
+            }
+            ast::Clause::Create(pattern) => {
+                LogicalPlan::Create {
+                    pattern,
+                    input: Box::new(plan),
+                }
+            }
+            ast::Clause::Remove(remove_clause) => {
+                LogicalPlan::Remove {
+                    items: remove_clause.items,
+                    input: Box::new(plan),
+                }
+            }
+            ast::Clause::Set(set_clause) => {
+                LogicalPlan::Set {
+                    items: set_clause.items,
+                    input: Box::new(plan),
+                }
+            }
+            ast::Clause::Delete(delete_clause) => {
+                LogicalPlan::Delete {
+                    expressions: delete_clause.expressions,
+                    detach: delete_clause.detach,
+                    input: Box::new(plan),
+                }
+            }
+            ast::Clause::Return(return_clause) => {
+                let projection_expressions = return_clause.items.into_iter()
+                    .map(|item| (item.expression, item.alias))
+                    .collect();
+                LogicalPlan::Projection {
+                    expressions: projection_expressions,
+                    input: Box::new(plan),
+                }
+            }
+        };
     }
+
+    Ok(plan)
 }
 
-fn build_plan_from_match(query: MatchQuery) -> Result<LogicalPlan> {
+fn build_plan_from_match(query: ast::MatchQuery, input_plan: LogicalPlan) -> Result<LogicalPlan> {
+    // For now, MATCH must be the first clause.
+    if !matches!(input_plan, LogicalPlan::Dummy) {
+        return Err(anyhow!("MATCH must be the first clause in a query"));
+    }
+
     let mut plan: Option<LogicalPlan> = None;
     let mut bound_variables = HashMap::new();
 
     for part in &query.pattern.parts {
         match part {
             PatternPart::Node(node_pattern) => {
-                let var = node_pattern.variable.clone().ok_or_else(|| anyhow!("All nodes in MATCH must have a variable"))?;
-                let label = node_pattern.labels.get(0).cloned().ok_or_else(|| anyhow!("All nodes in MATCH must have a label"))?;
+                let var = node_pattern.variable.clone().unwrap_or_else(|| format!("_anon_node_{}", bound_variables.len()));
+                let label = node_pattern.labels.get(0).cloned().unwrap_or_else(|| "".to_string()); // Allow anonymous nodes to have no label
                 bound_variables.insert(var.clone(), label.clone());
 
                 if plan.is_none() {
@@ -49,12 +114,18 @@ fn build_plan_from_match(query: MatchQuery) -> Result<LogicalPlan> {
             }
             PatternPart::Relationship(rel_pattern) => {
                 let start_node_var = bound_variables.keys().last().cloned().ok_or_else(|| anyhow!("Relationship must follow a node"))?;
-                let end_node_pattern = query.pattern.parts.get(bound_variables.len() * 2).and_then(|p| if let PatternPart::Node(n) = p { Some(n) } else { None }).ok_or_else(|| anyhow!("Relationship must be followed by a node"))?;
-                let end_node_var = end_node_pattern.variable.clone().ok_or_else(|| anyhow!("End node must have a variable"))?;
-                let end_node_label = end_node_pattern.labels.get(0).cloned().ok_or_else(|| anyhow!("End node must have a label"))?;
+                
+                // Find the end node pattern by looking at the next part in the pattern
+                let rel_pattern_index = query.pattern.parts.iter().position(|p| p == part).unwrap();
+                let end_node_pattern = query.pattern.parts.get(rel_pattern_index + 1)
+                    .and_then(|p| if let PatternPart::Node(n) = p { Some(n) } else { None })
+                    .ok_or_else(|| anyhow!("Relationship must be followed by a node"))?;
+
+                let end_node_var = end_node_pattern.variable.clone().unwrap_or_else(|| format!("_anon_node_{}", bound_variables.len()));
+                let end_node_label = end_node_pattern.labels.get(0).cloned().unwrap_or_else(|| "".to_string()); // Allow anonymous nodes to have no label
                 bound_variables.insert(end_node_var.clone(), end_node_label);
 
-                let rel_var = rel_pattern.variable.clone().unwrap_or_else(|| format!("_rel_{}", bound_variables.len()));
+                let rel_var = rel_pattern.variable.clone().unwrap_or_else(|| format!("_anon_rel_{}", bound_variables.len()));
                 let rel_type = rel_pattern.types.get(0).cloned().unwrap_or_else(|| "".to_string());
 
                 plan = Some(LogicalPlan::Expand {
@@ -77,15 +148,6 @@ fn build_plan_from_match(query: MatchQuery) -> Result<LogicalPlan> {
             input: Box::new(final_plan),
         };
     }
-
-    let projection_expressions = query.return_clause.items.into_iter()
-        .map(|item| (item.expression, item.alias))
-        .collect();
-
-    final_plan = LogicalPlan::Projection {
-        expressions: projection_expressions,
-        input: Box::new(final_plan),
-    };
 
     Ok(final_plan)
 }

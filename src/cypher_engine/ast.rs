@@ -1,16 +1,47 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct CypherQuery {
+    pub clauses: Vec<Clause>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum CypherQuery {
+pub enum Clause {
     Match(MatchQuery),
+    Create(Pattern),
+    Set(SetClause),
+    Remove(RemoveClause),
+    Delete(DeleteClause),
+    Return(ReturnClause),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RemoveClause {
+    pub items: Vec<Expression>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MatchQuery {
     pub pattern: Pattern,
     pub where_clause: Option<Expression>,
-    pub return_clause: ReturnClause,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SetClause {
+    pub items: Vec<SetItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SetItem {
+    pub property: Expression,
+    pub expression: Expression,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeleteClause {
+    pub expressions: Vec<Expression>,
+    pub detach: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -62,6 +93,7 @@ pub enum Expression {
     Variable(String),
     Property(Box<Expression>, String),
     Literal(LiteralValue),
+    Map(Vec<(String, Expression)>),
     BinaryOp {
         left: Box<Expression>,
         op: String,
@@ -75,6 +107,10 @@ impl fmt::Display for Expression {
             Expression::Variable(s) => write!(f, "{}", s),
             Expression::Property(expr, prop) => write!(f, "{}.{}", expr, prop),
             Expression::Literal(lit) => write!(f, "{}", lit),
+            Expression::Map(props) => {
+                let items: Vec<String> = props.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
+                write!(f, "{{{}}}", items.join(", "))
+            }
             Expression::BinaryOp { left, op, right } => write!(f, "{} {} {}", left, op, right),
         }
     }

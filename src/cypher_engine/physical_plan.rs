@@ -32,6 +32,24 @@ pub enum PhysicalPlan {
         expressions: Vec<(ast::Expression, Option<String>)>, // expr, alias
         input: Box<PhysicalPlan>,
     },
+    Create {
+        pattern: ast::Pattern,
+        input: Box<PhysicalPlan>,
+    },
+    Remove {
+        items: Vec<ast::Expression>,
+        input: Box<PhysicalPlan>,
+    },
+    Set {
+        items: Vec<ast::SetItem>,
+        input: Box<PhysicalPlan>,
+    },
+    Delete {
+        expressions: Vec<ast::Expression>,
+        detach: bool,
+        input: Box<PhysicalPlan>,
+    },
+    Dummy,
 }
 
 pub fn logical_to_physical_plan(
@@ -101,5 +119,31 @@ pub fn logical_to_physical_plan(
                 input: Box::new(logical_to_physical_plan(*input, index_manager)?),
             })
         }
+        LogicalPlan::Create { pattern, input } => {
+            Ok(PhysicalPlan::Create {
+                pattern,
+                input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+            })
+        }
+        LogicalPlan::Remove { items, input } => {
+            Ok(PhysicalPlan::Remove {
+                items,
+                input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+            })
+        }
+        LogicalPlan::Set { items, input } => {
+            Ok(PhysicalPlan::Set {
+                items,
+                input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+            })
+        }
+        LogicalPlan::Delete { expressions, detach, input } => {
+            Ok(PhysicalPlan::Delete {
+                expressions,
+                detach,
+                input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+            })
+        }
+        LogicalPlan::Dummy => Ok(PhysicalPlan::Dummy),
     }
 }
