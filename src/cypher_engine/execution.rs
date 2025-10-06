@@ -321,59 +321,69 @@ pub fn execute<'a>(
                                 continue;
                             }
 
-                            let edge_prefix = match direction {
-                                ast::RelationshipDirection::Outgoing => format!("_edge:out:{}:{}:", current_id, rel_type),
-                                ast::RelationshipDirection::Incoming => format!("_edge:in:{}:{}:", current_id, rel_type),
-                                ast::RelationshipDirection::Both => format!("_edge:out:{}:{}:", current_id, rel_type), // Simplified
+                            let mut prefixes_to_scan = Vec::new();
+                            match direction {
+                                ast::RelationshipDirection::Outgoing => {
+                                    prefixes_to_scan.push(format!("_edge:out:{}:{}:", current_id, rel_type));
+                                }
+                                ast::RelationshipDirection::Incoming => {
+                                    prefixes_to_scan.push(format!("_edge:in:{}:{}:", current_id, rel_type));
+                                }
+                                ast::RelationshipDirection::Both => {
+                                    prefixes_to_scan.push(format!("_edge:out:{}:{}:", current_id, rel_type));
+                                    prefixes_to_scan.push(format!("_edge:in:{}:{}:", current_id, rel_type));
+                                }
                             };
 
                             let tx_guard = transaction_handle.read().await;
-                            for entry in ctx.db.iter() {
-                                if entry.key().starts_with(&edge_prefix) {
-                                    let parts: Vec<&str> = entry.key().split(':').collect();
-                                    if parts.len() < 5 { continue; }
-                                    let end_node_id = parts[4];
+                            for edge_prefix in prefixes_to_scan {
+                                for entry in ctx.db.iter() {
+                                    if entry.key().starts_with(&edge_prefix) {
+                                        let parts: Vec<&str> = entry.key().split(':').collect();
+                                        if parts.len() < 5 { continue; }
+                                        let end_node_id = parts[4];
 
-                                    if visited_nodes.contains(end_node_id) { continue; }
+                                        if visited_nodes.contains(end_node_id) { continue; }
 
-                                    if let Some(DbValue::JsonB(rel_bytes)) = get_visible_db_value(entry.key(), &ctx, tx_guard.as_ref()).await {
-                                        let pk_key = format!("_pk_node:{}", end_node_id);
-                                        if let Some(DbValue::Bytes(label_bytes)) = get_visible_db_value(&pk_key, &ctx, tx_guard.as_ref()).await {
-                                            let end_node_label = String::from_utf8(label_bytes)?;
-                                            let end_node_key = format!("_node:{}:{}", end_node_label, end_node_id);
+                                        if let Some(DbValue::JsonB(rel_bytes)) = get_visible_db_value(entry.key(), &ctx, tx_guard.as_ref()).await {
+                                            let pk_key = format!("_pk_node:{}", end_node_id);
+                                            if let Some(DbValue::Bytes(label_bytes)) = get_visible_db_value(&pk_key, &ctx, tx_guard.as_ref()).await {
+                                                let end_node_label = String::from_utf8(label_bytes)?;
+                                                let end_node_key = format!("_node:{}:{}", end_node_label, end_node_id);
 
-                                            if let Some(DbValue::JsonB(end_node_bytes)) = get_visible_db_value(&end_node_key, &ctx, tx_guard.as_ref()).await {
-                                                let next_depth = current_depth + 1;
+                                                if let Some(DbValue::JsonB(end_node_bytes)) = get_visible_db_value(&end_node_key, &ctx, tx_guard.as_ref()).await {
+                                                    let next_depth = current_depth + 1;
 
-                                                let mut end_node_props = serde_json::from_slice::<Value>(&end_node_bytes)?;
-                                                if let Some(obj) = end_node_props.as_object_mut() {
-                                                    obj.insert("_id".to_string(), json!(end_node_id));
-                                                    obj.insert("_label".to_string(), json!(end_node_label.clone()));
-                                                }
-                                                let mut rel_props = serde_json::from_slice::<Value>(&rel_bytes)?;
-                                                if let Some(obj) = rel_props.as_object_mut() {
-                                                    obj.insert("_type".to_string(), json!(rel_type));
-                                                }
-
-                                                let mut new_path = current_path.clone();
-                                                new_path.push(rel_props.clone());
-                                                new_path.push(end_node_props.clone());
-
-                                                if next_depth >= min_depth {
-                                                    matched_once = true;
-                                                    let mut new_row = start_row.clone();
-                                                    if let Some(obj) = new_row.as_object_mut() {
-                                                        obj.insert(end_node_var.clone(), end_node_props.clone());
-                                                        obj.insert(rel_var.clone(), rel_props.clone());
-                                                        if let Some(path_var) = &path_variable {
-                                                            obj.insert(path_var.clone(), json!(new_path));
-                                                        }
+                                                    let mut end_node_props = serde_json::from_slice::<Value>(&end_node_bytes)?;
+                                                    if let Some(obj) = end_node_props.as_object_mut() {
+                                                        obj.insert("_id".to_string(), json!(end_node_id));
+                                                        obj.insert("_label".to_string(), json!(end_node_label.clone()));
                                                     }
-                                                    yield new_row;
-                                                }
+                                                    let mut rel_props = serde_json::from_slice::<Value>(&rel_bytes)?;
+                                                    if let Some(obj) = rel_props.as_object_mut() {
+                                                        obj.insert("_type".to_string(), json!(rel_type));
+                                                    }
 
-                                                q.push_back((end_node_id.to_string(), next_depth, new_path));
-                                                visited_nodes.insert(end_node_id.to_string());
+                                                    let mut new_path = current_path.clone();
+                                                    new_path.push(rel_props.clone());
+                                                    new_path.push(end_node_props.clone());
+
+                                                    if next_depth >= min_depth {
+                                                        matched_once = true;
+                                                        let mut new_row = start_row.clone();
+                                                        if let Some(obj) = new_row.as_object_mut() {
+                                                            obj.insert(end_node_var.clone(), end_node_props.clone());
+                                                            obj.insert(rel_var.clone(), rel_props.clone());
+                                                            if let Some(path_var) = &path_variable {
+                                                                obj.insert(path_var.clone(), json!(new_path));
+                                                            }
+                                                        }
+                                                        yield new_row;
+                                                    }
+
+                                                    q.push_back((end_node_id.to_string(), next_depth, new_path));
+                                                    visited_nodes.insert(end_node_id.to_string());
+                                                }
                                             }
                                         }
                                     }
@@ -382,27 +392,90 @@ pub fn execute<'a>(
                         }
                     } else {
                         // Single-step expansion
-                        let edge_prefix = match direction {
-                            ast::RelationshipDirection::Outgoing => format!("_edge:out:{}:{}:", start_node_id, rel_type),
-                            ast::RelationshipDirection::Incoming => format!("_edge:in:{}:{}:", start_node_id, rel_type),
-                            ast::RelationshipDirection::Both => format!("_edge:out:{}:{}:", start_node_id, rel_type), // Simplified for now
+                        let tx_guard = transaction_handle.read().await;
+                        let tx_opt = tx_guard.as_ref();
+
+                        let mut prefixes_to_scan = Vec::new();
+                        match direction {
+                            ast::RelationshipDirection::Outgoing => {
+                                prefixes_to_scan.push(format!("_edge:out:{}:{}:", start_node_id, rel_type));
+                            }
+                            ast::RelationshipDirection::Incoming => {
+                                prefixes_to_scan.push(format!("_edge:in:{}:{}:", start_node_id, rel_type));
+                            }
+                            ast::RelationshipDirection::Both => {
+                                let out_prefix = format!("_edge:out:{}:{}:", start_node_id, rel_type);
+                                let in_prefix = format!("_edge:in:{}:{}:", start_node_id, rel_type);
+
+                                let mut out_degree = 0;
+                                let mut in_degree = 0;
+
+                                let mut visible_keys = std::collections::HashSet::new();
+                                for entry in ctx.db.iter() {
+                                    if entry.key().starts_with(&out_prefix) || entry.key().starts_with(&in_prefix) {
+                                        visible_keys.insert(entry.key().clone());
+                                    }
+                                }
+                                if let Some(tx) = tx_opt {
+                                    for entry in tx.writes.iter() {
+                                        let key = entry.key();
+                                        if key.starts_with(&out_prefix) || key.starts_with(&in_prefix) {
+                                            if entry.value().is_some() {
+                                                visible_keys.insert(key.clone());
+                                            } else {
+                                                visible_keys.remove(key);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                for key in &visible_keys {
+                                    if key.starts_with(&out_prefix) { out_degree += 1; }
+                                    if key.starts_with(&in_prefix) { in_degree += 1; }
+                                }
+
+                                if out_degree <= in_degree {
+                                    prefixes_to_scan.push(out_prefix);
+                                    prefixes_to_scan.push(in_prefix);
+                                } else {
+                                    prefixes_to_scan.push(in_prefix);
+                                    prefixes_to_scan.push(out_prefix);
+                                }
+                            }
                         };
 
-                        let tx_guard = transaction_handle.read().await;
-                        for entry in ctx.db.iter() {
-                            if entry.key().starts_with(&edge_prefix) {
-                                let parts: Vec<&str> = entry.key().split(':').collect();
+                        for edge_prefix in prefixes_to_scan {
+                            let mut keys_to_process: std::collections::HashSet<String> = std::collections::HashSet::new();
+                            for entry in ctx.db.iter() {
+                                if entry.key().starts_with(&edge_prefix) {
+                                    keys_to_process.insert(entry.key().clone());
+                                }
+                            }
+                            if let Some(tx) = tx_opt {
+                                for entry in tx.writes.iter() {
+                                    if entry.key().starts_with(&edge_prefix) {
+                                        if entry.value().is_some() {
+                                            keys_to_process.insert(entry.key().clone());
+                                        } else {
+                                            keys_to_process.remove(entry.key());
+                                        }
+                                    }
+                                }
+                            }
+
+                            for key in keys_to_process {
+                                let parts: Vec<&str> = key.split(':').collect();
                                 if parts.len() < 5 { continue; }
 
                                 let end_node_id = parts[4];
 
                                 // Fetch the end node
                                 let pk_key = format!("_pk_node:{}", end_node_id);
-                                if let Some(DbValue::Bytes(label_bytes)) = get_visible_db_value(&pk_key, &ctx, tx_guard.as_ref()).await {
+                                if let Some(DbValue::Bytes(label_bytes)) = get_visible_db_value(&pk_key, &ctx, tx_opt).await {
                                     let end_node_label = String::from_utf8(label_bytes)?;
                                     let end_node_key = format!("_node:{}:{}", end_node_label, end_node_id);
 
-                                    if let Some(DbValue::JsonB(end_node_bytes)) = get_visible_db_value(&end_node_key, &ctx, tx_guard.as_ref()).await {
+                                    if let Some(DbValue::JsonB(end_node_bytes)) = get_visible_db_value(&end_node_key, &ctx, tx_opt).await {
                                         let mut end_node_props = serde_json::from_slice::<Value>(&end_node_bytes)?;
                                         if let Some(obj) = end_node_props.as_object_mut() {
                                             obj.insert("_id".to_string(), json!(end_node_id));
@@ -410,7 +483,7 @@ pub fn execute<'a>(
                                         }
 
                                         // Fetch the relationship properties
-                                        if let Some(DbValue::JsonB(rel_bytes)) = get_visible_db_value(entry.key(), &ctx, tx_guard.as_ref()).await {
+                                        if let Some(DbValue::JsonB(rel_bytes)) = get_visible_db_value(&key, &ctx, tx_opt).await {
                                             let mut rel_props = serde_json::from_slice::<Value>(&rel_bytes)?;
                                             if let Some(obj) = rel_props.as_object_mut() {
                                                 obj.insert("_type".to_string(), json!(rel_type));

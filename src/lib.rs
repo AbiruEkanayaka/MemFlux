@@ -268,7 +268,7 @@ impl MemFluxDB {
         async_stream::try_stream! {
             let plan_result = (|| {
                 let ast = parser::parse_cypher(cypher)?;
-                let logical = logical_plan::ast_to_logical_plan(ast)?;
+                let logical = logical_plan::ast_to_logical_plan(ast, &self.app_context.index_manager)?;
                 physical_plan::logical_to_physical_plan(logical, &self.app_context.index_manager)
             })();
 

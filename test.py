@@ -28,6 +28,8 @@ from tests.test_cte import test_cte
 from tests.test_transactions import test_transactions
 from tests.test_vacuum import test_vacuum
 from tests.test_graph import test_graph
+from tests.test_cypher import test_cypher
+from tests.test_cypher_writes import test_cypher_writes
 from tests.test_cypher_advanced import test_cypher_advanced
 from tests.test_cypher_functions_and_paths import test_cypher_functions_and_paths
 
