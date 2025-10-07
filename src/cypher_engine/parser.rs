@@ -375,6 +375,35 @@ impl CypherParser {
         Ok(ReturnClause { items })
     }
 
+    fn parse_order_by_clause(&mut self) -> Result<OrderByClause> {
+        self.expect("ORDER")?;
+        self.expect("BY")?;
+        let mut items = Vec::new();
+        loop {
+            items.push(self.parse_order_by_item()?);
+            if self.current() == Some(",") {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(OrderByClause { items })
+    }
+
+    fn parse_order_by_item(&mut self) -> Result<OrderByItem> {
+        let expression = self.parse_expression()?;
+        let asc = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("DESC")) {
+            self.advance();
+            false
+        } else {
+            if self.current().map_or(false, |t| t.eq_ignore_ascii_case("ASC")) {
+                self.advance();
+            }
+            true
+        };
+        Ok(OrderByItem { expression, asc })
+    }
+
     fn parse_return_item(&mut self) -> Result<ReturnItem> {
         let expression = self.parse_expression()?;
         let alias = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("AS")) {
@@ -485,6 +514,7 @@ impl CypherParser {
                 Some("SET") => query.clauses.push(Clause::Set(self.parse_set_clause()?)),
                 Some("DELETE") | Some("DETACH") => query.clauses.push(Clause::Delete(self.parse_delete_clause()?)),
                 Some("RETURN") => query.clauses.push(Clause::Return(self.parse_return_clause()?)),
+                Some("ORDER") => query.clauses.push(Clause::OrderBy(self.parse_order_by_clause()?)),
                 Some(other) => return Err(anyhow!("Unsupported clause: {}", other)),
                 None => break,
             }

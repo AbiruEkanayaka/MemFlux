@@ -66,6 +66,10 @@ pub enum LogicalPlan {
         detach: bool,
         input: Box<LogicalPlan>,
     },
+    Sort {
+        input: Box<LogicalPlan>,
+        sort_expressions: Vec<(ast::Expression, bool)>, // (expression, is_asc)
+    },
     Dummy,
 }
 
@@ -127,6 +131,17 @@ pub fn ast_to_logical_plan(
                 LogicalPlan::Projection {
                     expressions: projection_expressions,
                     input: Box::new(plan),
+                }
+            }
+            ast::Clause::OrderBy(order_by_clause) => {
+                let sort_expressions = order_by_clause
+                    .items
+                    .into_iter()
+                    .map(|item| (item.expression, item.asc))
+                    .collect();
+                LogicalPlan::Sort {
+                    input: Box::new(plan),
+                    sort_expressions,
                 }
             }
         };

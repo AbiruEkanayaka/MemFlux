@@ -64,6 +64,10 @@ pub enum PhysicalPlan {
         detach: bool,
         input: Box<PhysicalPlan>,
     },
+    Sort {
+        input: Box<PhysicalPlan>,
+        sort_expressions: Vec<(ast::Expression, bool)>,
+    },
     Dummy,
     Values(Vec<Row>),
 }
@@ -178,6 +182,12 @@ pub fn logical_to_physical_plan(
                 expressions,
                 detach,
                 input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+            })
+        }
+        LogicalPlan::Sort { input, sort_expressions } => {
+            Ok(PhysicalPlan::Sort {
+                input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+                sort_expressions,
             })
         }
         LogicalPlan::Dummy => Ok(PhysicalPlan::Dummy),

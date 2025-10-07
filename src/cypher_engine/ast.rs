@@ -18,6 +18,18 @@ pub enum Clause {
     Remove(RemoveClause),
     Delete(DeleteClause),
     Return(ReturnClause),
+    OrderBy(OrderByClause),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OrderByClause {
+    pub items: Vec<OrderByItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OrderByItem {
+    pub expression: Expression,
+    pub asc: bool, // true for ASC, false for DESC
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

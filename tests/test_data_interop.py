@@ -109,7 +109,33 @@ def test_data_interoperability(sock, reader):
 
     print("[PASS] Cypher on SQL Data tests complete.")
 
-    # --- 3. Cleanup ---
-    print("\n-- Phase 3: Cleanup --")
+    # --- 3. Cypher on SQL with Virtual Relationships ---
+    print("\n-- Phase 3: Cypher on SQL with Virtual Relationships --")
+    send(["FLUSHDB"])
+
+    # Create SQL tables with a foreign key relationship
+    send(["SQL", "CREATE TABLE v_users (id INTEGER PRIMARY KEY, name TEXT)"])
+    send(["SQL", "CREATE TABLE v_orders (id INTEGER PRIMARY KEY, user_id INTEGER, item TEXT, FOREIGN KEY(user_id) REFERENCES v_users(id))"])
+    send(["SQL", "INSERT INTO v_users (id, name) VALUES (101, 'virt_user')"])
+    send(["SQL", "INSERT INTO v_orders (id, user_id, item) VALUES (1, 101, 'Virtual Keyboard'), (2, 101, 'Virtual Monitor')"])
+
+    print("[INFO] SQL tables with FK created. Querying via Cypher with virtual relationship...")
+
+    # Query using the FK column name as the relationship type.
+    # This tests the new implementation in the Expand operator.
+    # The planner should start with (o:v_orders), then for each order, expand over the virtual :user_id relationship.
+    cypher_fk_query = "MATCH (o:v_orders)-[:user_id]->(u:v_users) WHERE u.name = 'virt_user' RETURN o.item ORDER BY o.item"
+    results_fk = send_and_parse(["CYPHER", cypher_fk_query], "MATCH with virtual FK relationship")
+
+    assert_eq(len(results_fk), 2, "Cypher on virtual FK relationship should return 2 rows")
+    if len(results_fk) == 2:
+        order_items = {r.get('o.item') for r in results_fk}
+        assert_eq(order_items, {'Virtual Keyboard', 'Virtual Monitor'}, "Verify items from virtual FK relationship")
+
+    print("[PASS] Cypher on SQL with Virtual Relationships tests complete.")
+
+
+    # --- 4. Cleanup ---
+    print("\n-- Phase 4: Cleanup --")
     send(["FLUSHDB"])
     print("[PASS] Cleanup complete.")

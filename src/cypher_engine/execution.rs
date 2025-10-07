@@ -203,6 +203,20 @@ async fn evaluate_expression(expr: &ast::Expression, row: &Row, ctx: Arc<AppCont
     }
 }
 
+fn compare_cypher_values(val_a: &Value, val_b: &Value) -> std::cmp::Ordering {
+    if val_a.is_null() && val_b.is_null() { return std::cmp::Ordering::Equal; }
+    if val_a.is_null() { return std::cmp::Ordering::Less; } // NULLS FIRST
+    if val_b.is_null() { return std::cmp::Ordering::Greater; }
+
+    match (val_a, val_b) {
+        (Value::Number(n_a), Value::Number(n_b)) =>
+            n_a.as_f64().unwrap_or(f64::NAN).partial_cmp(&n_b.as_f64().unwrap_or(f64::NAN)).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::String(s_a), Value::String(s_b)) => s_a.cmp(s_b),
+        (Value::Bool(b_a), Value::Bool(b_b)) => b_a.cmp(b_b),
+        _ => val_a.to_string().cmp(&val_b.to_string()),
+    }
+}
+
 pub fn execute<'a>(
     plan: PhysicalPlan,
     ctx: Arc<AppContext>,
@@ -336,6 +350,62 @@ pub fn execute<'a>(
                     let start_node_id = start_node_obj.get("_id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("Start node ID not found"))?;
 
                     let mut matched_once = false;
+
+                    // Phase 1.2: Virtual Relationship Expansion via Foreign Keys
+                    let start_node_label = start_node_obj.get("_label").and_then(|v| v.as_str());
+                    if let (Some(label), ast::RelationshipDirection::Outgoing) = (start_node_label, &direction) {
+                        if let Some(schema) = ctx.schema_cache.get(label) {
+                            if schema.source == crate::schema::SchemaSource::Native {
+                                for constraint in &schema.constraints {
+                                    if let crate::query_engine::ast::TableConstraint::ForeignKey(fk) = constraint {
+                                        // Convention: rel_type in query matches the FK column name.
+                                        if fk.columns.len() == 1 && fk.columns[0] == rel_type {
+                                            let fk_col_name = &fk.columns[0];
+                                            let fk_val = start_node_obj.get(fk_col_name);
+
+                                            if let Some(val) = fk_val {
+                                                let pk_val_str = match val {
+                                                    Value::String(s) => s.clone(),
+                                                    Value::Number(n) => n.to_string(),
+                                                    _ => continue,
+                                                };
+                                                let referenced_table = &fk.references_table;
+                                                let referenced_db_key = format!("{}:{}", referenced_table, pk_val_str);
+
+                                                let tx_guard = transaction_handle.read().await;
+                                                if let Some(db_val) = get_visible_db_value(&referenced_db_key, &ctx, tx_guard.as_ref()).await {
+                                                    if let DbValue::JsonB(bytes) = db_val {
+                                                        let mut end_node_props: Value = serde_json::from_slice(&bytes)?;
+                                                        if let Some(obj) = end_node_props.as_object_mut() {
+                                                            obj.insert("_id".to_string(), json!(pk_val_str));
+                                                            obj.insert("_label".to_string(), json!(referenced_table));
+                                                        }
+
+                                                        let rel_props = json!({
+                                                            "_type": rel_type,
+                                                            "_start_id": start_node_id,
+                                                            "_end_id": pk_val_str
+                                                        });
+
+                                                        matched_once = true;
+                                                        let mut new_row = start_row.clone();
+                                                        if let Some(obj) = new_row.as_object_mut() {
+                                                            obj.insert(end_node_var.clone(), end_node_props.clone());
+                                                            obj.insert(rel_var.clone(), rel_props.clone());
+                                                            if let Some(path_var) = &path_variable {
+                                                                obj.insert(path_var.clone(), json!([start_node_obj.clone(), rel_props, end_node_props]));
+                                                            }
+                                                        }
+                                                        yield new_row;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     if let Some((min_raw, max_raw)) = range {
                         // Variable-length path traversal using BFS
@@ -884,6 +954,36 @@ pub fn execute<'a>(
                             yield combined_row;
                         }
                     }
+                }
+            }
+            PhysicalPlan::Sort { input, sort_expressions } => {
+                let rows: Vec<Row> = Box::pin(execute(*input, ctx.clone(), transaction_handle.clone())).try_collect().await?;
+                let mut sort_data = Vec::new();
+                for row in rows.into_iter() {
+                    let mut keys = Vec::new();
+                    for (expr, _) in &sort_expressions {
+                        keys.push(evaluate_expression(expr, &row, ctx.clone(), transaction_handle.clone()).await?);
+                    }
+                    sort_data.push((keys, row));
+                }
+
+                sort_data.sort_by(|(keys_a, _), (keys_b, _)| {
+                    for (i, (_, asc)) in sort_expressions.iter().enumerate() {
+                        let val_a = &keys_a[i];
+                        let val_b = &keys_b[i];
+
+                        let ord = compare_cypher_values(val_a, val_b);
+                        let final_ord = if *asc { ord } else { ord.reverse() };
+
+                        if final_ord != std::cmp::Ordering::Equal {
+                            return final_ord;
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+
+                for (_, row) in sort_data {
+                    yield row;
                 }
             }
         }
