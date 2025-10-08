@@ -24,4 +24,6 @@ This design keeps the command handlers in `src/commands.rs` clean and simple. Th
 
 -   **`set`, `delete`, `json_set`, etc.**: These methods contain the two-path logic described above. They handle memory accounting with the `MemoryManager`, update indexes via the `IndexManager`, and correctly stage or apply writes based on the transactional context.
 
+-   **`graph_add_node`, `graph_add_relationship`, `graph_delete`, etc.**: This new suite of functions serves as the low-level implementation for the `GRAPH.*` commands and the `CREATE`/`DELETE` clauses in Cypher queries. They are responsible for creating and deleting the various keys (`_node:*`, `_edge:*`, `_pk_*`) required to represent graph elements.
+
 -   **`insert_rows`, `update_rows`, `delete_rows`**: These higher-level functions are used by the SQL engine's execution layer (`src/query_engine/execution.rs`). They are designed to handle DML operations that affect multiple rows, efficiently applying changes within the current transaction.

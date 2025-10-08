@@ -51,6 +51,28 @@ SELECT n FROM counter;
 Specifies the primary data source for the query.
 - **Table:** A table name, which corresponds to a key prefix (e.g., `FROM users` queries keys starting with `users:`).
 - **Subquery:** A nested `SELECT` statement in parentheses. A subquery in the `FROM` clause must have an alias.
+- **Graph Query (`GRAPH_MATCH`):** An embedded Cypher query. This powerful feature allows you to perform complex graph traversals and use the results as a table in your SQL query.
+
+**`GRAPH_MATCH` Syntax:**
+```sql
+FROM GRAPH_MATCH(
+    '<cypher_query_string>'
+) RETURNS (cypher_var1 AS sql_col1, ...)
+AS alias
+```
+- **Cypher Query:** A string literal containing a valid Cypher query. The query should `RETURN` one or more variables.
+- **`RETURNS` Clause:** This clause maps the variables returned by the Cypher query to named SQL columns for use in the rest of the SQL statement.
+- **Alias:** The derived table from the `GRAPH_MATCH` must have an alias.
+
+**Example (Joining SQL data with Graph data):**
+```sql
+-- Find the roles of employees who manage someone in the graph
+SELECT e.role
+FROM employees AS e
+JOIN GRAPH_MATCH(
+    'MATCH (mgr:Person)<-[:REPORTS_TO]-(emp:Person) RETURN mgr.employee_id AS id'
+) RETURNS (id AS id) AS managers ON e.id = managers.id;
+```
 
 **Example:**
 ```sql

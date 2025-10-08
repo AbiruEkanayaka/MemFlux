@@ -30,6 +30,14 @@ These are the fundamental data structures you can store in a MemFlux key.
 -   **Commands:** `SADD`, `SREM`, `SMEMBERS`, `SCARD`, `SISMEMBER`
 -   **Use Case:** Storing tags, tracking unique visitors, etc.
 
+### Graph (Nodes and Relationships)
+
+-   **Description:** MemFlux implements a full property graph model. This is not a distinct key-level type, but rather a conceptual model built on top of the key-value store. The graph consists of two main components:
+    -   **Nodes:** The entities in the graph. Each node has a **label** (e.g., `Person`, `Company`) and a set of **properties** (a JSON object).
+    -   **Relationships:** The directed connections between nodes. Each relationship has a **type** (e.g., `KNOWS`, `WORKS_AT`) and its own set of **properties**.
+-   **Commands:** `GRAPH.ADDNODE`, `GRAPH.ADDREL`, and the `CYPHER` query language command.
+-   **Use Case:** Modeling complex relationships, social networks, dependency graphs, and any other connected data.
+
 ## SQL Data Types
 
 When using the SQL engine with virtual schemas (`CREATE TABLE`), you can assign specific data types to the fields within your JSON documents. This enables type validation, casting, and more efficient query execution. These types define how the data inside the JSON is interpreted by the SQL engine.

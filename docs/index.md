@@ -10,12 +10,12 @@ Persistence is built-in, with a Write-Ahead Log (WAL) for durability and automat
 
 ## Core Features
 
-*   **Multi-Data Model:** Supports raw bytes, lists (deque), sets, and complex JSON documents as values.
-*   **Redis-like API:** Implements a subset of common Redis commands (e.g., `SET`, `GET`, `LPUSH`, `SADD`) over the RESP protocol.
-*   **Powerful SQL Engine:** A custom-built SQL query engine allows for complex queries on JSON data, including:
-    *   DDL: `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE` to define virtual schemas.
-    *   DML: `INSERT`, `UPDATE`, `DELETE` statements.
-    *   Advanced `SELECT`: `JOIN`s, aggregates (`COUNT`, `SUM`, `AVG`), `GROUP BY`, `ORDER BY`, `LIMIT`, subqueries, `CASE` expressions, and Common Table Expressions (CTEs) with `WITH` and `WITH RECURSIVE`.
+*   **Multi-Data Model:** Supports raw bytes, lists, sets, complex JSON documents, and a full Property Graph model (nodes and relationships).
+*   **Redis-like API:** Implements a subset of common Redis commands over the RESP protocol.
+*   **Powerful Query Engines:**
+    *   **Cypher Engine:** A custom-built engine for querying the property graph with support for `MATCH`, `CREATE`, `MERGE`, pathfinding, and more.
+    *   **SQL Engine:** A feature-rich SQL engine for JSON and tabular data, including `JOIN`s, CTEs, and advanced DDL/DML.
+*   **SQL/Graph Interoperability:** Run Cypher queries inside SQL with `GRAPH_MATCH`, or query graph data as if it were SQL tables.
 *   **JSON Indexing:** Create indexes on specific JSON fields to accelerate query performance.
 *   **Durable Persistence:** Uses a Write-Ahead Log (WAL) for command logging and automatic background snapshotting to ensure data safety and fast restarts.
 *   **Built-in Functions:** A library of SQL functions for string manipulation, numeric operations, and date/time processing.
@@ -101,6 +101,7 @@ This documentation is organized into the following sections:
 
 *   **[Configuration](./configuration.md):** How to configure the server, including TLS.
 *   **[Commands](./commands.md):** Detailed reference for all non-SQL, Redis-style commands.
+*   **[Graph & Cypher](./graph.md):** A guide to the property graph model and the Cypher query language.
 *   **[Data Types](./types.md):** An overview of the core data types and the SQL type system.
 *   **[SQL Reference](./sql.md):** An introduction to the SQL engine and links to detailed sections.
 *   **[Transactions](./transactions.md):** A guide to using transactions, isolation levels, and the MVCC model.

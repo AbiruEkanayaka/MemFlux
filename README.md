@@ -25,15 +25,15 @@ Database is designed with a dual-purpose architecture: it can be run as a **stan
     *   **Bytes/Strings:** Classic key-value operations.
     *   **JSON Documents:** Rich, schemaless JSON manipulation at the key or sub-path level.
     *   **Lists & Sets:** Redis-compatible list and set operations.
-*   **Integrated SQL Query Engine:** A powerful, built-from-scratch query engine that operates directly on your in-memory data. Supports:
-    *   Complex `SELECT` queries with `JOIN`s, `GROUP BY`, aggregates (`COUNT`, `SUM`, `AVG`), `ORDER BY`, `LIMIT`, subqueries, and `CASE` statements.
-    *   Common Table Expressions (CTEs) using the `WITH` clause, including `WITH RECURSIVE` for hierarchical or graph-based queries.
-    *   Data Manipulation Language (DML): `INSERT` (with `ON CONFLICT`), `UPDATE`, `DELETE`. All support a `RETURNING` clause.
-    *   Data Definition Language (DDL): `CREATE/DROP/ALTER TABLE`, `CREATE/DROP VIEW`, and `CREATE SCHEMA` for managing virtual schemas and namespaces.
-    *   Rich Data Types: `INTEGER`, `TEXT`, `TIMESTAMPTZ`, `NUMERIC`, `UUID`, `BYTEA`, arrays (`INTEGER[]`), and more.
-    *   Advanced Constraints: `PRIMARY KEY`, `UNIQUE`, `CHECK`, and `FOREIGN KEY` with referential actions (`ON DELETE CASCADE`, `ON UPDATE SET NULL`, etc.).
-    *   A rich function library (`LOWER`, `NOW()`, `DATE_PART`, `ABS()`, etc.).
-*   **Transactional Integrity with MVCC:** Provides ACID-like properties with Snapshot Isolation using a Multi-Version Concurrency Control (MVCC) architecture. This allows for non-blocking reads and safe, concurrent writes.
+    *   **Property Graph:** A complete property graph model with nodes (labels, properties) and relationships (types, properties).
+*   **Integrated Query Engines:**
+    *   **SQL Query Engine:** A feature-rich SQL engine for querying JSON and tabular data. Supports complex `SELECT`s, `JOIN`s, CTEs (`WITH RECURSIVE`), DML, DDL, and advanced constraints.
+    *   **Cypher Query Engine:** A powerful, from-scratch engine for querying the property graph, supporting `MATCH`, `CREATE`, `MERGE`, `RETURN`, `DELETE`, `SET`, path variables, variable-length traversals (`-[:KNOWS*1..3]->`), and functions like `shortestPath()`.
+*   **Seamless SQL & Graph Interoperability:**
+    *   **Query graph data with SQL:** Graph nodes and relationships are automatically exposed as virtual SQL tables.
+    *   **Query SQL data with Cypher:** SQL tables with foreign keys can be traversed as if they were graph nodes and relationships.
+    *   **`GRAPH_MATCH` in SQL:** Embed Cypher queries directly inside your SQL `FROM` clause to perform hybrid queries that join graph results with SQL tables.
+*   **Transactional Integrity with MVCC:** Provides ACID-like properties with Snapshot Isolation using a Multi-Version Concurrency Control (MVCC) architecture. This allows for non-blocking reads and safe, concurrent writes across all data models.
 *   **Dual-Mode Operation:**
     *   **Standalone Server:** Run as a TCP server with a Redis-compatible (RESP) protocol.
     *   **Embedded Library:** Integrate directly into your application via a C-compatible Foreign Function Interface (FFI) for zero-latency, in-process database operations.

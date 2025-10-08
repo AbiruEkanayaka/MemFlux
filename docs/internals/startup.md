@@ -24,6 +24,7 @@ The core of the startup sequence resides in the `MemFluxDB::open_with_config` fu
 
 4.  **Load Virtual Schemas and Views:**
     *   The database is scanned for special keys (`_internal:schemas:` and `_internal:views:`) to populate the `SchemaCache` and `ViewCache`. This makes all persisted table schemas and views available immediately.
+    *   The `load_graph_schemas_from_db` function is then called. It scans the database for graph nodes and relationships (`_node:*`, `_edge:*`) to dynamically create and register virtual table schemas for each node label and relationship type. This is what enables querying graph data via SQL.
 
 5.  **Initialize Memory Manager:**
     *   A `MemoryManager` is created based on the `maxmemory_mb` and `eviction_policy` settings.
