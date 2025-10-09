@@ -10,7 +10,7 @@ Persistence is built-in, with a Write-Ahead Log (WAL) for durability and automat
 
 ## Core Features
 
-*   **Multi-Data Model:** Supports raw bytes, lists, sets, complex JSON documents, and a full Property Graph model (nodes and relationships).
+*   **Multi-Data Model:** Supports raw bytes, lists, sets, complex JSON documents, a full Property Graph model, and direct table/row manipulation via low-level commands.
 *   **Redis-like API:** Implements a subset of common Redis commands over the RESP protocol.
 *   **Powerful Query Engines:**
     *   **Cypher Engine:** A custom-built engine for querying the property graph with support for `MATCH`, `CREATE`, `MERGE`, pathfinding, and more.

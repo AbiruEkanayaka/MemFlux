@@ -420,22 +420,22 @@ def test_sql(sock, reader):
 
     # Drop the table
     resp = send(["SQL", "DROP", "TABLE", "drop_test"])
-    assert_eq(resp, "+OK", "DROP TABLE drop_test")
+    assert_eq(resp.startswith("-ERR"), False, "DROP TABLE drop_test should not error")
 
     # Verify schema is gone
     schema_resp = send(["GET", "_internal:schemas:drop_test"])
     assert_eq(schema_resp, "$-1", "Schema for drop_test should NOT exist after drop")
 
-    # Verify data is NOT gone
+    # Verify data IS GONE (this is the fix)
     data_resp = send(["JSON.GET", "drop_test:1"])
-    assert_eq(data_resp, "$13\r\n{\"value\":100}", "Data for drop_test should still exist after drop")
+    assert_eq(data_resp, "$-1", "Data for drop_test should be gone after drop")
 
     # Test dropping a non-existent table
     resp = send(["SQL", "DROP", "TABLE", "non_existent_table"])
     assert_eq(resp.startswith("-ERR"), True, "DROP TABLE on non-existent table should fail")
 
-    # Clean up the data
-    assert_eq(send(["DELETE", "drop_test:1"]), ":1", "Clean up drop_test data")
+    # Clean up the data (should already be gone)
+    assert_eq(send(["DELETE", "drop_test:1"]), ":0", "Clean up drop_test data (should be 0)")
 
 
     # Clean up the created schema

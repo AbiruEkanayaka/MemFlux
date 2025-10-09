@@ -37,7 +37,7 @@ CREATE TABLE users (
 
 ## `DROP TABLE`
 
-Removes a virtual schema definition.
+Removes a virtual schema definition and all associated data.
 
 ### Syntax
 ```sql
@@ -45,8 +45,8 @@ DROP TABLE table_name;
 ```
 
 ### Behavior
-- This command only removes the schema definition. **It does not delete the underlying data associated with the key prefix.**
-- After dropping a table's schema, the query engine will revert to schemaless behavior for that key prefix.
+- This command removes the schema definition **and deletes all underlying data** associated with the key prefix.
+- After dropping a table, the key prefix is empty and the schema is gone.
 
 ### Example
 ```sql

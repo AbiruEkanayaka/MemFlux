@@ -90,6 +90,51 @@ Deletes a value from a JSON document. If the path is just a key, the entire key 
 - **Example (field):** `JSON.DEL user:1.profile.age`
 - **Example (key):** `JSON.DEL user:1`
 
+## Table and Row Commands
+
+These commands provide a low-level, direct interface for creating and manipulating tables and their rows, complementing the higher-level SQL interface.
+
+#### `TABLE.CREATE <table_name> <schema_json>`
+Creates a new table with a virtual schema.
+- **Syntax:** `TABLE.CREATE <table_name> <schema_json>`
+- **Returns:** `+OK` on success, or an error if the table already exists.
+- **Example:** `TABLE.CREATE my_table "{\"table_name\":\"my_table\",\"columns\":{\"id\":{\"type\":\"INTEGER\"}}, \"constraints\":[]}"`
+
+#### `TABLE.DROP <table_name>`
+Drops a table, its schema, and all associated data.
+- **Syntax:** `TABLE.DROP <table_name>`
+- **Returns:** A simple string indicating success and the number of rows deleted (e.g., `+OK. Dropped table and 5 associated rows.`).
+
+#### `TABLE.DESCRIBE <table_name>`
+Retrieves the JSON schema for a table.
+- **Syntax:** `TABLE.DESCRIBE <table_name>`
+- **Returns:** A bulk string reply containing the pretty-printed JSON schema of the table.
+
+#### `TABLE.SCAN <table_name>`
+Returns all rows in a table.
+- **Syntax:** `TABLE.SCAN <table_name>`
+- **Returns:** An array of bulk string replies, where each reply is a JSON object representing a row.
+
+#### `ROW.SET <table_name> <pk> <properties_json>`
+Sets or replaces an entire row in a table, identified by its primary key.
+- **Syntax:** `ROW.SET <table_name> <pk> <properties_json>`
+- **Returns:** `+OK`
+
+#### `ROW.GET <table_name> <pk>`
+Retrieves a single row by its primary key.
+- **Syntax:** `ROW.GET <table_name> <pk>`
+- **Returns:** A bulk string reply with the JSON object for the row, or Nil if not found.
+
+#### `ROW.DELETE <table_name> <pk>`
+Deletes a single row by its primary key.
+- **Syntax:** `ROW.DELETE <table_name> <pk>`
+- **Returns:** An integer reply: `1` if the row was deleted, `0` if it did not exist.
+
+#### `ROW.SETPROP <table_name> <pk> <property> <value_json>`
+Sets a single property on a specific row.
+- **Syntax:** `ROW.SETPROP <table_name> <pk> <property> <value_json>`
+- **Returns:** `+OK`
+
 ## List Commands
 
 List commands operate on a deque (double-ended queue) of byte strings.

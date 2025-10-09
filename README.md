@@ -26,6 +26,7 @@ Database is designed with a dual-purpose architecture: it can be run as a **stan
     *   **JSON Documents:** Rich, schemaless JSON manipulation at the key or sub-path level.
     *   **Lists & Sets:** Redis-compatible list and set operations.
     *   **Property Graph:** A complete property graph model with nodes (labels, properties) and relationships (types, properties).
+    *   **Low-Level Table/Row Commands:** A direct, Redis-style command interface (`TABLE.CREATE`, `ROW.SET`, etc.) for manipulating tabular data, complementing the SQL engine.
 *   **Integrated Query Engines:**
     *   **SQL Query Engine:** A feature-rich SQL engine for querying JSON and tabular data. Supports complex `SELECT`s, `JOIN`s, CTEs (`WITH RECURSIVE`), DML, DDL, and advanced constraints.
     *   **Cypher Query Engine:** A powerful, from-scratch engine for querying the property graph, supporting `MATCH`, `CREATE`, `MERGE`, `RETURN`, `DELETE`, `SET`, path variables, variable-length traversals (`-[:KNOWS*1..3]->`), and functions like `shortestPath()`.

@@ -1,4 +1,5 @@
 use crate::transaction::{Transaction, TransactionHandle};
+use crate::config::DurabilityLevel;
 use std::sync::atomic::Ordering;
 use anyhow::{anyhow, Result};
 use async_stream::try_stream;
@@ -735,15 +736,37 @@ pub fn execute<'a>(
                 if !ctx.schema_cache.contains_key(&table_name) {
                     Err(anyhow!("Table '{}' does not exist", table_name))?;
                 }
-                let schema_key = format!("{}{}", SCHEMA_PREFIX, table_name);
 
-                // Log the deletion
+                // Hard delete, mimicking the behavior of the TABLE.DROP command.
+                // This is not ideal for MVCC, but aligns with existing tested behavior.
+
+                // 1. Delete schema
+                let schema_key = format!("{}{}", SCHEMA_PREFIX, table_name);
                 let log_entry = LogEntry::Delete { key: schema_key.clone() };
                 log_and_wait_qe!(ctx.logger, log_entry, ctx).await?;
-
-                // Execute the deletion
-                ctx.schema_cache.remove(&table_name);
                 ctx.db.remove(&schema_key);
+                ctx.schema_cache.remove(&table_name);
+
+                // 2. Delete data
+                let prefix = format!("{}:", table_name);
+                let keys_to_delete: Vec<String> = ctx.db.iter().filter(|r| r.key().starts_with(&prefix)).map(|r| r.key().clone()).collect();
+                
+                for key in keys_to_delete {
+                    let log_entry = LogEntry::Delete { key: key.clone() };
+                    // Use a lower durability for data deletion for performance, similar to TABLE.DROP
+                     let (ack_tx, ack_rx) = oneshot::channel();
+                    let log_req = LogRequest {
+                        entry: log_entry,
+                        ack: ack_tx,
+                        durability: DurabilityLevel::None,
+                    };
+                    if ctx.logger.send(PersistenceRequest::Log(log_req)).await.is_err() {
+                         eprintln!("Failed to log data deletion for key {}: Persistence engine down.", key);
+                         continue;
+                    }
+                    let _ = ack_rx.await;
+                    ctx.db.remove(&key);
+                }
 
                 yield json!({"status": "Table dropped"});
             }

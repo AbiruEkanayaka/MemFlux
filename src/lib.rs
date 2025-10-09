@@ -173,6 +173,7 @@ impl MemFluxDB {
             tx_id_manager,
             tx_status_manager,
             active_transactions: Arc::new(DashMap::new()),
+            table_locks: Arc::new(DashMap::new()),
         });
 
         if app_context.memory.is_enabled()
