@@ -496,38 +496,56 @@ async fn handle_table_drop(
         return Response::Error(format!("Table '{}' does not exist", table_name));
     }
 
-    // 1. Remove schema
+    // Acquire a lock for the table to prevent concurrent operations.
+    let table_lock = ctx.table_locks.entry(table_name.clone()).or_default().clone();
+    let _lock_guard = table_lock.lock().await;
+
+    // 1. Collect all keys to delete upfront.
     let schema_key = format!("{}{}", crate::schema::SCHEMA_PREFIX, table_name);
-    let log_entry = LogEntry::Delete { key: schema_key.clone() };
-    let (ack_tx, ack_rx) = oneshot::channel();
-    if ctx.logger.send(PersistenceRequest::Log(LogRequest { entry: log_entry, ack: ack_tx, durability: ctx.config.durability.clone() })).await.is_err() {
-        return Response::Error("Persistence engine is down".to_string());
-    }
-    if let Err(e) = ack_rx.await {
-        return Response::Error(format!("Failed to log schema deletion: {}", e));
-    }
-
-    ctx.schema_cache.remove(&table_name);
-    ctx.db.remove(&schema_key);
-
-    // 2. Delete all data for the table
-    let prefix = format!("{}:", table_name);
-    let keys_to_delete: Vec<String> = ctx.db.iter().filter(|r| r.key().starts_with(&prefix)).map(|r| r.key().clone()).collect();
+    let data_prefix = format!("{}:", table_name);
     
-    let mut deleted_count = 0;
-    for key in keys_to_delete {
+    let mut keys_to_delete: Vec<String> = ctx.db.iter()
+        .filter(|r| r.key().starts_with(&data_prefix))
+        .map(|r| r.key().clone())
+        .collect();
+    keys_to_delete.push(schema_key.clone());
+
+    // 2. Create and send LogEntry::Delete for every key.
+    let mut ack_receivers = Vec::new();
+    for key in &keys_to_delete {
         let log_entry = LogEntry::Delete { key: key.clone() };
         let (ack_tx, ack_rx) = oneshot::channel();
-        if ctx.logger.send(PersistenceRequest::Log(LogRequest { entry: log_entry, ack: ack_tx, durability: DurabilityLevel::None })).await.is_err() {
-             eprintln!("Failed to log data deletion for key {}: Persistence engine down.", key);
-             continue;
+        let log_req = LogRequest {
+            entry: log_entry,
+            ack: ack_tx,
+            durability: ctx.config.durability.clone(),
+        };
+
+        if ctx.logger.send(PersistenceRequest::Log(log_req)).await.is_err() {
+            return Response::Error("Persistence engine is down".to_string());
         }
-        let _ = ack_rx.await; // We can continue even if this fails, WAL is best-effort for data
-        ctx.db.remove(&key);
-        deleted_count += 1;
+        ack_receivers.push(ack_rx);
     }
 
-    Response::SimpleString(format!("OK. Dropped table and {} associated rows.", deleted_count))
+    // 3. Await all acknowledgements.
+    let results = futures::future::join_all(ack_receivers).await;
+    for result in results {
+        match result {
+            Ok(Ok(())) => { /* WAL write successful */ }
+            Ok(Err(e)) => return Response::Error(format!("WAL write error during DROP TABLE: {}", e)),
+            Err(_) => return Response::Error("Persistence engine dropped ACK channel during DROP TABLE".to_string()),
+        }
+    }
+
+    // 4. Only after all persistence acks succeed, apply in-memory removals.
+    let deleted_data_count = keys_to_delete.len() - 1; // -1 for the schema key
+    for key in keys_to_delete {
+        ctx.db.remove(&key);
+    }
+    ctx.schema_cache.remove(&table_name);
+
+    // The lock is released when _lock_guard goes out of scope.
+    Response::SimpleString(format!("OK. Dropped table and {} associated rows.", deleted_data_count))
 }
 
 async fn handle_table_describe(
