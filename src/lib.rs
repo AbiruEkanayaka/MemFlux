@@ -358,7 +358,11 @@ impl MemFluxDB {
                 }
             }
         } else if command.name == "CYPHER" {
-            let cypher = String::from_utf8_lossy(&command.args[1]).to_string();
+            let cypher = command.args[1..]
+                .iter()
+                .map(|arg| String::from_utf8_lossy(arg))
+                .collect::<Vec<_>>()
+                .join(" ");
             let mut stream = Box::pin(self.execute_cypher_stream(&cypher, transaction_handle));
             let mut rows = Vec::new();
             while let Some(row_result) = stream.next().await {

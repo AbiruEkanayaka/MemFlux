@@ -1728,6 +1728,32 @@ impl StorageExecutor {
         // Transactional path
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
+            if self.ctx.memory.is_enabled() {
+                let node_key = format!("_node:{}:{}", label, node_id);
+                let pk_key = format!("_pk_node:{}", node_id);
+
+                let new_node_db_value = DbValue::JsonB(properties.clone());
+                let new_pk_db_value = DbValue::Bytes(label.clone().into_bytes());
+
+                let new_node_size = node_key.len() as u64 + memory::estimate_db_value_size(&new_node_db_value).await;
+                let new_pk_size = pk_key.len() as u64 + memory::estimate_db_value_size(&new_pk_db_value).await;
+                let memory_change = (new_node_size + new_pk_size) as i64;
+
+                if memory_change > 0 {
+                    if let Err(e) = self.ctx.memory.ensure_memory_for(memory_change as u64, &self.ctx).await {
+                        return Response::Error(e.to_string());
+                    }
+                }
+
+                if memory_change > 0 {
+                    self.ctx.memory.increase_memory(memory_change as u64);
+                } else {
+                    self.ctx.memory.decrease_memory(-memory_change as u64);
+                }
+
+                tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+            }
+
             tx.log_entries.write().await.push(log_entry);
 
             let node_key = format!("_node:{}:{}", label, node_id);
@@ -1746,32 +1772,50 @@ impl StorageExecutor {
         let txid = self.ctx.tx_id_manager.new_txid();
         self.ctx.tx_status_manager.begin(txid);
 
+        let node_key = format!("_node:{}:{}", label, &node_id);
+        let pk_key = format!("_pk_node:{}", &node_id);
+        
+        let mut total_new_size = 0;
+        if self.ctx.memory.is_enabled() {
+            let new_node_size = node_key.len() as u64 + properties.len() as u64;
+            let new_pk_size = pk_key.len() as u64 + label.len() as u64;
+            total_new_size = new_node_size + new_pk_size;
+
+            if let Err(e) = self.ctx.memory.ensure_memory_for(total_new_size, &self.ctx).await {
+                self.ctx.tx_status_manager.abort(txid);
+                return Response::Error(e.to_string());
+            }
+        }
+
         let ack_response = log_to_wal(log_entry, &self.ctx).await;
         if !matches!(ack_response, Response::Ok) {
             self.ctx.tx_status_manager.abort(txid);
             return ack_response;
         }
 
-        let node_key = format!("_node:{}:{}", label, node_id);
-        let pk_key = format!("_pk_node:{}", node_id);
-
         let node_version = crate::types::VersionedValue {
-            value: DbValue::JsonB(properties),
+            value: DbValue::JsonB(properties.clone()),
             creator_txid: txid,
             expirer_txid: 0,
         };
         self.ctx
             .db
-            .insert(node_key, Arc::new(RwLock::new(vec![node_version])));
+            .insert(node_key.clone(), Arc::new(RwLock::new(vec![node_version])));
 
         let pk_version = crate::types::VersionedValue {
-            value: DbValue::Bytes(label.into_bytes()),
+            value: DbValue::Bytes(label.clone().into_bytes()),
             creator_txid: txid,
             expirer_txid: 0,
         };
         self.ctx
             .db
-            .insert(pk_key, Arc::new(RwLock::new(vec![pk_version])));
+            .insert(pk_key.clone(), Arc::new(RwLock::new(vec![pk_version])));
+
+        if self.ctx.memory.is_enabled() {
+            self.ctx.memory.increase_memory(total_new_size);
+            self.ctx.memory.track_access(&node_key).await;
+            self.ctx.memory.track_access(&pk_key).await;
+        }
 
         self.ctx.tx_status_manager.commit(txid);
 
@@ -1806,8 +1850,8 @@ impl StorageExecutor {
         if let Some(tx) = tx_guard.as_mut() {
             tx.log_entries.write().await.push(log_entry);
 
-            let out_key = format!("_edge:out:{}:{}:{}", start_node_id, rel_type, end_node_id);
-            let in_key = format!("_edge:in:{}:{}:{}", end_node_id, rel_type, start_node_id);
+            let out_key = format!("_edge:out:{}:{}:{}:{}", start_node_id, rel_type, end_node_id, rel_id);
+            let in_key = format!("_edge:in:{}:{}:{}:{}", end_node_id, rel_type, start_node_id, rel_id);
             let pk_key = format!("_pk_rel:{}", rel_id);
             let pk_val = format!("{}:{}:{}", start_node_id, rel_type, end_node_id);
 
@@ -1832,8 +1876,8 @@ impl StorageExecutor {
             return ack_response;
         }
 
-        let out_key = format!("_edge:out:{}:{}:{}", start_node_id, rel_type, end_node_id);
-        let in_key = format!("_edge:in:{}:{}:{}", end_node_id, rel_type, start_node_id);
+        let out_key = format!("_edge:out:{}:{}:{}:{}", start_node_id, rel_type, end_node_id, rel_id);
+        let in_key = format!("_edge:in:{}:{}:{}:{}", end_node_id, rel_type, start_node_id, rel_id);
         let pk_key = format!("_pk_rel:{}", rel_id);
         let pk_val = format!("{}:{}:{}", start_node_id, rel_type, end_node_id);
 
@@ -2443,8 +2487,8 @@ impl StorageExecutor {
                 let pk_val = String::from_utf8(pk_val_bytes).unwrap_or_default();
                 let parts: Vec<&str> = pk_val.splitn(3, ':').collect();
                 if parts.len() == 3 {
-                    let out_key = format!("_edge:out:{}", pk_val);
-                    let in_key = format!("_edge:in:{}:{}:{}", parts[2], parts[1], parts[0]);
+                    let out_key = format!("_edge:out:{}:{}", pk_val, id);
+                    let in_key = format!("_edge:in:{}:{}:{}:{}", parts[2], parts[1], parts[0], id);
                     tx.log_entries
                         .write()
                         .await
@@ -2463,8 +2507,8 @@ impl StorageExecutor {
                 let pk_val = String::from_utf8(pk_val_bytes).unwrap_or_default();
                 let parts: Vec<&str> = pk_val.splitn(3, ':').collect();
                 if parts.len() == 3 {
-                    let out_key = format!("_edge:out:{}", pk_val);
-                    let in_key = format!("_edge:in:{}:{}:{}", parts[2], parts[1], parts[0]);
+                    let out_key = format!("_edge:out:{}:{}", pk_val, id);
+                    let in_key = format!("_edge:in:{}:{}:{}:{}", parts[2], parts[1], parts[0], id);
                     let txid = self.ctx.tx_id_manager.new_txid();
                     self.ctx.tx_status_manager.begin(txid);
                     let log_entry = LogEntry::DropRelationship { id: id.clone() };

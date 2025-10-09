@@ -295,50 +295,45 @@ impl CypherParser {
             self.advance();
             types.push(self.parse_identifier()?);
         }
-        let properties = if self.current() == Some("{") {
-            Some(self.parse_map_literal()?)
-        } else {
-            None
-        };
-
-        let range = if self.current() == Some("*") {
-            self.advance(); // consume *
-            let mut min = None;
-            let mut max = None;
-
-            // Case: * or *.. or *N.. or *..N or *M..N
-            if self.current().map_or(false, |t| t.chars().all(char::is_numeric) || t == ".") {
-                 // Case: *N.. or *N
-                if self.current().map_or(false, |t| t.chars().all(char::is_numeric)) {
-                    let num = self.current().unwrap().parse::<u32>()?;
-                    self.advance();
-                    min = Some(num);
-
-                    // Case: *N..M or *N..
-                    if self.current() == Some(".") {
+        let mut properties = None;
+        let mut range: Option<(Option<u32>, Option<u32>)> = None;
+        loop {
+            if self.current() == Some("*") && range.is_none() {
+                self.advance(); // consume *
+                let mut min = None;
+                let mut max = None;
+                // Cases: * | *.. | *N | *N.. | *..M | *M..N
+                if self.current().map_or(false, |t| t.chars().all(char::is_numeric) || t == ".") {
+                    if self.current().map_or(false, |t| t.chars().all(char::is_numeric)) {
+                        let num = self.current().unwrap().parse::<u32>()?;
+                        self.advance();
+                        min = Some(num);
+                        if self.current() == Some(".") {
+                            self.advance();
+                            self.expect(".")?;
+                            if self.current().map_or(false, |t| t.chars().all(char::is_numeric)) {
+                                max = Some(self.current().unwrap().parse::<u32>()?);
+                                self.advance();
+                            }
+                        } else {
+                            max = Some(num); // *N exact
+                        }
+                    } else if self.current() == Some(".") {
                         self.advance();
                         self.expect(".")?;
-                        if self.current().map_or(false, |t| t.chars().all(char::is_numeric)) {
-                            max = Some(self.current().unwrap().parse::<u32>()?);
-                            self.advance();
-                        }
-                    } else {
-                        // Case: *N (exact length)
-                        max = Some(num);
+                        max = Some(self.current().ok_or_else(|| anyhow!("Expected a number after *.."))?.parse::<u32>()?);
+                        self.advance();
                     }
                 }
-                // Case: *..M
-                else if self.current() == Some(".") {
-                    self.advance();
-                    self.expect(".")?;
-                    max = Some(self.current().ok_or_else(|| anyhow!("Expected a number after *.."))?.parse::<u32>()?);
-                    self.advance();
-                }
+                range = Some((min, max));
+                continue;
             }
-            Some((min, max))
-        } else {
-            None
-        };
+            if self.current() == Some("{") && properties.is_none() {
+                properties = Some(self.parse_map_literal()?);
+                continue;
+            }
+            break;
+        }
 
         self.expect("]")?;
 

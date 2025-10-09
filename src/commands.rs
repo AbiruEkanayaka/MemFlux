@@ -64,7 +64,10 @@ async fn handle_graph_getnode(
             match get_visible_db_value(&node_key, &ctx, tx_guard.as_ref()).await {
                 Some(DbValue::JsonB(props)) => Response::Bytes(props),
                 Some(_) => Response::Error("WRONGTYPE: Node data is not JSONB".to_string()),
-                None => Response::Nil, // Should be inconsistent state if PK exists but node doesn't
+                None => Response::Error(format!(
+                    "INCONSISTENT: PK exists but node missing for key {}",
+                    node_key
+                )),
             }
         }
         Some(_) => Response::Error("WRONGTYPE: Node PK index is not Bytes".to_string()),
@@ -294,12 +297,18 @@ pub async fn process_command(
         "GRAPH.GETRELS" => handle_graph_getrels(command, ctx.clone(), transaction_handle).await,
         "GRAPH.DELETE" => handle_graph_delete(command, ctx.clone(), transaction_handle).await,
         "GRAPH.SETNODEPROP" => handle_graph_setnodeprop(command, ctx.clone(), transaction_handle).await,
-        "_REFRESH_GRAPH_SCHEMAS" => handle_refresh_graph_schemas(ctx.clone()).await,
+        "_REFRESH_GRAPH_SCHEMAS" => handle_refresh_graph_schemas(command, ctx.clone()).await,
         _ => Response::Error(format!("Unknown command: {}", command.name)),
     }
 }
 
-async fn handle_refresh_graph_schemas(ctx: Arc<AppContext>) -> Response {
+async fn handle_refresh_graph_schemas(command: Command, ctx: Arc<AppContext>) -> Response {
+    if !ctx.config.requirepass.is_empty() {
+        if command.args.len() < 2 || String::from_utf8_lossy(&command.args[1]) != ctx.config.requirepass {
+            return Response::Error("Unauthorized".to_string());
+        }
+    }
+
     if let Err(e) = crate::load_graph_schemas_from_db(&ctx.db, &ctx.schema_cache, &ctx.tx_status_manager, &ctx.tx_id_manager).await {
         return Response::Error(format!("Failed to refresh graph schemas: {}", e));
     }

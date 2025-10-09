@@ -144,7 +144,7 @@ async fn evaluate_expression(expr: &ast::Expression, row: &Row, ctx: Arc<AppCont
                 for entry in ctx.db.iter() {
                     if entry.key().starts_with(&out_prefix_base) {
                         let parts: Vec<&str> = entry.key().split(':').collect();
-                        if parts.len() < 5 { continue; } // _edge:out:start_id:type:end_id
+                        if parts.len() < 6 { continue; } // _edge:out:start_id:type:end_id:rel_id
 
                         let rel_type_in_db = parts[3]; // The actual relationship type in the DB
 
@@ -426,14 +426,27 @@ pub fn execute<'a>(
                             let mut prefixes_to_scan = Vec::new();
                             match direction {
                                 ast::RelationshipDirection::Outgoing => {
-                                    prefixes_to_scan.push(format!("_edge:out:{}:{}:", current_id, rel_type));
+                                    if rel_type.is_empty() {
+                                        prefixes_to_scan.push(format!("_edge:out:{}:", current_id));
+                                    } else {
+                                        prefixes_to_scan.push(format!("_edge:out:{}:{}:", current_id, rel_type));
+                                    }
                                 }
                                 ast::RelationshipDirection::Incoming => {
-                                    prefixes_to_scan.push(format!("_edge:in:{}:{}:", current_id, rel_type));
+                                    if rel_type.is_empty() {
+                                        prefixes_to_scan.push(format!("_edge:in:{}:", current_id));
+                                    } else {
+                                        prefixes_to_scan.push(format!("_edge:in:{}:{}:", current_id, rel_type));
+                                    }
                                 }
                                 ast::RelationshipDirection::Both => {
-                                    prefixes_to_scan.push(format!("_edge:out:{}:{}:", current_id, rel_type));
-                                    prefixes_to_scan.push(format!("_edge:in:{}:{}:", current_id, rel_type));
+                                    if rel_type.is_empty() {
+                                        prefixes_to_scan.push(format!("_edge:out:{}:", current_id));
+                                        prefixes_to_scan.push(format!("_edge:in:{}:", current_id));
+                                    } else {
+                                        prefixes_to_scan.push(format!("_edge:out:{}:{}:", current_id, rel_type));
+                                        prefixes_to_scan.push(format!("_edge:in:{}:{}:", current_id, rel_type));
+                                    }
                                 }
                             };
 
@@ -442,7 +455,7 @@ pub fn execute<'a>(
                                 for entry in ctx.db.iter() {
                                     if entry.key().starts_with(&edge_prefix) {
                                         let parts: Vec<&str> = entry.key().split(':').collect();
-                                        if parts.len() < 5 { continue; }
+                                        if parts.len() < 6 { continue; }
                                         let end_node_id = parts[4];
 
                                         if visited_nodes.contains(end_node_id) { continue; }
@@ -463,7 +476,14 @@ pub fn execute<'a>(
                                                     }
                                                     let mut rel_props = serde_json::from_slice::<Value>(&rel_bytes)?;
                                                     if let Some(obj) = rel_props.as_object_mut() {
-                                                        obj.insert("_type".to_string(), json!(rel_type));
+                                                        obj.insert("_type".to_string(), json!(rel_type.clone()));
+                                                        if edge_prefix.starts_with("_edge:in:") {
+                                                            obj.insert("_start_id".to_string(), json!(end_node_id));
+                                                            obj.insert("_end_id".to_string(), json!(current_id.clone()));
+                                                        } else {
+                                                            obj.insert("_start_id".to_string(), json!(current_id.clone()));
+                                                            obj.insert("_end_id".to_string(), json!(end_node_id));
+                                                        }
                                                     }
 
                                                     let mut new_path = current_path.clone();
@@ -500,14 +520,30 @@ pub fn execute<'a>(
                         let mut prefixes_to_scan = Vec::new();
                         match direction {
                             ast::RelationshipDirection::Outgoing => {
-                                prefixes_to_scan.push(format!("_edge:out:{}:{}:", start_node_id, rel_type));
+                                if rel_type.is_empty() {
+                                    prefixes_to_scan.push(format!("_edge:out:{}:", start_node_id));
+                                } else {
+                                    prefixes_to_scan.push(format!("_edge:out:{}:{}:", start_node_id, rel_type));
+                                }
                             }
                             ast::RelationshipDirection::Incoming => {
-                                prefixes_to_scan.push(format!("_edge:in:{}:{}:", start_node_id, rel_type));
+                                if rel_type.is_empty() {
+                                    prefixes_to_scan.push(format!("_edge:in:{}:", start_node_id));
+                                } else {
+                                    prefixes_to_scan.push(format!("_edge:in:{}:{}:", start_node_id, rel_type));
+                                }
                             }
                             ast::RelationshipDirection::Both => {
-                                let out_prefix = format!("_edge:out:{}:{}:", start_node_id, rel_type);
-                                let in_prefix = format!("_edge:in:{}:{}:", start_node_id, rel_type);
+                                let out_prefix = if rel_type.is_empty() {
+                                    format!("_edge:out:{}:", start_node_id)
+                                } else {
+                                    format!("_edge:out:{}:{}:", start_node_id, rel_type)
+                                };
+                                let in_prefix = if rel_type.is_empty() {
+                                    format!("_edge:in:{}:", start_node_id)
+                                } else {
+                                    format!("_edge:in:{}:{}:", start_node_id, rel_type)
+                                };
 
                                 let mut out_degree = 0;
                                 let mut in_degree = 0;
@@ -567,7 +603,7 @@ pub fn execute<'a>(
 
                             for key in keys_to_process {
                                 let parts: Vec<&str> = key.split(':').collect();
-                                if parts.len() < 5 { continue; }
+                                if parts.len() < 6 { continue; }
 
                                 let end_node_id = parts[4];
 
@@ -588,9 +624,15 @@ pub fn execute<'a>(
                                         if let Some(DbValue::JsonB(rel_bytes)) = get_visible_db_value(&key, &ctx, tx_opt).await {
                                             let mut rel_props = serde_json::from_slice::<Value>(&rel_bytes)?;
                                             if let Some(obj) = rel_props.as_object_mut() {
-                                                obj.insert("_type".to_string(), json!(rel_type));
-                                                obj.insert("_start_id".to_string(), json!(start_node_id));
-                                                obj.insert("_end_id".to_string(), json!(end_node_id));
+                                                let current_rel_type = key.split(':').nth(3).unwrap_or("");
+                                                obj.insert("_type".to_string(), json!(current_rel_type));
+                                                if edge_prefix.starts_with("_edge:in:") {
+                                                    obj.insert("_start_id".to_string(), json!(end_node_id));
+                                                    obj.insert("_end_id".to_string(), json!(start_node_id));
+                                                } else {
+                                                    obj.insert("_start_id".to_string(), json!(start_node_id));
+                                                    obj.insert("_end_id".to_string(), json!(end_node_id));
+                                                }
                                             }
 
                                             matched_once = true;
@@ -785,7 +827,22 @@ pub fn execute<'a>(
                             };
                             let properties_bytes = serde_json::to_vec(&properties_val)?;
 
-                            storage_executor.graph_add_relationship(start_id, end_id, rel_type, properties_bytes).await;
+                            let response = storage_executor.graph_add_relationship(start_id.clone(), end_id.clone(), rel_type.clone(), properties_bytes).await;
+
+                            if let (Some(rel_var), crate::types::Response::Bytes(id_bytes)) = (&rel_pattern.variable, response) {
+                                let rel_id = String::from_utf8(id_bytes).unwrap_or_default();
+                                let mut rel_obj = properties_val;
+                                if let Some(obj) = rel_obj.as_object_mut() {
+                                    obj.insert("_id".to_string(), json!(rel_id));
+                                    obj.insert("_type".to_string(), json!(rel_type));
+                                    obj.insert("_start_id".to_string(), json!(start_id));
+                                    obj.insert("_end_id".to_string(), json!(end_id));
+                                }
+
+                                if let Some(obj) = new_row.as_object_mut() {
+                                    obj.insert(rel_var.clone(), rel_obj);
+                                }
+                            }
                         }
                     }
                     yield new_row;
@@ -877,10 +934,31 @@ pub fn execute<'a>(
 
                                 let mut rel_ids_to_delete = Vec::new();
 
-                                // This is a simplified implementation. A full one would need to handle transaction visibility.
-                                for entry in ctx.db.iter() {
-                                    if entry.key().starts_with(&out_prefix) || entry.key().starts_with(&in_prefix) {
-                                        if let Some(DbValue::JsonB(bytes)) = entry.value().read().await.last().map(|v| v.value.clone()) {
+                                { 
+                                    let tx_guard = transaction_handle.read().await;
+                                    let tx_ref = tx_guard.as_ref();
+
+                                    let mut keys_to_check = std::collections::HashSet::new();
+                                    for entry in ctx.db.iter() {
+                                        if entry.key().starts_with(&out_prefix) || entry.key().starts_with(&in_prefix) {
+                                            keys_to_check.insert(entry.key().clone());
+                                        }
+                                    }
+                                    if let Some(tx) = tx_ref {
+                                        for entry in tx.writes.iter() {
+                                            let key = entry.key();
+                                            if key.starts_with(&out_prefix) || key.starts_with(&in_prefix) {
+                                                if entry.value().is_some() {
+                                                    keys_to_check.insert(key.clone());
+                                                } else {
+                                                    keys_to_check.remove(key);
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    for key in keys_to_check {
+                                        if let Some(DbValue::JsonB(bytes)) = get_visible_db_value(&key, &ctx, tx_ref).await {
                                             if let Ok(props) = serde_json::from_slice::<Value>(&bytes) {
                                                 if let Some(rel_id) = props.get("_id").and_then(|v| v.as_str()) {
                                                     rel_ids_to_delete.push(rel_id.to_string());

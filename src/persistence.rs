@@ -906,8 +906,8 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                 }
             }
             LogEntry::AddRelationship { id, start_node_id, end_node_id, rel_type, properties } => {
-                let out_key = format!("_edge:out:{}:{}:{}", start_node_id, rel_type, end_node_id);
-                let in_key = format!("_edge:in:{}:{}:{}", end_node_id, rel_type, start_node_id);
+                let out_key = format!("_edge:out:{}:{}:{}:{}", start_node_id, rel_type, end_node_id, id);
+                let in_key = format!("_edge:in:{}:{}:{}:{}", end_node_id, rel_type, start_node_id, id);
                 let pk_key = format!("_pk_rel:{}", id);
                 let pk_val = format!("{}:{}:{}", start_node_id, rel_type, end_node_id);
 
@@ -940,8 +940,8 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                                     let start_node_id = parts[0];
                                     let rel_type = parts[1];
                                     let end_node_id = parts[2];
-                                    let out_key = format!("_edge:out:{}:{}:{}", start_node_id, rel_type, end_node_id);
-                                    let in_key = format!("_edge:in:{}:{}:{}", end_node_id, rel_type, start_node_id);
+                                    let out_key = format!("_edge:out:{}:{}:{}:{}", start_node_id, rel_type, end_node_id, id);
+                                    let in_key = format!("_edge:in:{}:{}:{}:{}", end_node_id, rel_type, start_node_id, id);
                                     db.remove(&out_key);
                                     db.remove(&in_key);
                                 }
