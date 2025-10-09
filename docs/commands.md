@@ -194,6 +194,56 @@ Removes a savepoint.
 - **Syntax:** `RELEASE SAVEPOINT <name>`
 - **Returns:** `+OK`
 
+## Query Commands
+
+#### `SQL <query>`
+Executes a SQL query. See the [SQL Reference](./sql.md) for full details.
+- **Syntax:** `SQL <query-string>`
+- **Returns:** A multi-bulk reply representing the query results.
+
+#### `CYPHER <query>`
+Executes a Cypher query against the property graph. See the [Graph & Cypher Guide](./graph.md) for full details.
+- **Syntax:** `CYPHER <query-string>`
+- **Returns:** A multi-bulk reply where each row is a JSON object representing the query results.
+
+## Graph Commands
+
+These commands provide a low-level API for direct manipulation of the property graph. For more powerful and expressive graph operations, see the `CYPHER` command.
+
+#### `GRAPH.ADDNODE <label> <properties_json>`
+Adds a new node to the graph.
+- **Syntax:** `GRAPH.ADDNODE <label> <properties_json>`
+- **Returns:** A bulk string reply with the unique ID of the newly created node.
+- **Example:** `GRAPH.ADDNODE Person "{\"name\":\"Alice\"}"`
+
+#### `GRAPH.GETNODE <id>`
+Retrieves the properties of a node.
+- **Syntax:** `GRAPH.GETNODE <id>`
+- **Returns:** A bulk string reply containing the JSON properties of the node, or Nil if not found.
+
+#### `GRAPH.ADDREL <start_id> <end_id> <type> <properties_json>`
+Adds a new directed relationship (edge) between two nodes.
+- **Syntax:** `GRAPH.ADDREL <start_id> <end_id> <type> <properties_json>`
+- **Returns:** A bulk string reply with the unique ID of the newly created relationship.
+- **Example:** `GRAPH.ADDREL <alice_id> <bob_id> KNOWS "{\"since\":2022}"`
+
+#### `GRAPH.GETRELS <node_id> [OUT|IN|BOTH] [type]`
+Retrieves all relationships connected to a node.
+- **Syntax:** `GRAPH.GETRELS <node_id> [direction] [type]`
+- **Direction (Optional):** `OUT` (default), `IN`, or `BOTH`.
+- **Type (Optional):** Filters by a specific relationship type.
+- **Returns:** An array of bulk string replies, where each reply is the JSON properties of a relationship.
+
+#### `GRAPH.DELETE <id>`
+Deletes a node or a relationship by its ID. Note: Deleting a node does **not** automatically delete its connected relationships (this can result in dangling edges). For cascading deletes, use the `DETACH DELETE` clause in a `CYPHER` query.
+- **Syntax:** `GRAPH.DELETE <id>`
+- **Returns:** An integer reply: `1` if deleted, `0` otherwise.
+
+#### `GRAPH.SETNODEPROP <id> <property> <value_json>`
+Sets a single property on a node, adding it if it doesn't exist or overwriting it if it does.
+- **Syntax:** `GRAPH.SETNODEPROP <id> <property> <value_json>`
+- **Returns:** An integer reply: `1` if the property was set, `0` if the node was not found.
+
 ## Indexing Commands
 
 See the [Indexing Documentation](./indexing.md) for more details.

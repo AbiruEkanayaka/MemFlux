@@ -12,6 +12,14 @@ The SQL engine is accessed via a single command, `SQL`, followed by the query st
 
 The engine treats key prefixes as "tables". For example, keys like `user:1`, `user:2` are considered rows in the `user` table. The part of the key after the prefix is automatically available as the `id` field in `SELECT` queries.
 
+### SQL & Graph Interoperability
+
+MemFlux features deep integration between its SQL and Graph models, allowing you to build powerful hybrid queries.
+
+*   **Graph Data as SQL Tables:** The graph is automatically exposed to the SQL engine as a set of virtual tables. For every node label (e.g., `Person`), a corresponding `Person` table is available to `SELECT` from. The same applies to relationship types (e.g., `KNOWS`). This allows you to use standard SQL to query, filter, and join graph data.
+
+*   **Cypher Queries in SQL (`GRAPH_MATCH`):** For more complex graph traversal patterns, you can embed a Cypher query directly into a SQL `FROM` clause using the `GRAPH_MATCH` function. This treats the results of the Cypher query as a temporary table that you can then `JOIN` with other SQL tables.
+
 ### Key Concepts
 
 *   **Virtual Schemas:** You can use DDL commands like `CREATE TABLE` to define a "virtual schema" for a key prefix. This provides data validation, type casting, and enables more robust query planning and error checking.

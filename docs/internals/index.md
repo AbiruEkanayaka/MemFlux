@@ -14,6 +14,10 @@ While the main documentation provides a user-focused overview, these documents d
 
 *   **[The SQL Query Engine](./query_engine.md):** A detailed breakdown of the query pipeline, from parsing a raw SQL string to executing a physical plan and streaming results.
 
+*   **[The Cypher Query Engine](./cypher_engine.md):** A breakdown of the new Cypher query pipeline, from parsing to execution.
+
+*   **[Graph Storage Model](./graph_storage.md):** An overview of the low-level key schema used to store graph nodes and relationships.
+
 *   **[The FFI Layer](./ffi.md):** An overview of how the core Rust library is exposed via a C-compatible Foreign Function Interface.
 
 *   **[Memory Management & Eviction](./memory_management.md):** An in-depth look at how memory is tracked and how the different eviction policies (LRU, LFU, ARC) are implemented.
