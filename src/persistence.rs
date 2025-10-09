@@ -801,8 +801,8 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                                     let start_node_id = parts[0];
                                     let rel_type = parts[1];
                                     let end_node_id = parts[2];
-                                    let out_key = format!("_edge:out:{}:{}:{}", start_node_id, rel_type, end_node_id);
-                                    let in_key = format!("_edge:in:{}:{}:{}", end_node_id, rel_type, start_node_id);
+                                    let out_key = format!("_edge:out:{}:{}:{}:{}", start_node_id, rel_type, end_node_id, id);
+                                    let in_key = format!("_edge:in:{}:{}:{}:{}", end_node_id, rel_type, start_node_id, id);
 
                                     for key in [out_key, in_key] {
                                         if let Some(edge_entry) = db.get(&key) {
@@ -877,8 +877,8 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                                     let start_node_id = parts[0];
                                     let rel_type = parts[1];
                                     let end_node_id = parts[2];
-                                    let out_key = format!("_edge:out:{}:{}:{}", start_node_id, rel_type, end_node_id);
-                                    let in_key = format!("_edge:in:{}:{}:{}", end_node_id, rel_type, start_node_id);
+                                    let out_key = format!("_edge:out:{}:{}:{}:{}", start_node_id, rel_type, end_node_id, id);
+                                    let in_key = format!("_edge:in:{}:{}:{}:{}", end_node_id, rel_type, start_node_id, id);
 
                                     for key in [out_key, in_key] {
                                         if let Some(edge_entry) = db.get(&key) {

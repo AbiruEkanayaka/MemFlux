@@ -1018,18 +1018,145 @@ pub fn execute<'a>(
                     }
                 }
             }
-            PhysicalPlan::Join { left, right, condition, join_type: _ } => {
+            PhysicalPlan::Join { left, right, condition, join_type } => {
                 let left_rows: Vec<Row> = Box::pin(execute(*left, ctx.clone(), transaction_handle.clone())).try_collect().await?;
                 let right_rows: Vec<Row> = Box::pin(execute(*right, ctx.clone(), transaction_handle.clone())).try_collect().await?;
 
-                for l_row in left_rows {
-                    for r_row in &right_rows {
-                        let mut combined = l_row.as_object().unwrap().clone();
-                        combined.extend(r_row.as_object().unwrap().clone());
-                        let combined_row = json!(combined);
+                match join_type {
+                    crate::cypher_engine::logical_plan::JoinType::Inner => {
+                        for l_row in &left_rows {
+                            for r_row in &right_rows {
+                                let mut combined = l_row.as_object().unwrap().clone();
+                                combined.extend(r_row.as_object().unwrap().clone());
+                                let combined_row = json!(combined);
 
-                        if evaluate_expression(&condition, &combined_row, ctx.clone(), transaction_handle.clone()).await?.as_bool().unwrap_or(false) {
-                            yield combined_row;
+                                if evaluate_expression(&condition, &combined_row, ctx.clone(), transaction_handle.clone()).await?.as_bool().unwrap_or(false) {
+                                    yield combined_row;
+                                }
+                            }
+                        }
+                    }
+                    crate::cypher_engine::logical_plan::JoinType::Left => {
+                        let mut right_keys = std::collections::HashSet::new();
+                        for r_row in &right_rows {
+                            if let Some(obj) = r_row.as_object() {
+                                for k in obj.keys() {
+                                    right_keys.insert(k.clone());
+                                }
+                            }
+                        }
+
+                        for l_row in &left_rows {
+                            let mut matched = false;
+                            for r_row in &right_rows {
+                                let mut combined = l_row.as_object().unwrap().clone();
+                                combined.extend(r_row.as_object().unwrap().clone());
+                                let combined_row = json!(combined);
+
+                                if evaluate_expression(&condition, &combined_row, ctx.clone(), transaction_handle.clone()).await?.as_bool().unwrap_or(false) {
+                                    yield combined_row;
+                                    matched = true;
+                                }
+                            }
+                            if !matched {
+                                let mut combined = l_row.as_object().unwrap().clone();
+                                for key in &right_keys {
+                                    combined.insert(key.clone(), Value::Null);
+                                }
+                                yield json!(combined);
+                            }
+                        }
+                    }
+                    crate::cypher_engine::logical_plan::JoinType::Right => {
+                        let mut left_keys = std::collections::HashSet::new();
+                        for l_row in &left_rows {
+                            if let Some(obj) = l_row.as_object() {
+                                for k in obj.keys() {
+                                    left_keys.insert(k.clone());
+                                }
+                            }
+                        }
+
+                        for r_row in &right_rows {
+                            let mut matched = false;
+                            for l_row in &left_rows {
+                                let mut combined = l_row.as_object().unwrap().clone();
+                                combined.extend(r_row.as_object().unwrap().clone());
+                                let combined_row = json!(combined);
+
+                                if evaluate_expression(&condition, &combined_row, ctx.clone(), transaction_handle.clone()).await?.as_bool().unwrap_or(false) {
+                                    yield combined_row;
+                                    matched = true;
+                                }
+                            }
+                            if !matched {
+                                let mut combined = r_row.as_object().unwrap().clone();
+                                for key in &left_keys {
+                                    combined.insert(key.clone(), Value::Null);
+                                }
+                                yield json!(combined);
+                            }
+                        }
+                    }
+                    crate::cypher_engine::logical_plan::JoinType::FullOuter => {
+                        let mut left_keys = std::collections::HashSet::new();
+                        for l_row in &left_rows {
+                            if let Some(obj) = l_row.as_object() {
+                                for k in obj.keys() {
+                                    left_keys.insert(k.clone());
+                                }
+                            }
+                        }
+                        let mut right_keys = std::collections::HashSet::new();
+                        for r_row in &right_rows {
+                            if let Some(obj) = r_row.as_object() {
+                                for k in obj.keys() {
+                                    right_keys.insert(k.clone());
+                                }
+                            }
+                        }
+
+                        let mut right_matched = vec![false; right_rows.len()];
+
+                        for l_row in &left_rows {
+                            let mut left_matched = false;
+                            for (i, r_row) in right_rows.iter().enumerate() {
+                                let mut combined = l_row.as_object().unwrap().clone();
+                                combined.extend(r_row.as_object().unwrap().clone());
+                                let combined_row = json!(combined);
+
+                                if evaluate_expression(&condition, &combined_row, ctx.clone(), transaction_handle.clone()).await?.as_bool().unwrap_or(false) {
+                                    yield combined_row;
+                                    left_matched = true;
+                                    right_matched[i] = true;
+                                }
+                            }
+                            if !left_matched {
+                                let mut combined = l_row.as_object().unwrap().clone();
+                                for key in &right_keys {
+                                    combined.insert(key.clone(), Value::Null);
+                                }
+                                yield json!(combined);
+                            }
+                        }
+
+                        for (i, r_row) in right_rows.iter().enumerate() {
+                            if !right_matched[i] {
+                                let mut combined = r_row.as_object().unwrap().clone();
+                                for key in &left_keys {
+                                    combined.insert(key.clone(), Value::Null);
+                                }
+                                yield json!(combined);
+                            }
+                        }
+                    }
+                    crate::cypher_engine::logical_plan::JoinType::Cross => {
+                        for l_row in &left_rows {
+                            for r_row in &right_rows {
+                                let mut combined = l_row.as_object().unwrap().clone();
+                                combined.extend(r_row.as_object().unwrap().clone());
+                                yield json!(combined);
+                            }
                         }
                     }
                 }
