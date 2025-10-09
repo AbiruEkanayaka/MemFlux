@@ -246,6 +246,314 @@ async fn handle_graph_setnodeprop(
 }
 
 
+async fn handle_row_set(
+    command: Command,
+    ctx: Arc<AppContext>,
+    transaction_handle: TransactionHandle,
+) -> Response {
+    if command.args.len() != 4 {
+        return Response::Error(
+            "ROW.SET requires <table_name>, <pk> and <properties_json>".to_string(),
+        );
+    }
+    let table_name = match String::from_utf8(command.args[1].clone()) {
+        Ok(l) => l,
+        Err(_) => return Response::Error("Invalid table name".to_string()),
+    };
+    let pk = match String::from_utf8(command.args[2].clone()) {
+        Ok(l) => l,
+        Err(_) => return Response::Error("Invalid primary key".to_string()),
+    };
+    let properties_json = &command.args[3];
+
+    // Validate JSON
+    let value: Value = match serde_json::from_slice(properties_json) {
+        Ok(v) => v,
+        Err(_) => return Response::Error("Invalid JSON properties".to_string()),
+    };
+
+    let key = format!("{}:{}", table_name, pk);
+
+    let executor = StorageExecutor::new(ctx, transaction_handle);
+    executor.json_set(key, "", value).await
+}
+
+async fn handle_row_get(
+    command: Command,
+    ctx: Arc<AppContext>,
+    transaction_handle: TransactionHandle,
+) -> Response {
+    if command.args.len() != 3 {
+        return Response::Error("ROW.GET requires <table_name> and <pk>".to_string());
+    }
+    let table_name = match String::from_utf8(command.args[1].clone()) {
+        Ok(l) => l,
+        Err(_) => return Response::Error("Invalid table name".to_string()),
+    };
+    let pk = match String::from_utf8(command.args[2].clone()) {
+        Ok(l) => l,
+        Err(_) => return Response::Error("Invalid primary key".to_string()),
+    };
+
+    let key = format!("{}:{}", table_name, pk);
+
+    let tx_guard = transaction_handle.read().await;
+    match get_visible_db_value(&key, &ctx, tx_guard.as_ref()).await {
+        Some(db_value) => json_db_value_to_response(&db_value, "", &key, &ctx).await,
+        None => Response::Nil,
+    }
+}
+
+async fn handle_row_delete(
+    command: Command,
+    ctx: Arc<AppContext>,
+    transaction_handle: TransactionHandle,
+) -> Response {
+    if command.args.len() != 3 {
+        return Response::Error("ROW.DELETE requires <table_name> and <pk>".to_string());
+    }
+    let table_name = match String::from_utf8(command.args[1].clone()) {
+        Ok(l) => l,
+        Err(_) => return Response::Error("Invalid table name".to_string()),
+    };
+    let pk = match String::from_utf8(command.args[2].clone()) {
+        Ok(l) => l,
+        Err(_) => return Response::Error("Invalid primary key".to_string()),
+    };
+
+    let key = format!("{}:{}", table_name, pk);
+
+    let executor = StorageExecutor::new(ctx, transaction_handle);
+    executor.delete(vec![key]).await
+}
+
+async fn handle_row_setprop(
+    command: Command,
+    ctx: Arc<AppContext>,
+    transaction_handle: TransactionHandle,
+) -> Response {
+    if command.args.len() != 5 {
+        return Response::Error(
+            "ROW.SETPROP requires <table_name>, <pk>, <property> and <value_json>".to_string(),
+        );
+    }
+    let table_name = match String::from_utf8(command.args[1].clone()) {
+        Ok(id) => id,
+        Err(_) => return Response::Error("Invalid table name".to_string()),
+    };
+    let pk = match String::from_utf8(command.args[2].clone()) {
+        Ok(id) => id,
+        Err(_) => return Response::Error("Invalid pk".to_string()),
+    };
+    let property = match String::from_utf8(command.args[3].clone()) {
+        Ok(p) => p,
+        Err(_) => return Response::Error("Invalid property name".to_string()),
+    };
+    let value_json = command.args[4].clone();
+
+    // Validate JSON
+    let value: Value = match serde_json::from_slice(&value_json) {
+        Ok(v) => v,
+        Err(_) => return Response::Error("Invalid JSON value".to_string()),
+    };
+
+    let key = format!("{}:{}", table_name, pk);
+
+    let executor = StorageExecutor::new(ctx, transaction_handle);
+    executor.json_set(key, &property, value).await
+}
+
+async fn handle_table_scan(
+    command: Command,
+    ctx: Arc<AppContext>,
+    transaction_handle: TransactionHandle,
+) -> Response {
+    if command.args.len() != 2 {
+        return Response::Error("TABLE.SCAN requires <table_name>".to_string());
+    }
+    let table_name = match String::from_utf8(command.args[1].clone()) {
+        Ok(l) => l,
+        Err(_) => return Response::Error("Invalid table name".to_string()),
+    };
+
+    let prefix = format!("{}:", table_name);
+    let mut results = Vec::new();
+    let tx_guard = transaction_handle.read().await;
+
+    let mut keys_to_process: HashSet<String> = HashSet::new();
+    if let Some(tx) = tx_guard.as_ref() {
+        for r in ctx.db.iter() {
+            if r.key().starts_with(&prefix) {
+                keys_to_process.insert(r.key().clone());
+            }
+        }
+        for item in tx.writes.iter() {
+            if item.key().starts_with(&prefix) {
+                keys_to_process.insert(item.key().clone());
+            }
+        }
+    } else {
+        for r in ctx.db.iter() {
+            if r.key().starts_with(&prefix) {
+                keys_to_process.insert(r.key().clone());
+            }
+        }
+    }
+
+    for key in keys_to_process {
+        if let Some(visible_value) = get_visible_db_value(&key, &ctx, tx_guard.as_ref()).await {
+            match visible_value {
+                DbValue::JsonB(props) => results.push(props),
+                DbValue::Json(props) => results.push(props.to_string().into_bytes()),
+                _ => {} // Ignore other types
+            }
+        }
+    }
+
+    Response::MultiBytes(results)
+}
+
+async fn handle_table_create(
+    command: Command,
+    ctx: Arc<AppContext>,
+    _transaction_handle: TransactionHandle,
+) -> Response {
+    if command.args.len() != 3 {
+        return Response::Error("TABLE.CREATE requires <table_name> and <schema_json>".to_string());
+    }
+    let table_name = match String::from_utf8(command.args[1].clone()) {
+        Ok(name) => name,
+        Err(_) => return Response::Error("Invalid table name".to_string()),
+    };
+    let schema_json = &command.args[2];
+
+    if ctx.schema_cache.contains_key(&table_name) {
+        return Response::Error(format!("Table '{}' already exists", table_name));
+    }
+
+    let schema: crate::schema::VirtualSchema = match serde_json::from_slice(schema_json) {
+        Ok(s) => s,
+        Err(e) => return Response::Error(format!("Invalid schema JSON: {}", e)),
+    };
+
+    // Basic validation
+    if schema.table_name != table_name {
+        return Response::Error("Table name in schema JSON does not match command".to_string());
+    }
+
+    let schema_key = format!("{}{}", crate::schema::SCHEMA_PREFIX, table_name);
+    let schema_bytes = match serde_json::to_vec(&schema) {
+        Ok(b) => b,
+        Err(e) => return Response::Error(format!("Failed to serialize schema: {}", e)),
+    };
+
+    let log_entry = LogEntry::SetBytes {
+        key: schema_key.clone(),
+        value: schema_bytes.clone(),
+    };
+    let (ack_tx, ack_rx) = oneshot::channel();
+    let log_req = LogRequest {
+        entry: log_entry,
+        ack: ack_tx,
+        durability: ctx.config.durability.clone(),
+    };
+
+    if ctx.logger.send(PersistenceRequest::Log(log_req)).await.is_err() {
+        return Response::Error("Persistence engine is down".to_string());
+    }
+
+    match ack_rx.await {
+        Ok(Ok(())) => {
+            let version = crate::types::VersionedValue {
+                value: DbValue::Bytes(schema_bytes),
+                creator_txid: 0, // System transaction
+                expirer_txid: 0,
+            };
+            ctx.db
+                .insert(schema_key, Arc::new(tokio::sync::RwLock::new(vec![version])));
+            ctx.schema_cache.insert(table_name, Arc::new(schema));
+            Response::Ok
+        }
+        Ok(Err(e)) => Response::Error(format!("WAL write error: {}", e)),
+        Err(_) => Response::Error("Persistence engine dropped ACK channel".to_string()),
+    }
+}
+
+async fn handle_table_drop(
+    command: Command,
+    ctx: Arc<AppContext>,
+    _transaction_handle: TransactionHandle,
+) -> Response {
+    if command.args.len() != 2 {
+        return Response::Error("TABLE.DROP requires <table_name>".to_string());
+    }
+    let table_name = match String::from_utf8(command.args[1].clone()) {
+        Ok(name) => name,
+        Err(_) => return Response::Error("Invalid table name".to_string()),
+    };
+
+    if !ctx.schema_cache.contains_key(&table_name) {
+        return Response::Error(format!("Table '{}' does not exist", table_name));
+    }
+
+    // 1. Remove schema
+    let schema_key = format!("{}{}", crate::schema::SCHEMA_PREFIX, table_name);
+    let log_entry = LogEntry::Delete { key: schema_key.clone() };
+    let (ack_tx, ack_rx) = oneshot::channel();
+    if ctx.logger.send(PersistenceRequest::Log(LogRequest { entry: log_entry, ack: ack_tx, durability: ctx.config.durability.clone() })).await.is_err() {
+        return Response::Error("Persistence engine is down".to_string());
+    }
+    if let Err(e) = ack_rx.await {
+        return Response::Error(format!("Failed to log schema deletion: {}", e));
+    }
+
+    ctx.schema_cache.remove(&table_name);
+    ctx.db.remove(&schema_key);
+
+    // 2. Delete all data for the table
+    let prefix = format!("{}:", table_name);
+    let keys_to_delete: Vec<String> = ctx.db.iter().filter(|r| r.key().starts_with(&prefix)).map(|r| r.key().clone()).collect();
+    
+    let mut deleted_count = 0;
+    for key in keys_to_delete {
+        let log_entry = LogEntry::Delete { key: key.clone() };
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if ctx.logger.send(PersistenceRequest::Log(LogRequest { entry: log_entry, ack: ack_tx, durability: DurabilityLevel::None })).await.is_err() {
+             eprintln!("Failed to log data deletion for key {}: Persistence engine down.", key);
+             continue;
+        }
+        let _ = ack_rx.await; // We can continue even if this fails, WAL is best-effort for data
+        ctx.db.remove(&key);
+        deleted_count += 1;
+    }
+
+    Response::SimpleString(format!("OK. Dropped table and {} associated rows.", deleted_count))
+}
+
+async fn handle_table_describe(
+    command: Command,
+    ctx: Arc<AppContext>,
+    _transaction_handle: TransactionHandle,
+) -> Response {
+    if command.args.len() != 2 {
+        return Response::Error("TABLE.DESCRIBE requires <table_name>".to_string());
+    }
+    let table_name = match String::from_utf8(command.args[1].clone()) {
+        Ok(name) => name,
+        Err(_) => return Response::Error("Invalid table name".to_string()),
+    };
+
+    match ctx.schema_cache.get(&table_name) {
+        Some(schema) => {
+            match serde_json::to_vec_pretty(&**schema) {
+                Ok(json_bytes) => Response::Bytes(json_bytes),
+                Err(e) => Response::Error(format!("Failed to serialize schema: {}", e)),
+            }
+        }
+        None => Response::Error(format!("Table '{}' not found", table_name)),
+    }
+}
+
 pub async fn process_command(
     command: Command,
     ctx: Arc<AppContext>,
@@ -297,6 +605,14 @@ pub async fn process_command(
         "GRAPH.GETRELS" => handle_graph_getrels(command, ctx.clone(), transaction_handle).await,
         "GRAPH.DELETE" => handle_graph_delete(command, ctx.clone(), transaction_handle).await,
         "GRAPH.SETNODEPROP" => handle_graph_setnodeprop(command, ctx.clone(), transaction_handle).await,
+        "ROW.SET" => handle_row_set(command, ctx.clone(), transaction_handle).await,
+        "ROW.GET" => handle_row_get(command, ctx.clone(), transaction_handle).await,
+        "ROW.DELETE" => handle_row_delete(command, ctx.clone(), transaction_handle).await,
+        "ROW.SETPROP" => handle_row_setprop(command, ctx.clone(), transaction_handle).await,
+        "TABLE.SCAN" => handle_table_scan(command, ctx.clone(), transaction_handle).await,
+        "TABLE.CREATE" => handle_table_create(command, ctx.clone(), transaction_handle).await,
+        "TABLE.DROP" => handle_table_drop(command, ctx.clone(), transaction_handle).await,
+        "TABLE.DESCRIBE" => handle_table_describe(command, ctx.clone(), transaction_handle).await,
         "_REFRESH_GRAPH_SCHEMAS" => handle_refresh_graph_schemas(command, ctx.clone()).await,
         _ => Response::Error(format!("Unknown command: {}", command.name)),
     }
