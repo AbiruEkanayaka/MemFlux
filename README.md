@@ -62,6 +62,17 @@ Key sections include:
 
 MemFlux can be used in two primary ways: as a standalone server or as an embedded library.
 
+First, clone the repository the project:
+
+```sh
+git clone --recurse-submodules https://github.com/AbiruEkanayaka/MemFlux.git
+cd MemFlux
+```
+This project uses FluxMap as a submodule. The `--recurse-submodules` flag ensures that FluxMap is cloned alongside MemFlux.
+
+
+### Then you can use the project in either mode:
+
 ### 1. As a Standalone Server
 
 In this mode, MemFlux runs as a background process and accepts client connections over the network using the Redis (RESP) protocol.
