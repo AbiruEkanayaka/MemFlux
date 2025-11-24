@@ -1,0 +1,3 @@
+[submodule "fluxmap"]
+	path = fluxmap
+	url = https://github.com/AbiruEkanayaka/FluxMap
