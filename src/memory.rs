@@ -1,13 +1,12 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use rand::Rng;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::{RwLock, oneshot};
 
 use crate::arc::ArcCache;
 use crate::config::EvictionPolicy;
 use crate::types::{AppContext, DbValue, LogEntry, LogRequest, PersistenceRequest};
-
 
 // A rough estimation of the memory used by a DbValue.
 // It's not perfect but gives us a baseline for memory management.
@@ -212,7 +211,8 @@ impl MemoryManager {
                     if let Some(k) = probationary.remove(pos) {
                         // Check protected segment capacity
                         let total_capacity = probationary.len() + protected.len();
-                        let max_protected = ((total_capacity as f64) * self.lfru_protected_ratio) as usize;
+                        let max_protected =
+                            ((total_capacity as f64) * self.lfru_protected_ratio) as usize;
                         if protected.len() >= max_protected && !protected.is_empty() {
                             // Evict from protected to probationary
                             if let Some(evicted) = protected.pop_back() {
@@ -360,9 +360,7 @@ impl MemoryManager {
 
         // Check if the single new item is larger than the total memory
         if needed_size > self.max_memory_bytes {
-            return Err(anyhow!(
-                "OOM: The item is larger than the maxmemory limit"
-            ));
+            return Err(anyhow!("OOM: The item is larger than the maxmemory limit"));
         }
 
         while self.current_memory() + needed_size > self.max_memory_bytes {
@@ -384,7 +382,10 @@ impl MemoryManager {
                             // Safety check: if min_freq exceeds a reasonable threshold, or
                             // we've looped too many times, give up
                             if *min_freq > 1_000_000 || iterations > MAX_ITERATIONS {
-                                eprintln!("WARNING: LFU eviction safety limit reached - min_freq: {}, iterations: {}", *min_freq, iterations);
+                                eprintln!(
+                                    "WARNING: LFU eviction safety limit reached - min_freq: {}, iterations: {}",
+                                    *min_freq, iterations
+                                );
                                 break None;
                             }
                             match freq_keys.get_mut(&min_freq) {
@@ -448,7 +449,8 @@ impl MemoryManager {
                     // Log the deletion for persistence
                     let log_entry = LogEntry::Delete { key: key.clone() };
                     let (ack_tx, ack_rx) = oneshot::channel();
-                    if ctx.logger
+                    if ctx
+                        .logger
                         .send(PersistenceRequest::Log(LogRequest {
                             entry: log_entry,
                             ack: ack_tx,

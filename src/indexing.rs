@@ -75,12 +75,3 @@ impl IndexManager {
         }
     }
 }
-
-
-
-
-
-
-
-
-

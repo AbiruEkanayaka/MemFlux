@@ -4,11 +4,11 @@ use crate::transaction::{Transaction, TransactionHandle};
 use crate::types::{
     AppContext, DbValue, LogEntry, LogRequest, PersistenceRequest, Response, TransactionStatus,
 };
-use anyhow::{anyhow, Result};
-use serde_json::{json, Value};
+use anyhow::{Result, anyhow};
+use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::{RwLock, oneshot};
 use uuid::Uuid;
 
 pub async fn log_to_wal(log_entry: LogEntry, ctx: &AppContext) -> Response {
@@ -33,7 +33,12 @@ pub async fn log_to_wal(log_entry: LogEntry, ctx: &AppContext) -> Response {
         ack: ack_tx,
         durability: ctx.config.durability.clone(),
     };
-    if ctx.logger.send(PersistenceRequest::Log(log_req)).await.is_err() {
+    if ctx
+        .logger
+        .send(PersistenceRequest::Log(log_req))
+        .await
+        .is_err()
+    {
         return Response::Error("Persistence engine is down".to_string());
     }
     match ack_rx.await {
@@ -65,9 +70,7 @@ pub async fn get_visible_db_value<'a>(
             drop(version_chain_lock);
             let version_chain = version_chain_arc.read().await;
             for version in version_chain.iter().rev() {
-                if tx.snapshot
-                    .is_visible(version, &ctx.tx_status_manager)
-                {
+                if tx.snapshot.is_visible(version, &ctx.tx_status_manager) {
                     if ctx.memory.is_enabled() {
                         ctx.memory.track_access(key).await;
                     }
@@ -105,11 +108,17 @@ pub struct StorageExecutor {
 
 impl StorageExecutor {
     pub fn new(ctx: Arc<AppContext>, transaction_handle: TransactionHandle) -> Self {
-        Self { ctx, transaction_handle }
+        Self {
+            ctx,
+            transaction_handle,
+        }
     }
 
     pub async fn set(&self, key: String, value: Vec<u8>) -> Response {
-        let log_entry = LogEntry::SetBytes { key: key.clone(), value: value.clone() };
+        let log_entry = LogEntry::SetBytes {
+            key: key.clone(),
+            value: value.clone(),
+        };
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
             if self.ctx.memory.is_enabled() {
@@ -121,12 +130,18 @@ impl StorageExecutor {
                 };
 
                 let new_db_value = DbValue::Bytes(value.clone());
-                let new_size = key.len() as u64 + memory::estimate_db_value_size(&new_db_value).await;
+                let new_size =
+                    key.len() as u64 + memory::estimate_db_value_size(&new_db_value).await;
 
                 let memory_change = new_size as i64 - old_size as i64;
 
                 if memory_change > 0 {
-                    if let Err(e) = self.ctx.memory.ensure_memory_for(memory_change as u64, &self.ctx).await {
+                    if let Err(e) = self
+                        .ctx
+                        .memory
+                        .ensure_memory_for(memory_change as u64, &self.ctx)
+                        .await
+                    {
                         return Response::Error(e.to_string());
                     }
                 }
@@ -137,18 +152,21 @@ impl StorageExecutor {
                     self.ctx.memory.decrease_memory(-memory_change as u64);
                 }
 
-                tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+                tx.reserved_memory
+                    .fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
             }
 
             tx.log_entries.write().await.push(log_entry);
-            tx.writes.insert(key.clone(), Some(DbValue::Bytes(value.clone())));
+            tx.writes
+                .insert(key.clone(), Some(DbValue::Bytes(value.clone())));
             return Response::Ok;
         }
         drop(tx_guard);
         let txid = self.ctx.tx_id_manager.new_txid();
         self.ctx.tx_status_manager.begin(txid);
         let mut old_size = 0;
-        let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
+        let snapshot =
+            crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
         if let Some(version_chain_lock) = self.ctx.db.get(&key) {
             let version_chain_arc = version_chain_lock.clone();
             drop(version_chain_lock);
@@ -158,8 +176,8 @@ impl StorageExecutor {
                 .rev()
                 .find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager))
             {
-                old_size = key.len() as u64
-                    + memory::estimate_db_value_size(&latest_version.value).await;
+                old_size =
+                    key.len() as u64 + memory::estimate_db_value_size(&latest_version.value).await;
             }
         }
         if self.ctx.memory.is_enabled() {
@@ -175,7 +193,8 @@ impl StorageExecutor {
             self.ctx.tx_status_manager.abort(txid);
             return ack_response;
         }
-        let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
+        let snapshot =
+            crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
         let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
         let mut version_chain = version_chain_arc.write().await;
         if let Some(latest_version) = version_chain
@@ -185,7 +204,11 @@ impl StorageExecutor {
         {
             latest_version.expirer_txid = txid;
         }
-        let new_version = crate::types::VersionedValue { value: DbValue::Bytes(value.clone()), creator_txid: txid, expirer_txid: 0 };
+        let new_version = crate::types::VersionedValue {
+            value: DbValue::Bytes(value.clone()),
+            creator_txid: txid,
+            expirer_txid: 0,
+        };
         version_chain.push(new_version);
         let new_size = key.len() as u64 + value.len() as u64;
         self.ctx.memory.decrease_memory(old_size);
@@ -207,11 +230,15 @@ impl StorageExecutor {
                     if let Some(v) = old_db_value {
                         let old_size = key.len() as u64 + memory::estimate_db_value_size(&v).await;
                         self.ctx.memory.decrease_memory(old_size);
-                        tx.reserved_memory.fetch_sub(old_size as i64, std::sync::atomic::Ordering::Relaxed);
+                        tx.reserved_memory
+                            .fetch_sub(old_size as i64, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
 
-                tx.log_entries.write().await.push(LogEntry::Delete { key: key.clone() });
+                tx.log_entries
+                    .write()
+                    .await
+                    .push(LogEntry::Delete { key: key.clone() });
                 tx.writes.insert(key, None);
                 deleted_count += 1;
             }
@@ -235,10 +262,15 @@ impl StorageExecutor {
                 drop(version_chain_lock);
                 let mut version_chain = version_chain_arc.write().await;
                 let mut expired_something = false;
-                if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == 0 && self.ctx.tx_status_manager.get_status(v.creator_txid) == Some(TransactionStatus::Committed)) {
+                if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| {
+                    v.expirer_txid == 0
+                        && self.ctx.tx_status_manager.get_status(v.creator_txid)
+                            == Some(TransactionStatus::Committed)
+                }) {
                     latest_version.expirer_txid = txid;
                     expired_something = true;
-                    old_size = key.len() as u64 + memory::estimate_db_value_size(&latest_version.value).await;
+                    old_size = key.len() as u64
+                        + memory::estimate_db_value_size(&latest_version.value).await;
                     old_value_for_index = match &latest_version.value {
                         DbValue::Json(v) => Some(v.clone()),
                         DbValue::JsonB(b) => serde_json::from_slice(b).ok(),
@@ -251,7 +283,10 @@ impl StorageExecutor {
                         self.ctx.memory.forget_key(&key).await;
                     }
                     if let Some(ref old_val) = old_value_for_index {
-                        self.ctx.index_manager.remove_key_from_indexes(&key, old_val).await;
+                        self.ctx
+                            .index_manager
+                            .remove_key_from_indexes(&key, old_val)
+                            .await;
                     }
                     deleted_count += 1;
                 }
@@ -278,7 +313,11 @@ impl StorageExecutor {
                     Some(DbValue::JsonB(b)) => serde_json::from_slice(&b).unwrap_or(json!({})),
                     _ => json!({}),
                 };
-                let pointer = if path == "." || path.is_empty() { "".to_string() } else { json_path_to_pointer(path) };
+                let pointer = if path == "." || path.is_empty() {
+                    "".to_string()
+                } else {
+                    json_path_to_pointer(path)
+                };
                 if pointer.is_empty() {
                     temp_val = value.clone();
                 } else if let Some(target) = temp_val.pointer_mut(&pointer) {
@@ -287,11 +326,19 @@ impl StorageExecutor {
                     // Create path if it doesn't exist
                     let mut current = &mut temp_val;
                     for part in path.split('.') {
-                        if part.is_empty() { continue; }
+                        if part.is_empty() {
+                            continue;
+                        }
                         if current.is_object() {
-                            current = current.as_object_mut().unwrap().entry(part).or_insert(json!({}));
+                            current = current
+                                .as_object_mut()
+                                .unwrap()
+                                .entry(part)
+                                .or_insert(json!({}));
                         } else {
-                            return Response::Error("Path creation failed: part is not an object".to_string());
+                            return Response::Error(
+                                "Path creation failed: part is not an object".to_string(),
+                            );
                         }
                     }
                     *current = value.clone();
@@ -301,7 +348,12 @@ impl StorageExecutor {
                 let memory_change = new_size as i64 - old_size as i64;
 
                 if memory_change > 0 {
-                    if let Err(e) = self.ctx.memory.ensure_memory_for(memory_change as u64, &self.ctx).await {
+                    if let Err(e) = self
+                        .ctx
+                        .memory
+                        .ensure_memory_for(memory_change as u64, &self.ctx)
+                        .await
+                    {
                         return Response::Error(e.to_string());
                     }
                 }
@@ -311,20 +363,32 @@ impl StorageExecutor {
                 } else {
                     self.ctx.memory.decrease_memory(-memory_change as u64);
                 }
-                tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+                tx.reserved_memory
+                    .fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
             }
 
-            let log_entry = LogEntry::JsonSet { path: format!("{}.{}", key, path), value: value.to_string() };
+            let log_entry = LogEntry::JsonSet {
+                path: format!("{}.{}", key, path),
+                value: value.to_string(),
+            };
             tx.log_entries.write().await.push(log_entry);
 
             let mut current_val = match get_visible_db_value(&key, &self.ctx, Some(tx)).await {
                 Some(DbValue::Json(v)) => v.clone(),
                 Some(DbValue::JsonB(b)) => serde_json::from_slice(&b).unwrap_or(json!({})),
-                Some(_) => return Response::Error("WRONGTYPE Operation against a non-JSON value".to_string()),
+                Some(_) => {
+                    return Response::Error(
+                        "WRONGTYPE Operation against a non-JSON value".to_string(),
+                    );
+                }
                 _ => json!({}),
             };
 
-            let pointer = if path == "." || path.is_empty() { "".to_string() } else { json_path_to_pointer(path) };
+            let pointer = if path == "." || path.is_empty() {
+                "".to_string()
+            } else {
+                json_path_to_pointer(path)
+            };
             if pointer.is_empty() {
                 current_val = value;
             } else if let Some(target) = current_val.pointer_mut(&pointer) {
@@ -332,11 +396,19 @@ impl StorageExecutor {
             } else {
                 let mut current = &mut current_val;
                 for part in path.split('.') {
-                    if part.is_empty() { continue; }
+                    if part.is_empty() {
+                        continue;
+                    }
                     if current.is_object() {
-                        current = current.as_object_mut().unwrap().entry(part).or_insert(json!({}));
+                        current = current
+                            .as_object_mut()
+                            .unwrap()
+                            .entry(part)
+                            .or_insert(json!({}));
                     } else {
-                        return Response::Error("Path creation failed: part is not an object".to_string());
+                        return Response::Error(
+                            "Path creation failed: part is not an object".to_string(),
+                        );
                     }
                 }
                 *current = value;
@@ -351,38 +423,44 @@ impl StorageExecutor {
         drop(tx_guard);
         let txid = self.ctx.tx_id_manager.new_txid();
         self.ctx.tx_status_manager.begin(txid);
-                let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
-                let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
-                let mut version_chain = version_chain_arc.write().await;
-                let mut old_size = 0;
-                let mut old_val_for_index = json!({});
-                let mut current_val = if let Some(latest_version) = version_chain
-                    .iter_mut()
-                    .rev()
-                    .find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager))
-                {
-                    latest_version.expirer_txid = txid;
-                    old_size = key.len() as u64
-                        + memory::estimate_db_value_size(&latest_version.value).await;
-                    match &latest_version.value {
-                        DbValue::Json(v) => {
-                            old_val_for_index = v.clone();
-                            v.clone()
-                        }
-                        DbValue::JsonB(b) => {
-                            let v: Value = serde_json::from_slice(b).unwrap_or_default();
-                            old_val_for_index = v.clone();
-                            v
-                        }
-                        _ => {
-                            return Response::Error(
-                                "WRONGTYPE Operation against a non-JSON value".to_string(),
-                            )
-                        }
-                    }
-                } else {
-                    json!({})
-                };        let pointer = if path == "." || path.is_empty() { "".to_string() } else { json_path_to_pointer(path) };
+        let snapshot =
+            crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
+        let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
+        let mut version_chain = version_chain_arc.write().await;
+        let mut old_size = 0;
+        let mut old_val_for_index = json!({});
+        let mut current_val = if let Some(latest_version) = version_chain
+            .iter_mut()
+            .rev()
+            .find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager))
+        {
+            latest_version.expirer_txid = txid;
+            old_size =
+                key.len() as u64 + memory::estimate_db_value_size(&latest_version.value).await;
+            match &latest_version.value {
+                DbValue::Json(v) => {
+                    old_val_for_index = v.clone();
+                    v.clone()
+                }
+                DbValue::JsonB(b) => {
+                    let v: Value = serde_json::from_slice(b).unwrap_or_default();
+                    old_val_for_index = v.clone();
+                    v
+                }
+                _ => {
+                    return Response::Error(
+                        "WRONGTYPE Operation against a non-JSON value".to_string(),
+                    );
+                }
+            }
+        } else {
+            json!({})
+        };
+        let pointer = if path == "." || path.is_empty() {
+            "".to_string()
+        } else {
+            json_path_to_pointer(path)
+        };
         if pointer.is_empty() {
             current_val = value;
         } else if let Some(target) = current_val.pointer_mut(&pointer) {
@@ -390,11 +468,19 @@ impl StorageExecutor {
         } else {
             let mut current = &mut current_val;
             for part in path.split('.') {
-                if part.is_empty() { continue; }
+                if part.is_empty() {
+                    continue;
+                }
                 if current.is_object() {
-                    current = current.as_object_mut().unwrap().entry(part).or_insert(json!({}));
+                    current = current
+                        .as_object_mut()
+                        .unwrap()
+                        .entry(part)
+                        .or_insert(json!({}));
                 } else {
-                    return Response::Error("Path creation failed: part is not an object".to_string());
+                    return Response::Error(
+                        "Path creation failed: part is not an object".to_string(),
+                    );
                 }
             }
             *current = value;
@@ -403,7 +489,10 @@ impl StorageExecutor {
             Ok(b) => b,
             Err(_) => return Response::Error("Failed to serialize new JSON value".to_string()),
         };
-        let log_entry = LogEntry::SetJsonB { key: key.clone(), value: new_value_bytes.clone() };
+        let log_entry = LogEntry::SetJsonB {
+            key: key.clone(),
+            value: new_value_bytes.clone(),
+        };
         if self.ctx.memory.is_enabled() {
             let new_size = key.len() as u64 + new_value_bytes.len() as u64;
             let needed = new_size.saturating_sub(old_size);
@@ -417,7 +506,11 @@ impl StorageExecutor {
             self.ctx.tx_status_manager.abort(txid);
             return ack_response;
         }
-        let new_version = crate::types::VersionedValue { value: DbValue::JsonB(new_value_bytes.clone()), creator_txid: txid, expirer_txid: 0 };
+        let new_version = crate::types::VersionedValue {
+            value: DbValue::JsonB(new_value_bytes.clone()),
+            creator_txid: txid,
+            expirer_txid: 0,
+        };
         version_chain.push(new_version);
         let new_size = key.len() as u64 + new_value_bytes.len() as u64;
         self.ctx.memory.decrease_memory(old_size);
@@ -425,8 +518,14 @@ impl StorageExecutor {
         if self.ctx.memory.is_enabled() {
             self.ctx.memory.track_access(&key).await;
         }
-        self.ctx.index_manager.remove_key_from_indexes(&key, &old_val_for_index).await;
-        self.ctx.index_manager.add_key_to_indexes(&key, &current_val).await;
+        self.ctx
+            .index_manager
+            .remove_key_from_indexes(&key, &old_val_for_index)
+            .await;
+        self.ctx
+            .index_manager
+            .add_key_to_indexes(&key, &current_val)
+            .await;
         self.ctx.tx_status_manager.commit(txid);
         Response::Ok
     }
@@ -434,19 +533,30 @@ impl StorageExecutor {
     pub async fn json_del(&self, key: String, path: &str) -> Response {
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
-            let log_entry = if path.is_empty() || path == "." { LogEntry::Delete { key: key.clone() } } else { LogEntry::JsonDelete { path: format!("{}.{}", key, path) } };
+            let log_entry = if path.is_empty() || path == "." {
+                LogEntry::Delete { key: key.clone() }
+            } else {
+                LogEntry::JsonDelete {
+                    path: format!("{}.{}", key, path),
+                }
+            };
             tx.log_entries.write().await.push(log_entry);
 
             let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
             let mut current_val = match current_db_val {
                 Some(DbValue::Json(v)) => v.clone(),
                 Some(DbValue::JsonB(b)) => serde_json::from_slice(&b).unwrap_or(json!({})),
-                Some(_) => return Response::Error("WRONGTYPE Operation against a non-JSON value".to_string()),
+                Some(_) => {
+                    return Response::Error(
+                        "WRONGTYPE Operation against a non-JSON value".to_string(),
+                    );
+                }
                 None => return Response::Integer(0), // Key doesn't exist
             };
 
             if self.ctx.memory.is_enabled() {
-                let old_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::Json(current_val.clone())).await;
+                let old_size = key.len() as u64
+                    + memory::estimate_db_value_size(&DbValue::Json(current_val.clone())).await;
                 let mut new_size = old_size;
                 let mut modified = false;
 
@@ -475,7 +585,8 @@ impl StorageExecutor {
                     } else {
                         self.ctx.memory.decrease_memory(-memory_change as u64);
                     }
-                    tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+                    tx.reserved_memory
+                        .fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
                 }
             }
 
@@ -489,16 +600,23 @@ impl StorageExecutor {
                 let mut modified = false;
                 if let Some(target) = current_val.pointer_mut(&parent_pointer) {
                     if let Some(obj) = target.as_object_mut() {
-                        if obj.remove(final_key).is_some() { modified = true; }
+                        if obj.remove(final_key).is_some() {
+                            modified = true;
+                        }
                     }
                 }
 
                 if modified {
                     let new_value_bytes = match serde_json::to_vec(&current_val) {
                         Ok(b) => b,
-                        Err(_) => return Response::Error("Failed to serialize new JSON value".to_string()),
+                        Err(_) => {
+                            return Response::Error(
+                                "Failed to serialize new JSON value".to_string(),
+                            );
+                        }
                     };
-                    tx.writes.insert(key.clone(), Some(DbValue::JsonB(new_value_bytes)));
+                    tx.writes
+                        .insert(key.clone(), Some(DbValue::JsonB(new_value_bytes)));
                     return Response::Integer(1);
                 }
             }
@@ -507,7 +625,8 @@ impl StorageExecutor {
         drop(tx_guard);
         let txid = self.ctx.tx_id_manager.new_txid();
         self.ctx.tx_status_manager.begin(txid);
-        let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
+        let snapshot =
+            crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
         let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
         let mut version_chain = version_chain_arc.write().await;
         let old_size;
@@ -519,8 +638,8 @@ impl StorageExecutor {
             .find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager))
         {
             latest_version.expirer_txid = txid;
-            old_size = key.len() as u64
-                + memory::estimate_db_value_size(&latest_version.value).await;
+            old_size =
+                key.len() as u64 + memory::estimate_db_value_size(&latest_version.value).await;
             let current_val = match &latest_version.value {
                 DbValue::Json(v) => {
                     old_val_for_index = v.clone();
@@ -534,7 +653,7 @@ impl StorageExecutor {
                 _ => {
                     return Response::Error(
                         "WRONGTYPE Operation against a non-JSON value".to_string(),
-                    )
+                    );
                 }
             };
             if path.is_empty() || path == "." {
@@ -570,66 +689,109 @@ impl StorageExecutor {
                 return ack_response;
             }
             self.ctx.memory.decrease_memory(old_size);
-            if self.ctx.memory.is_enabled() { self.ctx.memory.forget_key(&key).await; }
-            self.ctx.index_manager.remove_key_from_indexes(&key, &old_val_for_index).await;
+            if self.ctx.memory.is_enabled() {
+                self.ctx.memory.forget_key(&key).await;
+            }
+            self.ctx
+                .index_manager
+                .remove_key_from_indexes(&key, &old_val_for_index)
+                .await;
         } else {
             let new_value_bytes = match serde_json::to_vec(&new_val) {
                 Ok(b) => b,
                 Err(_) => return Response::Error("Failed to serialize new JSON value".to_string()),
             };
-            let log_entry = LogEntry::SetJsonB { key: key.clone(), value: new_value_bytes.clone() };
+            let log_entry = LogEntry::SetJsonB {
+                key: key.clone(),
+                value: new_value_bytes.clone(),
+            };
             let ack_response = log_to_wal(log_entry, &self.ctx).await;
             if !matches!(ack_response, Response::Ok) {
                 self.ctx.tx_status_manager.abort(txid);
                 return ack_response;
             }
-            let new_version = crate::types::VersionedValue { value: DbValue::JsonB(new_value_bytes.clone()), creator_txid: txid, expirer_txid: 0 };
+            let new_version = crate::types::VersionedValue {
+                value: DbValue::JsonB(new_value_bytes.clone()),
+                creator_txid: txid,
+                expirer_txid: 0,
+            };
             version_chain.push(new_version);
             let new_size = key.len() as u64 + new_value_bytes.len() as u64;
             self.ctx.memory.decrease_memory(old_size);
             self.ctx.memory.increase_memory(new_size);
-            if self.ctx.memory.is_enabled() { self.ctx.memory.track_access(&key).await; }
-            self.ctx.index_manager.remove_key_from_indexes(&key, &old_val_for_index).await;
-            self.ctx.index_manager.add_key_to_indexes(&key, &new_val).await;
+            if self.ctx.memory.is_enabled() {
+                self.ctx.memory.track_access(&key).await;
+            }
+            self.ctx
+                .index_manager
+                .remove_key_from_indexes(&key, &old_val_for_index)
+                .await;
+            self.ctx
+                .index_manager
+                .add_key_to_indexes(&key, &new_val)
+                .await;
         }
         self.ctx.tx_status_manager.commit(txid);
         Response::Integer(1)
     }
 
     pub async fn lpush(&self, key: String, values: Vec<Vec<u8>>) -> Response {
-        let log_entry = LogEntry::LPush { key: key.clone(), values: values.clone() };
+        let log_entry = LogEntry::LPush {
+            key: key.clone(),
+            values: values.clone(),
+        };
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
             let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
             let mut current_list = match current_db_val {
                 Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
-                Some(_) => return Response::Error("WRONGTYPE Operation against a non-list value".to_string()),
+                Some(_) => {
+                    return Response::Error(
+                        "WRONGTYPE Operation against a non-list value".to_string(),
+                    );
+                }
                 _ => VecDeque::new(),
             };
 
             if self.ctx.memory.is_enabled() {
-                let old_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::List(RwLock::new(current_list.clone()))).await;
-                
+                let old_size = key.len() as u64
+                    + memory::estimate_db_value_size(&DbValue::List(RwLock::new(
+                        current_list.clone(),
+                    )))
+                    .await;
+
                 let mut temp_list = current_list.clone();
-                for v in values.iter().rev() { temp_list.push_front(v.clone()); }
-                let new_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::List(RwLock::new(temp_list))).await;
-                
+                for v in values.iter().rev() {
+                    temp_list.push_front(v.clone());
+                }
+                let new_size = key.len() as u64
+                    + memory::estimate_db_value_size(&DbValue::List(RwLock::new(temp_list))).await;
+
                 let memory_change = new_size as i64 - old_size as i64;
                 if memory_change > 0 {
-                    if let Err(e) = self.ctx.memory.ensure_memory_for(memory_change as u64, &self.ctx).await {
+                    if let Err(e) = self
+                        .ctx
+                        .memory
+                        .ensure_memory_for(memory_change as u64, &self.ctx)
+                        .await
+                    {
                         return Response::Error(e.to_string());
                     }
                     self.ctx.memory.increase_memory(memory_change as u64);
                 } else {
                     self.ctx.memory.decrease_memory(-memory_change as u64);
                 }
-                tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+                tx.reserved_memory
+                    .fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
             }
 
             tx.log_entries.write().await.push(log_entry);
-            for v in values.into_iter().rev() { current_list.push_front(v); }
+            for v in values.into_iter().rev() {
+                current_list.push_front(v);
+            }
             let new_len = current_list.len() as i64;
-            tx.writes.insert(key, Some(DbValue::List(RwLock::new(current_list))));
+            tx.writes
+                .insert(key, Some(DbValue::List(RwLock::new(current_list))));
             return Response::Integer(new_len);
         }
         drop(tx_guard);
@@ -640,7 +802,8 @@ impl StorageExecutor {
             self.ctx.tx_status_manager.abort(txid);
             return ack_response;
         }
-        let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
+        let snapshot =
+            crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
         let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
         let mut version_chain = version_chain_arc.write().await;
         let mut old_size = 0;
@@ -650,20 +813,22 @@ impl StorageExecutor {
             .find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager))
         {
             latest_version.expirer_txid = txid;
-            old_size = key.len() as u64
-                + memory::estimate_db_value_size(&latest_version.value).await;
+            old_size =
+                key.len() as u64 + memory::estimate_db_value_size(&latest_version.value).await;
             match &latest_version.value {
                 DbValue::List(list_lock) => list_lock.read().await.clone(),
                 _ => {
                     return Response::Error(
                         "WRONGTYPE Operation against a non-list value".to_string(),
-                    )
+                    );
                 }
             }
         } else {
             VecDeque::new()
         };
-        for v in values { new_list.push_front(v); }
+        for v in values {
+            new_list.push_front(v);
+        }
         let new_len = new_list.len() as i64;
         let new_db_value = DbValue::List(RwLock::new(new_list));
         let new_size = key.len() as u64 + memory::estimate_db_value_size(&new_db_value).await;
@@ -674,49 +839,78 @@ impl StorageExecutor {
                 return Response::Error(e.to_string());
             }
         }
-        let new_version = crate::types::VersionedValue { value: new_db_value, creator_txid: txid, expirer_txid: 0 };
+        let new_version = crate::types::VersionedValue {
+            value: new_db_value,
+            creator_txid: txid,
+            expirer_txid: 0,
+        };
         version_chain.push(new_version);
         self.ctx.memory.decrease_memory(old_size);
         self.ctx.memory.increase_memory(new_size);
-        if self.ctx.memory.is_enabled() { self.ctx.memory.track_access(&key).await; }
+        if self.ctx.memory.is_enabled() {
+            self.ctx.memory.track_access(&key).await;
+        }
         self.ctx.tx_status_manager.commit(txid);
         Response::Integer(new_len)
     }
 
     pub async fn rpush(&self, key: String, values: Vec<Vec<u8>>) -> Response {
-        let log_entry = LogEntry::RPush { key: key.clone(), values: values.clone() };
+        let log_entry = LogEntry::RPush {
+            key: key.clone(),
+            values: values.clone(),
+        };
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
             let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
             let mut current_list = match current_db_val {
                 Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
-                Some(_) => return Response::Error("WRONGTYPE Operation against a non-list value".to_string()),
+                Some(_) => {
+                    return Response::Error(
+                        "WRONGTYPE Operation against a non-list value".to_string(),
+                    );
+                }
                 _ => VecDeque::new(),
             };
 
             if self.ctx.memory.is_enabled() {
-                let old_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::List(RwLock::new(current_list.clone()))).await;
-                
+                let old_size = key.len() as u64
+                    + memory::estimate_db_value_size(&DbValue::List(RwLock::new(
+                        current_list.clone(),
+                    )))
+                    .await;
+
                 let mut temp_list = current_list.clone();
-                for v in &values { temp_list.push_back(v.clone()); }
-                let new_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::List(RwLock::new(temp_list))).await;
-                
+                for v in &values {
+                    temp_list.push_back(v.clone());
+                }
+                let new_size = key.len() as u64
+                    + memory::estimate_db_value_size(&DbValue::List(RwLock::new(temp_list))).await;
+
                 let memory_change = new_size as i64 - old_size as i64;
                 if memory_change > 0 {
-                    if let Err(e) = self.ctx.memory.ensure_memory_for(memory_change as u64, &self.ctx).await {
+                    if let Err(e) = self
+                        .ctx
+                        .memory
+                        .ensure_memory_for(memory_change as u64, &self.ctx)
+                        .await
+                    {
                         return Response::Error(e.to_string());
                     }
                     self.ctx.memory.increase_memory(memory_change as u64);
                 } else {
                     self.ctx.memory.decrease_memory(-memory_change as u64);
                 }
-                tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+                tx.reserved_memory
+                    .fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
             }
 
             tx.log_entries.write().await.push(log_entry);
-            for v in values { current_list.push_back(v); }
+            for v in values {
+                current_list.push_back(v);
+            }
             let new_len = current_list.len() as i64;
-            tx.writes.insert(key, Some(DbValue::List(RwLock::new(current_list))));
+            tx.writes
+                .insert(key, Some(DbValue::List(RwLock::new(current_list))));
             return Response::Integer(new_len);
         }
         drop(tx_guard);
@@ -727,7 +921,8 @@ impl StorageExecutor {
             self.ctx.tx_status_manager.abort(txid);
             return ack_response;
         }
-        let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
+        let snapshot =
+            crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
         let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
         let mut version_chain = version_chain_arc.write().await;
         let mut old_size = 0;
@@ -737,20 +932,22 @@ impl StorageExecutor {
             .find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager))
         {
             latest_version.expirer_txid = txid;
-            old_size = key.len() as u64
-                + memory::estimate_db_value_size(&latest_version.value).await;
+            old_size =
+                key.len() as u64 + memory::estimate_db_value_size(&latest_version.value).await;
             match &latest_version.value {
                 DbValue::List(list_lock) => list_lock.read().await.clone(),
                 _ => {
                     return Response::Error(
                         "WRONGTYPE Operation against a non-list value".to_string(),
-                    )
+                    );
                 }
             }
         } else {
             VecDeque::new()
         };
-        for v in values { new_list.push_back(v); }
+        for v in values {
+            new_list.push_back(v);
+        }
         let new_len = new_list.len() as i64;
         let new_db_value = DbValue::List(RwLock::new(new_list));
         let new_size = key.len() as u64 + memory::estimate_db_value_size(&new_db_value).await;
@@ -761,326 +958,469 @@ impl StorageExecutor {
                 return Response::Error(e.to_string());
             }
         }
-        let new_version = crate::types::VersionedValue { value: new_db_value, creator_txid: txid, expirer_txid: 0 };
+        let new_version = crate::types::VersionedValue {
+            value: new_db_value,
+            creator_txid: txid,
+            expirer_txid: 0,
+        };
         version_chain.push(new_version);
         self.ctx.memory.decrease_memory(old_size);
         self.ctx.memory.increase_memory(new_size);
-        if self.ctx.memory.is_enabled() { self.ctx.memory.track_access(&key).await; }
+        if self.ctx.memory.is_enabled() {
+            self.ctx.memory.track_access(&key).await;
+        }
         self.ctx.tx_status_manager.commit(txid);
         Response::Integer(new_len)
     }
 
-        pub async fn lpop(&self, key: String, count: usize) -> Response {
-            let log_entry = LogEntry::LPop { key: key.clone(), count };
-            let mut tx_guard = self.transaction_handle.write().await;
-            if let Some(tx) = tx_guard.as_mut() {
-                let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
-                let mut current_list = match current_db_val {
-                    Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
-                    Some(_) => return Response::Error("WRONGTYPE Operation against a non-list value".to_string()),
-                    _ => VecDeque::new(),
-                };
-    
-                if current_list.is_empty() {
-                    return Response::Nil;
+    pub async fn lpop(&self, key: String, count: usize) -> Response {
+        let log_entry = LogEntry::LPop {
+            key: key.clone(),
+            count,
+        };
+        let mut tx_guard = self.transaction_handle.write().await;
+        if let Some(tx) = tx_guard.as_mut() {
+            let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
+            let mut current_list = match current_db_val {
+                Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
+                Some(_) => {
+                    return Response::Error(
+                        "WRONGTYPE Operation against a non-list value".to_string(),
+                    );
                 }
-    
-                if self.ctx.memory.is_enabled() {
-                    let old_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::List(RwLock::new(current_list.clone()))).await;
-                    
-                    let mut temp_list = current_list.clone();
-                    for _ in 0..count { if temp_list.pop_front().is_none() { break; } } 
-                    let new_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::List(RwLock::new(temp_list))).await;
-                    
-                    let memory_change = new_size as i64 - old_size as i64;
-                    self.ctx.memory.decrease_memory(-memory_change as u64);
-                    tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
-                }
-    
-                tx.log_entries.write().await.push(log_entry);
-                let mut popped = Vec::new();
-                for _ in 0..count { if let Some(val) = current_list.pop_front() { popped.push(val); } else { break; } }
-                tx.writes.insert(key, Some(DbValue::List(RwLock::new(current_list))));
-                if popped.is_empty() { return Response::Nil; }
-                return Response::MultiBytes(popped);
-            }
-            drop(tx_guard);
-            let txid = self.ctx.tx_id_manager.new_txid();
-            self.ctx.tx_status_manager.begin(txid);
-            let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
-            let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
-            let mut version_chain = version_chain_arc.write().await;
-            let mut old_size = 0;
-            let mut popped = Vec::new();
-            let mut list_exists = false;
-            let mut new_list = if let Some(latest_version) = version_chain
-                .iter_mut()
-                .rev()
-                .find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager))
-            {
-                latest_version.expirer_txid = txid;
-                list_exists = true;
-                old_size = key.len() as u64
-                    + memory::estimate_db_value_size(&latest_version.value).await;
-                match &latest_version.value {
-                    DbValue::List(list_lock) => list_lock.read().await.clone(),
-                    _ => {
-                        return Response::Error(
-                            "WRONGTYPE Operation against a non-list value".to_string(),
-                        )
-                    }
-                }
-            } else {
-                VecDeque::new()
+                _ => VecDeque::new(),
             };
-            if list_exists {
-                for _ in 0..count {
-                    if let Some(val) = new_list.pop_front() {
-                        popped.push(val);
-                    } else {
-                        break;
-                    }
-                }
-            }
 
-            if popped.is_empty() {
-                if list_exists {
-                    if let Some(version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == txid) {
-                        version.expirer_txid = 0;
-                    }
-                }
-                self.ctx.tx_status_manager.abort(txid);
+            if current_list.is_empty() {
                 return Response::Nil;
             }
 
-            let ack_response = log_to_wal(log_entry, &self.ctx).await;
-            if !matches!(ack_response, Response::Ok) {
-                if let Some(version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == txid) {
-                    version.expirer_txid = 0;
-                }
-                self.ctx.tx_status_manager.abort(txid);
-                return ack_response;
-            }
-
-            let new_db_value = DbValue::List(RwLock::new(new_list));
-            let new_size = key.len() as u64 + memory::estimate_db_value_size(&new_db_value).await;
             if self.ctx.memory.is_enabled() {
-                let needed = new_size.saturating_sub(old_size);
-                if let Err(e) = self.ctx.memory.ensure_memory_for(needed, &self.ctx).await {
-                    self.ctx.tx_status_manager.abort(txid);
-                    return Response::Error(e.to_string());
-                }
-            }
-            let new_version = crate::types::VersionedValue { value: new_db_value, creator_txid: txid, expirer_txid: 0 };
-            version_chain.push(new_version);
-            self.ctx.memory.decrease_memory(old_size);
-            self.ctx.memory.increase_memory(new_size);
-            if self.ctx.memory.is_enabled() { self.ctx.memory.track_access(&key).await; }
-            self.ctx.tx_status_manager.commit(txid);
-            if popped.is_empty() { Response::Nil } else { Response::MultiBytes(popped) }
-        }
-        pub async fn rpop(&self, key: String, count: usize) -> Response {
-            let log_entry = LogEntry::RPop { key: key.clone(), count };
-            let mut tx_guard = self.transaction_handle.write().await;
-            if let Some(tx) = tx_guard.as_mut() {
-                let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
-                let mut current_list = match current_db_val {
-                    Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
-                    Some(_) => return Response::Error("WRONGTYPE Operation against a non-list value".to_string()),
-                    _ => VecDeque::new(),
-                };
-    
-                if current_list.is_empty() {
-                    return Response::Nil;
-                }
-    
-                if self.ctx.memory.is_enabled() {
-                    let old_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::List(RwLock::new(current_list.clone()))).await;
-                    
-                    let mut temp_list = current_list.clone();
-                    for _ in 0..count { if temp_list.pop_back().is_none() { break; } } 
-                    let new_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::List(RwLock::new(temp_list))).await;
-                    
-                    let memory_change = new_size as i64 - old_size as i64;
-                    self.ctx.memory.decrease_memory(-memory_change as u64);
-                    tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
-                }
-    
-                tx.log_entries.write().await.push(log_entry);
-                let mut popped = Vec::new();
-                for _ in 0..count { if let Some(val) = current_list.pop_back() { popped.push(val); } else { break; } }
-                tx.writes.insert(key, Some(DbValue::List(RwLock::new(current_list))));
-                if popped.is_empty() { return Response::Nil; }
-                return Response::MultiBytes(popped);
-            }
-            drop(tx_guard);
-            let txid = self.ctx.tx_id_manager.new_txid();
-            self.ctx.tx_status_manager.begin(txid);
-            let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
-            let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
-            let mut version_chain = version_chain_arc.write().await;
-            let mut old_size = 0;
-            let mut popped = Vec::new();
-            let mut list_exists = false;
-            let mut new_list = if let Some(latest_version) = version_chain
-                .iter_mut()
-                .rev()
-                .find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager))
-            {
-                latest_version.expirer_txid = txid;
-                list_exists = true;
-                old_size = key.len() as u64
-                    + memory::estimate_db_value_size(&latest_version.value).await;
-                match &latest_version.value {
-                    DbValue::List(list_lock) => list_lock.read().await.clone(),
-                    _ => {
-                        return Response::Error(
-                            "WRONGTYPE Operation against a non-list value".to_string(),
-                        )
-                    }
-                }
-            } else {
-                VecDeque::new()
-            };
-            if list_exists {
+                let old_size = key.len() as u64
+                    + memory::estimate_db_value_size(&DbValue::List(RwLock::new(
+                        current_list.clone(),
+                    )))
+                    .await;
+
+                let mut temp_list = current_list.clone();
                 for _ in 0..count {
-                    if let Some(val) = new_list.pop_back() {
-                        popped.push(val);
-                    } else {
+                    if temp_list.pop_front().is_none() {
                         break;
                     }
                 }
+                let new_size = key.len() as u64
+                    + memory::estimate_db_value_size(&DbValue::List(RwLock::new(temp_list))).await;
+
+                let memory_change = new_size as i64 - old_size as i64;
+                self.ctx.memory.decrease_memory(-memory_change as u64);
+                tx.reserved_memory
+                    .fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
             }
-            if popped.is_empty() {
-                if list_exists {
-                    if let Some(version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == txid) {
-                        version.expirer_txid = 0;
-                    }
+
+            tx.log_entries.write().await.push(log_entry);
+            let mut popped = Vec::new();
+            for _ in 0..count {
+                if let Some(val) = current_list.pop_front() {
+                    popped.push(val);
+                } else {
+                    break;
                 }
-                self.ctx.tx_status_manager.abort(txid);
+            }
+            tx.writes
+                .insert(key, Some(DbValue::List(RwLock::new(current_list))));
+            if popped.is_empty() {
                 return Response::Nil;
             }
-            let ack_response = log_to_wal(log_entry, &self.ctx).await;
-            if !matches!(ack_response, Response::Ok) {
-                if list_exists {
-                    if let Some(version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == txid) {
-                        version.expirer_txid = 0;
-                    }
-                }
-                self.ctx.tx_status_manager.abort(txid);
-                return ack_response;
-            }
-            let new_db_value = DbValue::List(RwLock::new(new_list));
-            let new_size = key.len() as u64 + memory::estimate_db_value_size(&new_db_value).await;
-            if self.ctx.memory.is_enabled() {
-                let needed = new_size.saturating_sub(old_size);
-                if let Err(e) = self.ctx.memory.ensure_memory_for(needed, &self.ctx).await {
-                    self.ctx.tx_status_manager.abort(txid);
-                    return Response::Error(e.to_string());
-                }
-            }
-            let new_version = crate::types::VersionedValue { value: new_db_value, creator_txid: txid, expirer_txid: 0 };
-            version_chain.push(new_version);
-            self.ctx.memory.decrease_memory(old_size);
-            self.ctx.memory.increase_memory(new_size);
-            if self.ctx.memory.is_enabled() { self.ctx.memory.track_access(&key).await; }
-            self.ctx.tx_status_manager.commit(txid);
-            if popped.is_empty() { Response::Nil } else { Response::MultiBytes(popped) }
+            return Response::MultiBytes(popped);
         }
-        pub async fn sadd(&self, key: String, members: Vec<Vec<u8>>) -> Response {
-            let log_entry = LogEntry::SAdd { key: key.clone(), members: members.clone() };
-            let mut tx_guard = self.transaction_handle.write().await;
-            if let Some(tx) = tx_guard.as_mut() {
-                let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
-                let mut current_set = match current_db_val {
-                    Some(DbValue::Set(set_lock)) => set_lock.read().await.clone(),
-                    Some(_) => return Response::Error("WRONGTYPE Operation against a non-set value".to_string()),
-                    _ => HashSet::new(),
-                };
-    
-                if self.ctx.memory.is_enabled() {
-                    let old_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::Set(RwLock::new(current_set.clone()))).await;
-                    
-                    let mut temp_set = current_set.clone();
-                    for m in &members { temp_set.insert(m.clone()); }
-                    let new_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::Set(RwLock::new(temp_set))).await;
-                    
-                    let memory_change = new_size as i64 - old_size as i64;
-                    if memory_change > 0 {
-                        if let Err(e) = self.ctx.memory.ensure_memory_for(memory_change as u64, &self.ctx).await {
-                            return Response::Error(e.to_string());
-                        }
-                        self.ctx.memory.increase_memory(memory_change as u64);
-                    } else {
-                        self.ctx.memory.decrease_memory(-memory_change as u64);
-                    }
-                    tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+        drop(tx_guard);
+        let txid = self.ctx.tx_id_manager.new_txid();
+        self.ctx.tx_status_manager.begin(txid);
+        let snapshot =
+            crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
+        let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
+        let mut version_chain = version_chain_arc.write().await;
+        let mut old_size = 0;
+        let mut popped = Vec::new();
+        let mut list_exists = false;
+        let mut new_list = if let Some(latest_version) = version_chain
+            .iter_mut()
+            .rev()
+            .find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager))
+        {
+            latest_version.expirer_txid = txid;
+            list_exists = true;
+            old_size =
+                key.len() as u64 + memory::estimate_db_value_size(&latest_version.value).await;
+            match &latest_version.value {
+                DbValue::List(list_lock) => list_lock.read().await.clone(),
+                _ => {
+                    return Response::Error(
+                        "WRONGTYPE Operation against a non-list value".to_string(),
+                    );
                 }
-    
-                tx.log_entries.write().await.push(log_entry);
-                let mut added_count = 0;
-                for m in members { if current_set.insert(m) { added_count += 1; } }
-                tx.writes.insert(key, Some(DbValue::Set(RwLock::new(current_set))));
-                return Response::Integer(added_count);
             }
-            drop(tx_guard);
-            let txid = self.ctx.tx_id_manager.new_txid();
-            self.ctx.tx_status_manager.begin(txid);
-            let existing_value = get_visible_db_value(&key, &self.ctx, None).await;
-            let mut old_size = 0;
-            let mut new_set = match existing_value {
-                Some(DbValue::Set(set_lock)) => {
-                    let s = set_lock.read().await;
-                    old_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::Set(RwLock::new(s.clone()))).await;
-                    s.clone()
+        } else {
+            VecDeque::new()
+        };
+        if list_exists {
+            for _ in 0..count {
+                if let Some(val) = new_list.pop_front() {
+                    popped.push(val);
+                } else {
+                    break;
                 }
-                Some(_) => { self.ctx.tx_status_manager.abort(txid); return Response::Error("WRONGTYPE Operation against a non-set value".to_string()); }
-                None => HashSet::new(),
-            };
-            let ack_response = log_to_wal(log_entry, &self.ctx).await;
-            if !matches!(ack_response, Response::Ok) {
-                self.ctx.tx_status_manager.abort(txid);
-                return ack_response;
             }
-            let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
-            let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
-            let mut version_chain = version_chain_arc.write().await;
-            if old_size > 0 {
-                if let Some(latest_version) = version_chain
+        }
+
+        if popped.is_empty() {
+            if list_exists {
+                if let Some(version) = version_chain
                     .iter_mut()
                     .rev()
-                    .find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager))
+                    .find(|v| v.expirer_txid == txid)
                 {
-                    latest_version.expirer_txid = txid;
+                    version.expirer_txid = 0;
                 }
             }
-            let mut added_count = 0;
-            for m in members { if new_set.insert(m) { added_count += 1; } }
-            let new_db_value = DbValue::Set(RwLock::new(new_set));
-            let new_size = key.len() as u64 + memory::estimate_db_value_size(&new_db_value).await;
-            if self.ctx.memory.is_enabled() {
-                let needed = new_size.saturating_sub(old_size);
-                if let Err(e) = self.ctx.memory.ensure_memory_for(needed, &self.ctx).await {
-                    self.ctx.tx_status_manager.abort(txid);
-                    return Response::Error(e.to_string());
-                }
-            }
-            let new_version = crate::types::VersionedValue { value: new_db_value, creator_txid: txid, expirer_txid: 0 };
-            version_chain.push(new_version);
-            self.ctx.memory.decrease_memory(old_size);
-            self.ctx.memory.increase_memory(new_size);
-            if self.ctx.memory.is_enabled() { self.ctx.memory.track_access(&key).await; }
-            self.ctx.tx_status_manager.commit(txid);
-            Response::Integer(added_count)
+            self.ctx.tx_status_manager.abort(txid);
+            return Response::Nil;
         }
-    pub async fn srem(&self, key: String, members: Vec<Vec<u8>>) -> Response {
-        let log_entry = LogEntry::SRem { key: key.clone(), members: members.clone() };
+
+        let ack_response = log_to_wal(log_entry, &self.ctx).await;
+        if !matches!(ack_response, Response::Ok) {
+            if let Some(version) = version_chain
+                .iter_mut()
+                .rev()
+                .find(|v| v.expirer_txid == txid)
+            {
+                version.expirer_txid = 0;
+            }
+            self.ctx.tx_status_manager.abort(txid);
+            return ack_response;
+        }
+
+        let new_db_value = DbValue::List(RwLock::new(new_list));
+        let new_size = key.len() as u64 + memory::estimate_db_value_size(&new_db_value).await;
+        if self.ctx.memory.is_enabled() {
+            let needed = new_size.saturating_sub(old_size);
+            if let Err(e) = self.ctx.memory.ensure_memory_for(needed, &self.ctx).await {
+                self.ctx.tx_status_manager.abort(txid);
+                return Response::Error(e.to_string());
+            }
+        }
+        let new_version = crate::types::VersionedValue {
+            value: new_db_value,
+            creator_txid: txid,
+            expirer_txid: 0,
+        };
+        version_chain.push(new_version);
+        self.ctx.memory.decrease_memory(old_size);
+        self.ctx.memory.increase_memory(new_size);
+        if self.ctx.memory.is_enabled() {
+            self.ctx.memory.track_access(&key).await;
+        }
+        self.ctx.tx_status_manager.commit(txid);
+        if popped.is_empty() {
+            Response::Nil
+        } else {
+            Response::MultiBytes(popped)
+        }
+    }
+    pub async fn rpop(&self, key: String, count: usize) -> Response {
+        let log_entry = LogEntry::RPop {
+            key: key.clone(),
+            count,
+        };
+        let mut tx_guard = self.transaction_handle.write().await;
+        if let Some(tx) = tx_guard.as_mut() {
+            let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
+            let mut current_list = match current_db_val {
+                Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
+                Some(_) => {
+                    return Response::Error(
+                        "WRONGTYPE Operation against a non-list value".to_string(),
+                    );
+                }
+                _ => VecDeque::new(),
+            };
+
+            if current_list.is_empty() {
+                return Response::Nil;
+            }
+
+            if self.ctx.memory.is_enabled() {
+                let old_size = key.len() as u64
+                    + memory::estimate_db_value_size(&DbValue::List(RwLock::new(
+                        current_list.clone(),
+                    )))
+                    .await;
+
+                let mut temp_list = current_list.clone();
+                for _ in 0..count {
+                    if temp_list.pop_back().is_none() {
+                        break;
+                    }
+                }
+                let new_size = key.len() as u64
+                    + memory::estimate_db_value_size(&DbValue::List(RwLock::new(temp_list))).await;
+
+                let memory_change = new_size as i64 - old_size as i64;
+                self.ctx.memory.decrease_memory(-memory_change as u64);
+                tx.reserved_memory
+                    .fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            tx.log_entries.write().await.push(log_entry);
+            let mut popped = Vec::new();
+            for _ in 0..count {
+                if let Some(val) = current_list.pop_back() {
+                    popped.push(val);
+                } else {
+                    break;
+                }
+            }
+            tx.writes
+                .insert(key, Some(DbValue::List(RwLock::new(current_list))));
+            if popped.is_empty() {
+                return Response::Nil;
+            }
+            return Response::MultiBytes(popped);
+        }
+        drop(tx_guard);
+        let txid = self.ctx.tx_id_manager.new_txid();
+        self.ctx.tx_status_manager.begin(txid);
+        let snapshot =
+            crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
+        let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
+        let mut version_chain = version_chain_arc.write().await;
+        let mut old_size = 0;
+        let mut popped = Vec::new();
+        let mut list_exists = false;
+        let mut new_list = if let Some(latest_version) = version_chain
+            .iter_mut()
+            .rev()
+            .find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager))
+        {
+            latest_version.expirer_txid = txid;
+            list_exists = true;
+            old_size =
+                key.len() as u64 + memory::estimate_db_value_size(&latest_version.value).await;
+            match &latest_version.value {
+                DbValue::List(list_lock) => list_lock.read().await.clone(),
+                _ => {
+                    return Response::Error(
+                        "WRONGTYPE Operation against a non-list value".to_string(),
+                    );
+                }
+            }
+        } else {
+            VecDeque::new()
+        };
+        if list_exists {
+            for _ in 0..count {
+                if let Some(val) = new_list.pop_back() {
+                    popped.push(val);
+                } else {
+                    break;
+                }
+            }
+        }
+        if popped.is_empty() {
+            if list_exists {
+                if let Some(version) = version_chain
+                    .iter_mut()
+                    .rev()
+                    .find(|v| v.expirer_txid == txid)
+                {
+                    version.expirer_txid = 0;
+                }
+            }
+            self.ctx.tx_status_manager.abort(txid);
+            return Response::Nil;
+        }
+        let ack_response = log_to_wal(log_entry, &self.ctx).await;
+        if !matches!(ack_response, Response::Ok) {
+            if list_exists {
+                if let Some(version) = version_chain
+                    .iter_mut()
+                    .rev()
+                    .find(|v| v.expirer_txid == txid)
+                {
+                    version.expirer_txid = 0;
+                }
+            }
+            self.ctx.tx_status_manager.abort(txid);
+            return ack_response;
+        }
+        let new_db_value = DbValue::List(RwLock::new(new_list));
+        let new_size = key.len() as u64 + memory::estimate_db_value_size(&new_db_value).await;
+        if self.ctx.memory.is_enabled() {
+            let needed = new_size.saturating_sub(old_size);
+            if let Err(e) = self.ctx.memory.ensure_memory_for(needed, &self.ctx).await {
+                self.ctx.tx_status_manager.abort(txid);
+                return Response::Error(e.to_string());
+            }
+        }
+        let new_version = crate::types::VersionedValue {
+            value: new_db_value,
+            creator_txid: txid,
+            expirer_txid: 0,
+        };
+        version_chain.push(new_version);
+        self.ctx.memory.decrease_memory(old_size);
+        self.ctx.memory.increase_memory(new_size);
+        if self.ctx.memory.is_enabled() {
+            self.ctx.memory.track_access(&key).await;
+        }
+        self.ctx.tx_status_manager.commit(txid);
+        if popped.is_empty() {
+            Response::Nil
+        } else {
+            Response::MultiBytes(popped)
+        }
+    }
+    pub async fn sadd(&self, key: String, members: Vec<Vec<u8>>) -> Response {
+        let log_entry = LogEntry::SAdd {
+            key: key.clone(),
+            members: members.clone(),
+        };
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
             let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
             let mut current_set = match current_db_val {
                 Some(DbValue::Set(set_lock)) => set_lock.read().await.clone(),
-                Some(_) => return Response::Error("WRONGTYPE Operation against a non-set value".to_string()),
+                Some(_) => {
+                    return Response::Error(
+                        "WRONGTYPE Operation against a non-set value".to_string(),
+                    );
+                }
+                _ => HashSet::new(),
+            };
+
+            if self.ctx.memory.is_enabled() {
+                let old_size = key.len() as u64
+                    + memory::estimate_db_value_size(&DbValue::Set(RwLock::new(
+                        current_set.clone(),
+                    )))
+                    .await;
+
+                let mut temp_set = current_set.clone();
+                for m in &members {
+                    temp_set.insert(m.clone());
+                }
+                let new_size = key.len() as u64
+                    + memory::estimate_db_value_size(&DbValue::Set(RwLock::new(temp_set))).await;
+
+                let memory_change = new_size as i64 - old_size as i64;
+                if memory_change > 0 {
+                    if let Err(e) = self
+                        .ctx
+                        .memory
+                        .ensure_memory_for(memory_change as u64, &self.ctx)
+                        .await
+                    {
+                        return Response::Error(e.to_string());
+                    }
+                    self.ctx.memory.increase_memory(memory_change as u64);
+                } else {
+                    self.ctx.memory.decrease_memory(-memory_change as u64);
+                }
+                tx.reserved_memory
+                    .fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            tx.log_entries.write().await.push(log_entry);
+            let mut added_count = 0;
+            for m in members {
+                if current_set.insert(m) {
+                    added_count += 1;
+                }
+            }
+            tx.writes
+                .insert(key, Some(DbValue::Set(RwLock::new(current_set))));
+            return Response::Integer(added_count);
+        }
+        drop(tx_guard);
+        let txid = self.ctx.tx_id_manager.new_txid();
+        self.ctx.tx_status_manager.begin(txid);
+        let existing_value = get_visible_db_value(&key, &self.ctx, None).await;
+        let mut old_size = 0;
+        let mut new_set = match existing_value {
+            Some(DbValue::Set(set_lock)) => {
+                let s = set_lock.read().await;
+                old_size = key.len() as u64
+                    + memory::estimate_db_value_size(&DbValue::Set(RwLock::new(s.clone()))).await;
+                s.clone()
+            }
+            Some(_) => {
+                self.ctx.tx_status_manager.abort(txid);
+                return Response::Error("WRONGTYPE Operation against a non-set value".to_string());
+            }
+            None => HashSet::new(),
+        };
+        let ack_response = log_to_wal(log_entry, &self.ctx).await;
+        if !matches!(ack_response, Response::Ok) {
+            self.ctx.tx_status_manager.abort(txid);
+            return ack_response;
+        }
+        let snapshot =
+            crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
+        let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
+        let mut version_chain = version_chain_arc.write().await;
+        if old_size > 0 {
+            if let Some(latest_version) = version_chain
+                .iter_mut()
+                .rev()
+                .find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager))
+            {
+                latest_version.expirer_txid = txid;
+            }
+        }
+        let mut added_count = 0;
+        for m in members {
+            if new_set.insert(m) {
+                added_count += 1;
+            }
+        }
+        let new_db_value = DbValue::Set(RwLock::new(new_set));
+        let new_size = key.len() as u64 + memory::estimate_db_value_size(&new_db_value).await;
+        if self.ctx.memory.is_enabled() {
+            let needed = new_size.saturating_sub(old_size);
+            if let Err(e) = self.ctx.memory.ensure_memory_for(needed, &self.ctx).await {
+                self.ctx.tx_status_manager.abort(txid);
+                return Response::Error(e.to_string());
+            }
+        }
+        let new_version = crate::types::VersionedValue {
+            value: new_db_value,
+            creator_txid: txid,
+            expirer_txid: 0,
+        };
+        version_chain.push(new_version);
+        self.ctx.memory.decrease_memory(old_size);
+        self.ctx.memory.increase_memory(new_size);
+        if self.ctx.memory.is_enabled() {
+            self.ctx.memory.track_access(&key).await;
+        }
+        self.ctx.tx_status_manager.commit(txid);
+        Response::Integer(added_count)
+    }
+    pub async fn srem(&self, key: String, members: Vec<Vec<u8>>) -> Response {
+        let log_entry = LogEntry::SRem {
+            key: key.clone(),
+            members: members.clone(),
+        };
+        let mut tx_guard = self.transaction_handle.write().await;
+        if let Some(tx) = tx_guard.as_mut() {
+            let current_db_val = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
+            let mut current_set = match current_db_val {
+                Some(DbValue::Set(set_lock)) => set_lock.read().await.clone(),
+                Some(_) => {
+                    return Response::Error(
+                        "WRONGTYPE Operation against a non-set value".to_string(),
+                    );
+                }
                 _ => HashSet::new(),
             };
 
@@ -1089,27 +1429,41 @@ impl StorageExecutor {
             }
 
             if self.ctx.memory.is_enabled() {
-                let old_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::Set(RwLock::new(current_set.clone()))).await;
-                
+                let old_size = key.len() as u64
+                    + memory::estimate_db_value_size(&DbValue::Set(RwLock::new(
+                        current_set.clone(),
+                    )))
+                    .await;
+
                 let mut temp_set = current_set.clone();
-                for m in &members { temp_set.remove(m); }
-                let new_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::Set(RwLock::new(temp_set))).await;
-                
+                for m in &members {
+                    temp_set.remove(m);
+                }
+                let new_size = key.len() as u64
+                    + memory::estimate_db_value_size(&DbValue::Set(RwLock::new(temp_set))).await;
+
                 let memory_change = new_size as i64 - old_size as i64;
                 self.ctx.memory.decrease_memory(-memory_change as u64);
-                tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+                tx.reserved_memory
+                    .fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
             }
 
             tx.log_entries.write().await.push(log_entry);
             let mut removed_count = 0;
-            for m in members { if current_set.remove(&m) { removed_count += 1; } }
-            tx.writes.insert(key, Some(DbValue::Set(RwLock::new(current_set))));
+            for m in members {
+                if current_set.remove(&m) {
+                    removed_count += 1;
+                }
+            }
+            tx.writes
+                .insert(key, Some(DbValue::Set(RwLock::new(current_set))));
             return Response::Integer(removed_count);
         }
         drop(tx_guard);
         let txid = self.ctx.tx_id_manager.new_txid();
         self.ctx.tx_status_manager.begin(txid);
-        let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
+        let snapshot =
+            crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
         let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
         let mut version_chain = version_chain_arc.write().await;
         let mut old_size = 0;
@@ -1120,14 +1474,14 @@ impl StorageExecutor {
             .find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager))
         {
             latest_version.expirer_txid = txid;
-            old_size = key.len() as u64
-                + memory::estimate_db_value_size(&latest_version.value).await;
+            old_size =
+                key.len() as u64 + memory::estimate_db_value_size(&latest_version.value).await;
             match &latest_version.value {
                 DbValue::Set(set_lock) => set_lock.read().await.clone(),
                 _ => {
                     return Response::Error(
                         "WRONGTYPE Operation against a non-set value".to_string(),
-                    )
+                    );
                 }
             }
         } else {
@@ -1140,7 +1494,11 @@ impl StorageExecutor {
         }
         if removed_count == 0 {
             if old_size > 0 {
-                if let Some(version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == txid) {
+                if let Some(version) = version_chain
+                    .iter_mut()
+                    .rev()
+                    .find(|v| v.expirer_txid == txid)
+                {
                     version.expirer_txid = 0;
                 }
             }
@@ -1150,7 +1508,11 @@ impl StorageExecutor {
         let ack_response = log_to_wal(log_entry, &self.ctx).await;
         if !matches!(ack_response, Response::Ok) {
             if old_size > 0 {
-                if let Some(version) = version_chain.iter_mut().rev().find(|v| v.expirer_txid == txid) {
+                if let Some(version) = version_chain
+                    .iter_mut()
+                    .rev()
+                    .find(|v| v.expirer_txid == txid)
+                {
                     version.expirer_txid = 0;
                 }
             }
@@ -1166,11 +1528,17 @@ impl StorageExecutor {
                 return Response::Error(e.to_string());
             }
         }
-        let new_version = crate::types::VersionedValue { value: new_db_value, creator_txid: txid, expirer_txid: 0 };
+        let new_version = crate::types::VersionedValue {
+            value: new_db_value,
+            creator_txid: txid,
+            expirer_txid: 0,
+        };
         version_chain.push(new_version);
         self.ctx.memory.decrease_memory(old_size);
         self.ctx.memory.increase_memory(new_size);
-        if self.ctx.memory.is_enabled() { self.ctx.memory.track_access(&key).await; }
+        if self.ctx.memory.is_enabled() {
+            self.ctx.memory.track_access(&key).await;
+        }
         self.ctx.tx_status_manager.commit(txid);
         Response::Integer(removed_count)
     }
@@ -1180,19 +1548,29 @@ impl StorageExecutor {
         if let Some(tx) = tx_guard.as_mut() {
             let mut deleted_count = 0;
             for row in rows {
-                let table_part = match row.get(table_name) { Some(part) => part, None => continue };
-                let key = match table_part.get("_key").and_then(|k| k.as_str()) { Some(k) => k.to_string(), None => continue };
-                
+                let table_part = match row.get(table_name) {
+                    Some(part) => part,
+                    None => continue,
+                };
+                let key = match table_part.get("_key").and_then(|k| k.as_str()) {
+                    Some(k) => k.to_string(),
+                    None => continue,
+                };
+
                 if self.ctx.memory.is_enabled() {
                     let old_db_value = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
                     if let Some(v) = old_db_value {
                         let old_size = key.len() as u64 + memory::estimate_db_value_size(&v).await;
                         self.ctx.memory.decrease_memory(old_size);
-                        tx.reserved_memory.fetch_sub(old_size as i64, std::sync::atomic::Ordering::Relaxed);
+                        tx.reserved_memory
+                            .fetch_sub(old_size as i64, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
 
-                tx.log_entries.write().await.push(LogEntry::Delete { key: key.clone() });
+                tx.log_entries
+                    .write()
+                    .await
+                    .push(LogEntry::Delete { key: key.clone() });
                 tx.writes.insert(key, None);
                 deleted_count += 1;
             }
@@ -1201,8 +1579,14 @@ impl StorageExecutor {
         drop(tx_guard);
         let mut deleted_count = 0;
         for row in rows {
-            let table_part = match row.get(table_name) { Some(part) => part, None => continue };
-            let key = match table_part.get("_key").and_then(|k| k.as_str()) { Some(k) => k.to_string(), None => continue };
+            let table_part = match row.get(table_name) {
+                Some(part) => part,
+                None => continue,
+            };
+            let key = match table_part.get("_key").and_then(|k| k.as_str()) {
+                Some(k) => k.to_string(),
+                None => continue,
+            };
             let txid = self.ctx.tx_id_manager.new_txid();
             self.ctx.tx_status_manager.begin(txid);
             let log_entry = LogEntry::Delete { key: key.clone() };
@@ -1217,7 +1601,11 @@ impl StorageExecutor {
                 drop(version_chain_lock);
                 let mut version_chain = version_chain_arc.write().await;
                 let mut expired_something = false;
-                let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
+                let snapshot = crate::types::Snapshot::new(
+                    0,
+                    &self.ctx.tx_status_manager,
+                    &self.ctx.tx_id_manager,
+                );
                 if let Some(latest_version) = version_chain
                     .iter_mut()
                     .rev()
@@ -1227,11 +1615,16 @@ impl StorageExecutor {
                     expired_something = true;
                     old_size = key.len() as u64
                         + memory::estimate_db_value_size(&latest_version.value).await;
-                    self.ctx.index_manager.remove_key_from_indexes(&key, &table_part).await;
+                    self.ctx
+                        .index_manager
+                        .remove_key_from_indexes(&key, &table_part)
+                        .await;
                 }
                 if expired_something {
                     self.ctx.memory.decrease_memory(old_size);
-                    if self.ctx.memory.is_enabled() { self.ctx.memory.forget_key(&key).await; }
+                    if self.ctx.memory.is_enabled() {
+                        self.ctx.memory.forget_key(&key).await;
+                    }
                     deleted_count += 1;
                 }
             }
@@ -1240,15 +1633,26 @@ impl StorageExecutor {
         Ok(deleted_count)
     }
 
-    pub async fn update_rows(&self, table_name: &str, rows_to_update: Vec<Value>, set_clauses: &[(String, crate::query_engine::logical_plan::Expression)]) -> Result<Vec<Value>> {
+    pub async fn update_rows(
+        &self,
+        table_name: &str,
+        rows_to_update: Vec<Value>,
+        set_clauses: &[(String, crate::query_engine::logical_plan::Expression)],
+    ) -> Result<Vec<Value>> {
         let mut updated_rows = Vec::new();
         let schema = self.ctx.schema_cache.get(table_name);
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
             for row in rows_to_update {
-                let table_part = match row.get(table_name) { Some(part) => part, None => continue };
-                let key = match table_part.get("_key").and_then(|k| k.as_str()) { Some(k) => k.to_string(), None => continue };
-                
+                let table_part = match row.get(table_name) {
+                    Some(part) => part,
+                    None => continue,
+                };
+                let key = match table_part.get("_key").and_then(|k| k.as_str()) {
+                    Some(k) => k.to_string(),
+                    None => continue,
+                };
+
                 let old_db_value = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
                 let old_size = if let Some(ref v) = old_db_value {
                     key.len() as u64 + memory::estimate_db_value_size(v).await
@@ -1258,10 +1662,20 @@ impl StorageExecutor {
 
                 let mut new_val = table_part.clone();
                 for (col, expr) in set_clauses {
-                    let mut val = expr.evaluate_with_context(&row, None, self.ctx.clone(), Some(self.transaction_handle.clone())).await?;
+                    let mut val = expr
+                        .evaluate_with_context(
+                            &row,
+                            None,
+                            self.ctx.clone(),
+                            Some(self.transaction_handle.clone()),
+                        )
+                        .await?;
                     if let Some(s) = &schema {
                         if let Some(col_def) = s.columns.get(col) {
-                            val = crate::query_engine::logical_plan::cast_value_to_type(val, &col_def.data_type)?;
+                            val = crate::query_engine::logical_plan::cast_value_to_type(
+                                val,
+                                &col_def.data_type,
+                            )?;
                         }
                     }
                     new_val[col] = val;
@@ -1272,17 +1686,26 @@ impl StorageExecutor {
 
                 if self.ctx.memory.is_enabled() {
                     if memory_change > 0 {
-                        if let Err(e) = self.ctx.memory.ensure_memory_for(memory_change as u64, &self.ctx).await {
+                        if let Err(e) = self
+                            .ctx
+                            .memory
+                            .ensure_memory_for(memory_change as u64, &self.ctx)
+                            .await
+                        {
                             return Err(anyhow!(e.to_string()));
                         }
                         self.ctx.memory.increase_memory(memory_change as u64);
                     } else {
                         self.ctx.memory.decrease_memory(-memory_change as u64);
                     }
-                    tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+                    tx.reserved_memory
+                        .fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
                 }
 
-                let log_entry = LogEntry::SetJsonB { key: key.clone(), value: new_val_bytes.clone() };
+                let log_entry = LogEntry::SetJsonB {
+                    key: key.clone(),
+                    value: new_val_bytes.clone(),
+                };
                 tx.log_entries.write().await.push(log_entry);
                 tx.writes.insert(key, Some(DbValue::JsonB(new_val_bytes)));
                 updated_rows.push(new_val);
@@ -1290,16 +1713,26 @@ impl StorageExecutor {
         } else {
             drop(tx_guard);
             for row in rows_to_update {
-                let table_part = match row.get(table_name) { Some(part) => part, None => continue };
-                let key = match table_part.get("_key").and_then(|k| k.as_str()) { Some(k) => k.to_string(), None => continue };
-                
+                let table_part = match row.get(table_name) {
+                    Some(part) => part,
+                    None => continue,
+                };
+                let key = match table_part.get("_key").and_then(|k| k.as_str()) {
+                    Some(k) => k.to_string(),
+                    None => continue,
+                };
+
                 let txid = self.ctx.tx_id_manager.new_txid();
                 self.ctx.tx_status_manager.begin(txid);
 
                 let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
                 let version_chain = version_chain_arc.read().await;
 
-                let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
+                let snapshot = crate::types::Snapshot::new(
+                    0,
+                    &self.ctx.tx_status_manager,
+                    &self.ctx.tx_id_manager,
+                );
                 let old_val_opt = {
                     let mut old_val = None;
                     for version in version_chain.iter().rev() {
@@ -1307,7 +1740,11 @@ impl StorageExecutor {
                             old_val = Some(match &version.value {
                                 DbValue::Json(v) => v.clone(),
                                 DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
-                                _ => return Err(anyhow!("WRONGTYPE Operation against a non-JSON value")),
+                                _ => {
+                                    return Err(anyhow!(
+                                        "WRONGTYPE Operation against a non-JSON value"
+                                    ));
+                                }
                             });
                             break;
                         }
@@ -1323,26 +1760,38 @@ impl StorageExecutor {
 
                 let mut new_val = old_val.clone();
                 for (col, expr) in set_clauses {
-                    let mut val = expr.evaluate_with_context(&row, Some(&old_val), self.ctx.clone(), None).await?;
+                    let mut val = expr
+                        .evaluate_with_context(&row, Some(&old_val), self.ctx.clone(), None)
+                        .await?;
                     if let Some(s) = &schema {
                         if let Some(col_def) = s.columns.get(col) {
-                            val = crate::query_engine::logical_plan::cast_value_to_type(val, &col_def.data_type)?;
+                            val = crate::query_engine::logical_plan::cast_value_to_type(
+                                val,
+                                &col_def.data_type,
+                            )?;
                         }
                     }
                     new_val[col] = val;
                 }
-                
+
                 let new_val_bytes = serde_json::to_vec(&new_val)?;
-                let log_entry = LogEntry::SetJsonB { key: key.clone(), value: new_val_bytes.clone() };
+                let log_entry = LogEntry::SetJsonB {
+                    key: key.clone(),
+                    value: new_val_bytes.clone(),
+                };
                 if let Response::Error(e) = log_to_wal(log_entry, &self.ctx).await {
                     self.ctx.tx_status_manager.abort(txid);
                     return Err(anyhow!(e));
                 }
-                
+
                 drop(version_chain);
                 let mut version_chain = version_chain_arc.write().await;
 
-                let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
+                let snapshot = crate::types::Snapshot::new(
+                    0,
+                    &self.ctx.tx_status_manager,
+                    &self.ctx.tx_id_manager,
+                );
                 if let Some(latest_version) = version_chain
                     .iter_mut()
                     .rev()
@@ -1350,10 +1799,20 @@ impl StorageExecutor {
                 {
                     latest_version.expirer_txid = txid;
                 }
-                let new_version = crate::types::VersionedValue { value: DbValue::JsonB(new_val_bytes), creator_txid: txid, expirer_txid: 0 };
+                let new_version = crate::types::VersionedValue {
+                    value: DbValue::JsonB(new_val_bytes),
+                    creator_txid: txid,
+                    expirer_txid: 0,
+                };
                 version_chain.push(new_version);
-                self.ctx.index_manager.remove_key_from_indexes(&key, &old_val).await;
-                self.ctx.index_manager.add_key_to_indexes(&key, &new_val).await;
+                self.ctx
+                    .index_manager
+                    .remove_key_from_indexes(&key, &old_val)
+                    .await;
+                self.ctx
+                    .index_manager
+                    .add_key_to_indexes(&key, &new_val)
+                    .await;
                 self.ctx.tx_status_manager.commit(txid);
                 updated_rows.push(new_val);
             }
@@ -1361,18 +1820,36 @@ impl StorageExecutor {
         Ok(updated_rows)
     }
 
-    pub async fn insert_rows(&self, table_name: &str, columns: &[String], source_rows: Vec<Value>, source_column_names: &[String], on_conflict: &Option<(Vec<String>, crate::query_engine::logical_plan::OnConflictAction)>) -> Result<Vec<Value>> {
+    pub async fn insert_rows(
+        &self,
+        table_name: &str,
+        columns: &[String],
+        source_rows: Vec<Value>,
+        source_column_names: &[String],
+        on_conflict: &Option<(
+            Vec<String>,
+            crate::query_engine::logical_plan::OnConflictAction,
+        )>,
+    ) -> Result<Vec<Value>> {
         let mut inserted_rows = Vec::new();
         let schema = self.ctx.schema_cache.get(table_name);
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
             for source_row in source_rows {
-                let source_row_obj = source_row.as_object().ok_or_else(|| anyhow!("INSERT source did not produce an object"))?;
+                let source_row_obj = source_row
+                    .as_object()
+                    .ok_or_else(|| anyhow!("INSERT source did not produce an object"))?;
                 let insert_columns = if columns.is_empty() {
                     if let Some(s) = &schema {
-                        if !s.column_order.is_empty() { s.column_order.clone() } else { s.columns.keys().cloned().collect::<Vec<String>>() }
+                        if !s.column_order.is_empty() {
+                            s.column_order.clone()
+                        } else {
+                            s.columns.keys().cloned().collect::<Vec<String>>()
+                        }
                     } else {
-                        return Err(anyhow!("Cannot INSERT without column list into a table with no schema"));
+                        return Err(anyhow!(
+                            "Cannot INSERT without column list into a table with no schema"
+                        ));
                     }
                 } else {
                     columns.to_vec()
@@ -1380,14 +1857,24 @@ impl StorageExecutor {
                 let mut row_data = json!({});
                 if !source_column_names.is_empty() {
                     if insert_columns.len() != source_column_names.len() {
-                        return Err(anyhow!("INSERT has mismatch between number of columns ({}) and values from source ({})", insert_columns.len(), source_column_names.len()));
+                        return Err(anyhow!(
+                            "INSERT has mismatch between number of columns ({}) and values from source ({})",
+                            insert_columns.len(),
+                            source_column_names.len()
+                        ));
                     }
                     for (i, target_col_name) in insert_columns.iter().enumerate() {
                         let source_col_name = &source_column_names[i];
-                        let mut val = source_row_obj.get(source_col_name).cloned().unwrap_or(Value::Null);
+                        let mut val = source_row_obj
+                            .get(source_col_name)
+                            .cloned()
+                            .unwrap_or(Value::Null);
                         if let Some(s) = &schema {
                             if let Some(col_def) = s.columns.get(target_col_name) {
-                                val = crate::query_engine::logical_plan::cast_value_to_type(val, &col_def.data_type)?;
+                                val = crate::query_engine::logical_plan::cast_value_to_type(
+                                    val,
+                                    &col_def.data_type,
+                                )?;
                             }
                         }
                         row_data[target_col_name] = val;
@@ -1398,16 +1885,47 @@ impl StorageExecutor {
                     for (col_name, col_def) in &s.columns {
                         if !row_data.get(col_name).is_some() {
                             if let Some(default_expr) = &col_def.default {
-                                let mut val = default_expr.evaluate_with_context(&json!({}), None, self.ctx.clone(), Some(self.transaction_handle.clone())).await?;
-                                val = crate::query_engine::logical_plan::cast_value_to_type(val, &col_def.data_type)?;
+                                let mut val = default_expr
+                                    .evaluate_with_context(
+                                        &json!({}),
+                                        None,
+                                        self.ctx.clone(),
+                                        Some(self.transaction_handle.clone()),
+                                    )
+                                    .await?;
+                                val = crate::query_engine::logical_plan::cast_value_to_type(
+                                    val,
+                                    &col_def.data_type,
+                                )?;
                                 row_data[col_name.clone()] = val;
                             }
                         }
                     }
                 }
 
-                let pk_col = if let Some(s) = &schema { s.constraints.iter().find_map(|c| if let crate::query_engine::ast::TableConstraint::PrimaryKey { columns, .. } = c { columns.first().cloned() } else { None }).unwrap_or_else(|| "id".to_string()) } else { "id".to_string() };
-                let pk = match row_data.get(&pk_col) { Some(Value::String(s)) => s.clone(), Some(Value::Number(n)) => n.to_string(), _ => uuid::Uuid::new_v4().to_string() };
+                let pk_col = if let Some(s) = &schema {
+                    s.constraints
+                        .iter()
+                        .find_map(|c| {
+                            if let crate::query_engine::ast::TableConstraint::PrimaryKey {
+                                columns,
+                                ..
+                            } = c
+                            {
+                                columns.first().cloned()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_else(|| "id".to_string())
+                } else {
+                    "id".to_string()
+                };
+                let pk = match row_data.get(&pk_col) {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Number(n)) => n.to_string(),
+                    _ => uuid::Uuid::new_v4().to_string(),
+                };
                 let key = format!("{}:{}", table_name, pk);
 
                 let visible_value = get_visible_db_value(&key, &self.ctx, Some(tx)).await;
@@ -1417,20 +1935,33 @@ impl StorageExecutor {
                             crate::query_engine::logical_plan::OnConflictAction::DoNothing => {
                                 continue; // Skip insertion
                             }
-                            crate::query_engine::logical_plan::OnConflictAction::DoUpdate(set_clauses) => {
+                            crate::query_engine::logical_plan::OnConflictAction::DoUpdate(
+                                set_clauses,
+                            ) => {
                                 let old_val = match visible_value {
                                     Some(DbValue::JsonB(b)) => serde_json::from_slice(&b)?,
                                     Some(DbValue::Json(v)) => v.clone(),
                                     _ => json!({}),
                                 };
 
-                                let old_size = key.len() as u64 + memory::estimate_db_value_size(&DbValue::JsonB(serde_json::to_vec(&old_val)?)).await;
+                                let old_size = key.len() as u64
+                                    + memory::estimate_db_value_size(&DbValue::JsonB(
+                                        serde_json::to_vec(&old_val)?,
+                                    ))
+                                    .await;
 
                                 let mut new_val = old_val.clone();
                                 let excluded_row = json!({ "excluded": row_data.clone() });
 
                                 for (col, expr) in set_clauses {
-                                    let val = expr.evaluate_with_context(&excluded_row, Some(&old_val), self.ctx.clone(), Some(self.transaction_handle.clone())).await?;
+                                    let val = expr
+                                        .evaluate_with_context(
+                                            &excluded_row,
+                                            Some(&old_val),
+                                            self.ctx.clone(),
+                                            Some(self.transaction_handle.clone()),
+                                        )
+                                        .await?;
                                     new_val[col] = val;
                                 }
 
@@ -1440,26 +1971,40 @@ impl StorageExecutor {
 
                                 if self.ctx.memory.is_enabled() {
                                     if memory_change > 0 {
-                                        if let Err(e) = self.ctx.memory.ensure_memory_for(memory_change as u64, &self.ctx).await {
+                                        if let Err(e) = self
+                                            .ctx
+                                            .memory
+                                            .ensure_memory_for(memory_change as u64, &self.ctx)
+                                            .await
+                                        {
                                             return Err(anyhow!(e.to_string()));
                                         }
                                         self.ctx.memory.increase_memory(memory_change as u64);
                                     } else {
                                         self.ctx.memory.decrease_memory(-memory_change as u64);
                                     }
-                                    tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+                                    tx.reserved_memory.fetch_add(
+                                        memory_change,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
                                 }
 
-                                let log_entry = LogEntry::SetJsonB { key: key.clone(), value: value_bytes.clone() };
+                                let log_entry = LogEntry::SetJsonB {
+                                    key: key.clone(),
+                                    value: value_bytes.clone(),
+                                };
                                 tx.log_entries.write().await.push(log_entry);
                                 tx.writes.insert(key, Some(DbValue::JsonB(value_bytes)));
-                                
+
                                 inserted_rows.push(new_val);
                                 continue;
                             }
                         }
                     } else {
-                        return Err(anyhow!("PRIMARY KEY constraint failed. Key '{}' already exists.", key));
+                        return Err(anyhow!(
+                            "PRIMARY KEY constraint failed. Key '{}' already exists.",
+                            key
+                        ));
                     }
                 }
 
@@ -1469,15 +2014,24 @@ impl StorageExecutor {
 
                 if self.ctx.memory.is_enabled() {
                     if memory_change > 0 {
-                        if let Err(e) = self.ctx.memory.ensure_memory_for(memory_change as u64, &self.ctx).await {
+                        if let Err(e) = self
+                            .ctx
+                            .memory
+                            .ensure_memory_for(memory_change as u64, &self.ctx)
+                            .await
+                        {
                             return Err(anyhow!(e.to_string()));
                         }
                         self.ctx.memory.increase_memory(memory_change as u64);
                     }
-                    tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+                    tx.reserved_memory
+                        .fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
                 }
 
-                let log_entry = LogEntry::SetJsonB { key: key.clone(), value: value_bytes.clone() };
+                let log_entry = LogEntry::SetJsonB {
+                    key: key.clone(),
+                    value: value_bytes.clone(),
+                };
                 tx.log_entries.write().await.push(log_entry);
                 tx.writes.insert(key, Some(DbValue::JsonB(value_bytes)));
                 inserted_rows.push(row_data);
@@ -1486,12 +2040,20 @@ impl StorageExecutor {
         }
         drop(tx_guard);
         for source_row in source_rows {
-            let source_row_obj = source_row.as_object().ok_or_else(|| anyhow!("INSERT source did not produce an object"))?;
+            let source_row_obj = source_row
+                .as_object()
+                .ok_or_else(|| anyhow!("INSERT source did not produce an object"))?;
             let insert_columns = if columns.is_empty() {
                 if let Some(s) = &schema {
-                    if !s.column_order.is_empty() { s.column_order.clone() } else { s.columns.keys().cloned().collect::<Vec<String>>() }
+                    if !s.column_order.is_empty() {
+                        s.column_order.clone()
+                    } else {
+                        s.columns.keys().cloned().collect::<Vec<String>>()
+                    }
                 } else {
-                    return Err(anyhow!("Cannot INSERT without column list into a table with no schema"));
+                    return Err(anyhow!(
+                        "Cannot INSERT without column list into a table with no schema"
+                    ));
                 }
             } else {
                 columns.to_vec()
@@ -1499,61 +2061,109 @@ impl StorageExecutor {
             let mut row_data = json!({});
             for (i, target_col_name) in insert_columns.iter().enumerate() {
                 let source_col_name = &source_column_names[i];
-                let mut val = source_row_obj.get(source_col_name).cloned().unwrap_or(Value::Null);
+                let mut val = source_row_obj
+                    .get(source_col_name)
+                    .cloned()
+                    .unwrap_or(Value::Null);
                 if let Some(s) = &schema {
                     if let Some(col_def) = s.columns.get(target_col_name) {
-                        val = crate::query_engine::logical_plan::cast_value_to_type(val, &col_def.data_type)?;
+                        val = crate::query_engine::logical_plan::cast_value_to_type(
+                            val,
+                            &col_def.data_type,
+                        )?;
                     }
                 }
                 row_data[target_col_name] = val;
             }
             if let Some(s) = &schema {
-            for (col_name, col_def) in &s.columns {
-                if !row_data.get(col_name).is_some() {
-                    if let Some(default_expr) = &col_def.default {
-                        let mut val = default_expr.evaluate_with_context(&json!({}), None, self.ctx.clone(), None).await?;
-                        val = crate::query_engine::logical_plan::cast_value_to_type(val, &col_def.data_type)?;
-                        row_data[col_name.clone()] = val;
+                for (col_name, col_def) in &s.columns {
+                    if !row_data.get(col_name).is_some() {
+                        if let Some(default_expr) = &col_def.default {
+                            let mut val = default_expr
+                                .evaluate_with_context(&json!({}), None, self.ctx.clone(), None)
+                                .await?;
+                            val = crate::query_engine::logical_plan::cast_value_to_type(
+                                val,
+                                &col_def.data_type,
+                            )?;
+                            row_data[col_name.clone()] = val;
+                        }
                     }
                 }
             }
-        }
 
-        if let Some(s) = &schema {
-            // NOT NULL and CHECK constraints
-            for (col_name, col_def) in &s.columns {
-                let val = row_data.get(col_name).unwrap_or(&Value::Null);
-                if !col_def.nullable && val.is_null() {
-                    return Err(anyhow!("NULL value in column '{}' violates not-null constraint", col_name));
+            if let Some(s) = &schema {
+                // NOT NULL and CHECK constraints
+                for (col_name, col_def) in &s.columns {
+                    let val = row_data.get(col_name).unwrap_or(&Value::Null);
+                    if !col_def.nullable && val.is_null() {
+                        return Err(anyhow!(
+                            "NULL value in column '{}' violates not-null constraint",
+                            col_name
+                        ));
+                    }
                 }
-            }
-            for constraint in &s.constraints {
-                if let crate::query_engine::ast::TableConstraint::Check { name: _, expression } = constraint {
-                    let check_row = json!({ table_name.to_string(): row_data.clone() });
-                    if !crate::query_engine::logical_plan::simple_expr_to_expression(expression.clone(), &self.ctx.schema_cache, &self.ctx.view_cache, &self.ctx.function_registry, None)?.evaluate_with_context(&check_row, None, self.ctx.clone(), None).await?.as_bool().unwrap_or(false)
+                for constraint in &s.constraints {
+                    if let crate::query_engine::ast::TableConstraint::Check {
+                        name: _,
+                        expression,
+                    } = constraint
                     {
-                        return Err(anyhow!("CHECK constraint failed for table '{}'", table_name));
+                        let check_row = json!({ table_name.to_string(): row_data.clone() });
+                        if !crate::query_engine::logical_plan::simple_expr_to_expression(
+                            expression.clone(),
+                            &self.ctx.schema_cache,
+                            &self.ctx.view_cache,
+                            &self.ctx.function_registry,
+                            None,
+                        )?
+                        .evaluate_with_context(&check_row, None, self.ctx.clone(), None)
+                        .await?
+                        .as_bool()
+                        .unwrap_or(false)
+                        {
+                            return Err(anyhow!(
+                                "CHECK constraint failed for table '{}'",
+                                table_name
+                            ));
+                        }
                     }
                 }
             }
-        }
 
-        // UNIQUE and PRIMARY KEY constraints
-        if let Some(s) = &schema {
-            for constraint in &s.constraints {
-                if let crate::query_engine::ast::TableConstraint::Unique { name, columns } = constraint {
-                    if columns.len() == 1 { // Only single-column unique constraints are handled here
-                        let col_name = &columns[0];
-                        if let Some(val) = row_data.get(col_name) {
-                            let index_name = name.clone().unwrap_or_else(|| format!("unique_{}_{}", table_name, col_name));
+            // UNIQUE and PRIMARY KEY constraints
+            if let Some(s) = &schema {
+                for constraint in &s.constraints {
+                    if let crate::query_engine::ast::TableConstraint::Unique { name, columns } =
+                        constraint
+                    {
+                        if columns.len() == 1 {
+                            // Only single-column unique constraints are handled here
+                            let col_name = &columns[0];
+                            if let Some(val) = row_data.get(col_name) {
+                                let index_name = name.clone().unwrap_or_else(|| {
+                                    format!("unique_{}_{}", table_name, col_name)
+                                });
 
-                            if let Some(internal_name_entry) = self.ctx.index_manager.name_to_internal_name.get(&index_name) {
-                                let internal_name = internal_name_entry.value();
-                                if let Some(index) = self.ctx.index_manager.indexes.get(internal_name) {
-                                    let index_key = serde_json::to_string(val)?;
-                                    let index_data = index.read().await;
-                                    if index_data.contains_key(&index_key) {
-                                        return Err(anyhow!("UNIQUE constraint '{}' failed for column '{}'", index_name, col_name));
+                                if let Some(internal_name_entry) = self
+                                    .ctx
+                                    .index_manager
+                                    .name_to_internal_name
+                                    .get(&index_name)
+                                {
+                                    let internal_name = internal_name_entry.value();
+                                    if let Some(index) =
+                                        self.ctx.index_manager.indexes.get(internal_name)
+                                    {
+                                        let index_key = serde_json::to_string(val)?;
+                                        let index_data = index.read().await;
+                                        if index_data.contains_key(&index_key) {
+                                            return Err(anyhow!(
+                                                "UNIQUE constraint '{}' failed for column '{}'",
+                                                index_name,
+                                                col_name
+                                            ));
+                                        }
                                     }
                                 }
                             }
@@ -1561,128 +2171,182 @@ impl StorageExecutor {
                     }
                 }
             }
-        }
 
-        // FOREIGN KEY constraints
-        if let Some(s) = &schema {
-            for constraint in &s.constraints {
-                if let crate::query_engine::ast::TableConstraint::ForeignKey(fk) = constraint {
-                    let child_key_values: Vec<Value> = fk
-                        .columns
-                        .iter()
-                        .map(|col_name| row_data.get(col_name).cloned().unwrap_or(Value::Null))
-                        .collect();
+            // FOREIGN KEY constraints
+            if let Some(s) = &schema {
+                for constraint in &s.constraints {
+                    if let crate::query_engine::ast::TableConstraint::ForeignKey(fk) = constraint {
+                        let child_key_values: Vec<Value> = fk
+                            .columns
+                            .iter()
+                            .map(|col_name| row_data.get(col_name).cloned().unwrap_or(Value::Null))
+                            .collect();
 
-                    if child_key_values.iter().any(|v| v.is_null()) {
-                        continue;
-                    }
+                        if child_key_values.iter().any(|v| v.is_null()) {
+                            continue;
+                        }
 
-                    // This is a simplified check assuming single-column FK to PK
-                    if fk.columns.len() == 1 && fk.references_columns.len() == 1 {
-                        let child_fk_val = &child_key_values[0];
-                        let parent_key_val = match child_fk_val {
-                            Value::String(s) => s.clone(),
-                            Value::Number(n) => n.to_string(),
-                            _ => continue, // Cannot build key from this value
-                        };
+                        // This is a simplified check assuming single-column FK to PK
+                        if fk.columns.len() == 1 && fk.references_columns.len() == 1 {
+                            let child_fk_val = &child_key_values[0];
+                            let parent_key_val = match child_fk_val {
+                                Value::String(s) => s.clone(),
+                                Value::Number(n) => n.to_string(),
+                                _ => continue, // Cannot build key from this value
+                            };
 
-                        let parent_key = format!("{}:{}", fk.references_table, parent_key_val);
-                        
-                        let parent_exists = get_visible_db_value(&parent_key, &self.ctx, None).await.is_some();
+                            let parent_key = format!("{}:{}", fk.references_table, parent_key_val);
 
-                        if !parent_exists {
-                            return Err(anyhow!(
-                                "Insert or update on table '{}' violates foreign key constraint. A matching key was not found in table '{}'.",
-                                table_name,
-                                fk.references_table,
-                            ));
+                            let parent_exists = get_visible_db_value(&parent_key, &self.ctx, None)
+                                .await
+                                .is_some();
+
+                            if !parent_exists {
+                                return Err(anyhow!(
+                                    "Insert or update on table '{}' violates foreign key constraint. A matching key was not found in table '{}'.",
+                                    table_name,
+                                    fk.references_table,
+                                ));
+                            }
                         }
                     }
                 }
             }
-        }
 
-        let pk_col = if let Some(s) = &schema { s.constraints.iter().find_map(|c| if let crate::query_engine::ast::TableConstraint::PrimaryKey { columns, .. } = c { columns.first().cloned() } else { None }).unwrap_or_else(|| "id".to_string()) } else { "id".to_string() };
-                    let pk = match row_data.get(&pk_col) { Some(Value::String(s)) => s.clone(), Some(Value::Number(n)) => n.to_string(), _ => uuid::Uuid::new_v4().to_string() };
-                    let key = format!("{}:{}", table_name, pk);
-                                let visible_value = get_visible_db_value(&key, &self.ctx, None).await;
-                                if visible_value.is_some() {
-                                    if let Some((_target, action)) = on_conflict {
-                                        match action {
-                                            crate::query_engine::logical_plan::OnConflictAction::DoNothing => {
-                                                continue; // Skip insertion
-                                            }
-                                            crate::query_engine::logical_plan::OnConflictAction::DoUpdate(set_clauses) => {
-                                                let txid = self.ctx.tx_id_manager.new_txid();
-                                                self.ctx.tx_status_manager.begin(txid);
-                                                let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
-                                                
-                                                let (old_val_for_index, new_val, old_size) = {
-                                                    let old_val = match &visible_value {
-                                                        Some(DbValue::JsonB(b)) => serde_json::from_slice(&b)?,
-                                                        Some(DbValue::Json(v)) => v.clone(),
-                                                        _ => json!({}),
-                                                    };
-                                                    let old_size = if let Some(vv) = &visible_value {
-                                                        key.len() as u64 + memory::estimate_db_value_size(vv).await
-                                                    } else {
-                                                        0
-                                                    };
-                                                    let mut new_val = old_val.clone();
-                                                    let excluded_row = json!({ "excluded": row_data.clone() });
-                                                    for (col, expr) in set_clauses {
-                                                        let val = expr.evaluate_with_context(&excluded_row, Some(&old_val), self.ctx.clone(), None).await?;
-                                                        new_val[col] = val;
-                                                    }
-                                                    (old_val, new_val, old_size)
-                                                };
-
-                                                let new_val_bytes = serde_json::to_vec(&new_val)?;
-
-                                                if self.ctx.memory.is_enabled() {
-                                                    let new_size = key.len() as u64 + new_val_bytes.len() as u64;
-                                                    let needed = new_size.saturating_sub(old_size);
-                                                    if let Err(e) = self.ctx.memory.ensure_memory_for(needed, &self.ctx).await {
-                                                        self.ctx.tx_status_manager.abort(txid);
-                                                        return Err(anyhow!(e.to_string()));
-                                                    }
-                                                }
-
-                                                let log_entry = LogEntry::SetJsonB { key: key.clone(), value: new_val_bytes.clone() };
-                                                if let Response::Error(e) = log_to_wal(log_entry, &self.ctx).await {
-                                                    self.ctx.tx_status_manager.abort(txid);
-                                                    return Err(anyhow!(e));
-                                                }
-                                                let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
-                                                let mut version_chain = version_chain_arc.write().await;
-                                                if let Some(latest_version) = version_chain
-                                                    .iter_mut()
-                                                    .rev()
-                                                    .find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager))
-                                                {
-                                                    latest_version.expirer_txid = txid;
-                                                }
-                                                let new_version = crate::types::VersionedValue { value: DbValue::JsonB(new_val_bytes.clone()), creator_txid: txid, expirer_txid: 0 };
-                                                version_chain.push(new_version);
-
-                                                if self.ctx.memory.is_enabled() {
-                                                    let new_size = key.len() as u64 + new_val_bytes.len() as u64;
-                                                    self.ctx.memory.decrease_memory(old_size);
-                                                    self.ctx.memory.increase_memory(new_size);
-                                                    self.ctx.memory.track_access(&key).await;
-                                                }
-
-                                                self.ctx.index_manager.remove_key_from_indexes(&key, &old_val_for_index).await;
-                                                self.ctx.index_manager.add_key_to_indexes(&key, &new_val).await;
-                                                self.ctx.tx_status_manager.commit(txid);
-                                                inserted_rows.push(new_val);
-                                                continue;
-                            }
-                            }
+            let pk_col = if let Some(s) = &schema {
+                s.constraints
+                    .iter()
+                    .find_map(|c| {
+                        if let crate::query_engine::ast::TableConstraint::PrimaryKey {
+                            columns,
+                            ..
+                        } = c
+                        {
+                            columns.first().cloned()
                         } else {
-                            return Err(anyhow!("PRIMARY KEY constraint failed. Key '{}' already exists.", key));
+                            None
                         }
-                    }            
+                    })
+                    .unwrap_or_else(|| "id".to_string())
+            } else {
+                "id".to_string()
+            };
+            let pk = match row_data.get(&pk_col) {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Number(n)) => n.to_string(),
+                _ => uuid::Uuid::new_v4().to_string(),
+            };
+            let key = format!("{}:{}", table_name, pk);
+            let visible_value = get_visible_db_value(&key, &self.ctx, None).await;
+            if visible_value.is_some() {
+                if let Some((_target, action)) = on_conflict {
+                    match action {
+                        crate::query_engine::logical_plan::OnConflictAction::DoNothing => {
+                            continue; // Skip insertion
+                        }
+                        crate::query_engine::logical_plan::OnConflictAction::DoUpdate(
+                            set_clauses,
+                        ) => {
+                            let txid = self.ctx.tx_id_manager.new_txid();
+                            self.ctx.tx_status_manager.begin(txid);
+                            let snapshot = crate::types::Snapshot::new(
+                                0,
+                                &self.ctx.tx_status_manager,
+                                &self.ctx.tx_id_manager,
+                            );
+
+                            let (old_val_for_index, new_val, old_size) = {
+                                let old_val = match &visible_value {
+                                    Some(DbValue::JsonB(b)) => serde_json::from_slice(&b)?,
+                                    Some(DbValue::Json(v)) => v.clone(),
+                                    _ => json!({}),
+                                };
+                                let old_size = if let Some(vv) = &visible_value {
+                                    key.len() as u64 + memory::estimate_db_value_size(vv).await
+                                } else {
+                                    0
+                                };
+                                let mut new_val = old_val.clone();
+                                let excluded_row = json!({ "excluded": row_data.clone() });
+                                for (col, expr) in set_clauses {
+                                    let val = expr
+                                        .evaluate_with_context(
+                                            &excluded_row,
+                                            Some(&old_val),
+                                            self.ctx.clone(),
+                                            None,
+                                        )
+                                        .await?;
+                                    new_val[col] = val;
+                                }
+                                (old_val, new_val, old_size)
+                            };
+
+                            let new_val_bytes = serde_json::to_vec(&new_val)?;
+
+                            if self.ctx.memory.is_enabled() {
+                                let new_size = key.len() as u64 + new_val_bytes.len() as u64;
+                                let needed = new_size.saturating_sub(old_size);
+                                if let Err(e) =
+                                    self.ctx.memory.ensure_memory_for(needed, &self.ctx).await
+                                {
+                                    self.ctx.tx_status_manager.abort(txid);
+                                    return Err(anyhow!(e.to_string()));
+                                }
+                            }
+
+                            let log_entry = LogEntry::SetJsonB {
+                                key: key.clone(),
+                                value: new_val_bytes.clone(),
+                            };
+                            if let Response::Error(e) = log_to_wal(log_entry, &self.ctx).await {
+                                self.ctx.tx_status_manager.abort(txid);
+                                return Err(anyhow!(e));
+                            }
+                            let version_chain_arc =
+                                self.ctx.db.entry(key.clone()).or_default().clone();
+                            let mut version_chain = version_chain_arc.write().await;
+                            if let Some(latest_version) = version_chain
+                                .iter_mut()
+                                .rev()
+                                .find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager))
+                            {
+                                latest_version.expirer_txid = txid;
+                            }
+                            let new_version = crate::types::VersionedValue {
+                                value: DbValue::JsonB(new_val_bytes.clone()),
+                                creator_txid: txid,
+                                expirer_txid: 0,
+                            };
+                            version_chain.push(new_version);
+
+                            if self.ctx.memory.is_enabled() {
+                                let new_size = key.len() as u64 + new_val_bytes.len() as u64;
+                                self.ctx.memory.decrease_memory(old_size);
+                                self.ctx.memory.increase_memory(new_size);
+                                self.ctx.memory.track_access(&key).await;
+                            }
+
+                            self.ctx
+                                .index_manager
+                                .remove_key_from_indexes(&key, &old_val_for_index)
+                                .await;
+                            self.ctx
+                                .index_manager
+                                .add_key_to_indexes(&key, &new_val)
+                                .await;
+                            self.ctx.tx_status_manager.commit(txid);
+                            inserted_rows.push(new_val);
+                            continue;
+                        }
+                    }
+                } else {
+                    return Err(anyhow!(
+                        "PRIMARY KEY constraint failed. Key '{}' already exists.",
+                        key
+                    ));
+                }
+            }
             let value_bytes = serde_json::to_vec(&row_data)?;
 
             if self.ctx.memory.is_enabled() {
@@ -1693,14 +2357,24 @@ impl StorageExecutor {
                 }
             }
 
-            let log_entry = LogEntry::SetJsonB { key: key.clone(), value: value_bytes.clone() };
+            let log_entry = LogEntry::SetJsonB {
+                key: key.clone(),
+                value: value_bytes.clone(),
+            };
             if let Response::Error(e) = log_to_wal(log_entry, &self.ctx).await {
                 return Err(anyhow!(e));
             }
-            self.ctx.index_manager.add_key_to_indexes(&key, &row_data).await;
+            self.ctx
+                .index_manager
+                .add_key_to_indexes(&key, &row_data)
+                .await;
             let txid = self.ctx.tx_id_manager.new_txid();
             self.ctx.tx_status_manager.begin(txid);
-            let new_version = crate::types::VersionedValue { value: DbValue::JsonB(value_bytes.clone()), creator_txid: txid, expirer_txid: 0 };
+            let new_version = crate::types::VersionedValue {
+                value: DbValue::JsonB(value_bytes.clone()),
+                creator_txid: txid,
+                expirer_txid: 0,
+            };
             let version_chain_arc = self.ctx.db.entry(key.clone()).or_default().clone();
             let mut version_chain = version_chain_arc.write().await;
             version_chain.push(new_version);
@@ -1735,12 +2409,19 @@ impl StorageExecutor {
                 let new_node_db_value = DbValue::JsonB(properties.clone());
                 let new_pk_db_value = DbValue::Bytes(label.clone().into_bytes());
 
-                let new_node_size = node_key.len() as u64 + memory::estimate_db_value_size(&new_node_db_value).await;
-                let new_pk_size = pk_key.len() as u64 + memory::estimate_db_value_size(&new_pk_db_value).await;
+                let new_node_size = node_key.len() as u64
+                    + memory::estimate_db_value_size(&new_node_db_value).await;
+                let new_pk_size =
+                    pk_key.len() as u64 + memory::estimate_db_value_size(&new_pk_db_value).await;
                 let memory_change = (new_node_size + new_pk_size) as i64;
 
                 if memory_change > 0 {
-                    if let Err(e) = self.ctx.memory.ensure_memory_for(memory_change as u64, &self.ctx).await {
+                    if let Err(e) = self
+                        .ctx
+                        .memory
+                        .ensure_memory_for(memory_change as u64, &self.ctx)
+                        .await
+                    {
                         return Response::Error(e.to_string());
                     }
                 }
@@ -1751,7 +2432,8 @@ impl StorageExecutor {
                     self.ctx.memory.decrease_memory(-memory_change as u64);
                 }
 
-                tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+                tx.reserved_memory
+                    .fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
             }
 
             tx.log_entries.write().await.push(log_entry);
@@ -1759,8 +2441,7 @@ impl StorageExecutor {
             let node_key = format!("_node:{}:{}", label, node_id);
             let pk_key = format!("_pk_node:{}", node_id);
 
-            tx.writes
-                .insert(node_key, Some(DbValue::JsonB(properties)));
+            tx.writes.insert(node_key, Some(DbValue::JsonB(properties)));
             tx.writes
                 .insert(pk_key, Some(DbValue::Bytes(label.into_bytes())));
 
@@ -1774,14 +2455,19 @@ impl StorageExecutor {
 
         let node_key = format!("_node:{}:{}", label, &node_id);
         let pk_key = format!("_pk_node:{}", &node_id);
-        
+
         let mut total_new_size = 0;
         if self.ctx.memory.is_enabled() {
             let new_node_size = node_key.len() as u64 + properties.len() as u64;
             let new_pk_size = pk_key.len() as u64 + label.len() as u64;
             total_new_size = new_node_size + new_pk_size;
 
-            if let Err(e) = self.ctx.memory.ensure_memory_for(total_new_size, &self.ctx).await {
+            if let Err(e) = self
+                .ctx
+                .memory
+                .ensure_memory_for(total_new_size, &self.ctx)
+                .await
+            {
                 self.ctx.tx_status_manager.abort(txid);
                 return Response::Error(e.to_string());
             }
@@ -1848,8 +2534,14 @@ impl StorageExecutor {
         // Transactional path
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
-            let out_key = format!("_edge:out:{}:{}:{}:{}", start_node_id, rel_type, end_node_id, rel_id);
-            let in_key = format!("_edge:in:{}:{}:{}:{}", end_node_id, rel_type, start_node_id, rel_id);
+            let out_key = format!(
+                "_edge:out:{}:{}:{}:{}",
+                start_node_id, rel_type, end_node_id, rel_id
+            );
+            let in_key = format!(
+                "_edge:in:{}:{}:{}:{}",
+                end_node_id, rel_type, start_node_id, rel_id
+            );
             let pk_key = format!("_pk_rel:{}", rel_id);
             let pk_val = format!("{}:{}:{}", start_node_id, rel_type, end_node_id);
             let pk_val_bytes = pk_val.into_bytes();
@@ -1858,14 +2550,22 @@ impl StorageExecutor {
                 let out_db_value = DbValue::JsonB(final_properties.clone());
                 let pk_db_value = DbValue::Bytes(pk_val_bytes.clone());
 
-                let out_size = out_key.len() as u64 + memory::estimate_db_value_size(&out_db_value).await;
-                let in_size = in_key.len() as u64 + memory::estimate_db_value_size(&out_db_value).await;
-                let pk_size = pk_key.len() as u64 + memory::estimate_db_value_size(&pk_db_value).await;
+                let out_size =
+                    out_key.len() as u64 + memory::estimate_db_value_size(&out_db_value).await;
+                let in_size =
+                    in_key.len() as u64 + memory::estimate_db_value_size(&out_db_value).await;
+                let pk_size =
+                    pk_key.len() as u64 + memory::estimate_db_value_size(&pk_db_value).await;
 
                 let memory_change = (out_size + in_size + pk_size) as i64;
 
                 if memory_change > 0 {
-                    if let Err(e) = self.ctx.memory.ensure_memory_for(memory_change as u64, &self.ctx).await {
+                    if let Err(e) = self
+                        .ctx
+                        .memory
+                        .ensure_memory_for(memory_change as u64, &self.ctx)
+                        .await
+                    {
                         return Response::Error(e.to_string());
                     }
                 }
@@ -1876,7 +2576,8 @@ impl StorageExecutor {
                     self.ctx.memory.decrease_memory(-memory_change as u64);
                 }
 
-                tx.reserved_memory.fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
+                tx.reserved_memory
+                    .fetch_add(memory_change, std::sync::atomic::Ordering::Relaxed);
             }
 
             tx.log_entries.write().await.push(log_entry);
@@ -1885,8 +2586,7 @@ impl StorageExecutor {
                 .insert(out_key, Some(DbValue::JsonB(final_properties.clone())));
             tx.writes
                 .insert(in_key, Some(DbValue::JsonB(final_properties)));
-            tx.writes
-                .insert(pk_key, Some(DbValue::Bytes(pk_val_bytes)));
+            tx.writes.insert(pk_key, Some(DbValue::Bytes(pk_val_bytes)));
 
             return Response::Bytes(rel_id.into_bytes());
         }
@@ -1896,24 +2596,36 @@ impl StorageExecutor {
         let txid = self.ctx.tx_id_manager.new_txid();
         self.ctx.tx_status_manager.begin(txid);
 
-        let out_key = format!("_edge:out:{}:{}:{}:{}", start_node_id, rel_type, end_node_id, rel_id);
-        let in_key = format!("_edge:in:{}:{}:{}:{}", end_node_id, rel_type, start_node_id, rel_id);
+        let out_key = format!(
+            "_edge:out:{}:{}:{}:{}",
+            start_node_id, rel_type, end_node_id, rel_id
+        );
+        let in_key = format!(
+            "_edge:in:{}:{}:{}:{}",
+            end_node_id, rel_type, start_node_id, rel_id
+        );
         let pk_key = format!("_pk_rel:{}", rel_id);
         let pk_val = format!("{}:{}:{}", start_node_id, rel_type, end_node_id);
         let pk_val_bytes = pk_val.into_bytes();
-        
+
         let mut total_new_size = 0;
         if self.ctx.memory.is_enabled() {
             let out_db_value = DbValue::JsonB(final_properties.clone());
             let pk_db_value = DbValue::Bytes(pk_val_bytes.clone());
 
-            let out_size = out_key.len() as u64 + memory::estimate_db_value_size(&out_db_value).await;
+            let out_size =
+                out_key.len() as u64 + memory::estimate_db_value_size(&out_db_value).await;
             let in_size = in_key.len() as u64 + memory::estimate_db_value_size(&out_db_value).await;
             let pk_size = pk_key.len() as u64 + memory::estimate_db_value_size(&pk_db_value).await;
-            
+
             total_new_size = out_size + in_size + pk_size;
 
-            if let Err(e) = self.ctx.memory.ensure_memory_for(total_new_size, &self.ctx).await {
+            if let Err(e) = self
+                .ctx
+                .memory
+                .ensure_memory_for(total_new_size, &self.ctx)
+                .await
+            {
                 self.ctx.tx_status_manager.abort(txid);
                 return Response::Error(e.to_string());
             }
@@ -1930,9 +2642,10 @@ impl StorageExecutor {
             creator_txid: txid,
             expirer_txid: 0,
         };
-        self.ctx
-            .db
-            .insert(out_key.clone(), Arc::new(RwLock::new(vec![edge_version.clone()])));
+        self.ctx.db.insert(
+            out_key.clone(),
+            Arc::new(RwLock::new(vec![edge_version.clone()])),
+        );
         self.ctx
             .db
             .insert(in_key.clone(), Arc::new(RwLock::new(vec![edge_version])));
@@ -1958,30 +2671,33 @@ impl StorageExecutor {
         Response::Bytes(rel_id.into_bytes())
     }
 
-    pub async fn graph_remove_node_property(
-        &self,
-        node_id: String,
-        property: String,
-    ) -> Response {
+    pub async fn graph_remove_node_property(&self, node_id: String, property: String) -> Response {
         let mut tx_guard = self.transaction_handle.write().await;
         if let Some(tx) = tx_guard.as_mut() {
             let pk_key = format!("_pk_node:{}", node_id);
 
             let label = match get_visible_db_value(&pk_key, &self.ctx, Some(tx)).await {
-                Some(DbValue::Bytes(label_bytes)) => String::from_utf8(label_bytes).unwrap_or_default(),
+                Some(DbValue::Bytes(label_bytes)) => {
+                    String::from_utf8(label_bytes).unwrap_or_default()
+                }
                 _ => return Response::Integer(0), // Node not found
             };
-            if label.is_empty() { return Response::Integer(0); }
+            if label.is_empty() {
+                return Response::Integer(0);
+            }
 
             let node_key = format!("_node:{}:{}", label, node_id);
-            let current_props_bytes = match get_visible_db_value(&node_key, &self.ctx, Some(tx)).await {
-                Some(DbValue::JsonB(bytes)) => bytes,
-                _ => return Response::Integer(0),
-            };
+            let current_props_bytes =
+                match get_visible_db_value(&node_key, &self.ctx, Some(tx)).await {
+                    Some(DbValue::JsonB(bytes)) => bytes,
+                    _ => return Response::Integer(0),
+                };
 
             let mut props: Value = match serde_json::from_slice(&current_props_bytes) {
                 Ok(p) => p,
-                Err(_) => return Response::Error("Failed to deserialize node properties".to_string()),
+                Err(_) => {
+                    return Response::Error("Failed to deserialize node properties".to_string());
+                }
             };
 
             if let Some(obj) = props.as_object_mut() {
@@ -1999,7 +2715,8 @@ impl StorageExecutor {
                         property,
                     };
                     tx.log_entries.write().await.push(log_entry);
-                    tx.writes.insert(node_key, Some(DbValue::JsonB(new_props_bytes)));
+                    tx.writes
+                        .insert(node_key, Some(DbValue::JsonB(new_props_bytes)));
                     Response::Integer(1)
                 }
                 Err(_) => Response::Error("Failed to serialize updated properties".to_string()),
@@ -2012,29 +2729,56 @@ impl StorageExecutor {
 
             let pk_key = format!("_pk_node:{}", node_id);
             let label = match get_visible_db_value(&pk_key, &self.ctx, None).await {
-                Some(DbValue::Bytes(label_bytes)) => String::from_utf8(label_bytes).unwrap_or_default(),
-                _ => { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+                Some(DbValue::Bytes(label_bytes)) => {
+                    String::from_utf8(label_bytes).unwrap_or_default()
+                }
+                _ => {
+                    self.ctx.tx_status_manager.abort(txid);
+                    return Response::Integer(0);
+                }
             };
-            if label.is_empty() { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+            if label.is_empty() {
+                self.ctx.tx_status_manager.abort(txid);
+                return Response::Integer(0);
+            }
 
             let node_key = format!("_node:{}:{}", label, node_id);
             let version_chain_arc = match self.ctx.db.get(&node_key) {
                 Some(vc) => vc.clone(),
-                None => { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+                None => {
+                    self.ctx.tx_status_manager.abort(txid);
+                    return Response::Integer(0);
+                }
             };
 
             let mut version_chain = version_chain_arc.write().await;
-            let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
+            let snapshot = crate::types::Snapshot::new(
+                0,
+                &self.ctx.tx_status_manager,
+                &self.ctx.tx_id_manager,
+            );
 
-            if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager)) {
+            if let Some(latest_version) = version_chain
+                .iter_mut()
+                .rev()
+                .find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager))
+            {
                 let current_props_bytes = match &latest_version.value {
                     DbValue::JsonB(bytes) => bytes.clone(),
-                    _ => { self.ctx.tx_status_manager.abort(txid); return Response::Error("WRONGTYPE: Node data is not JSONB".to_string()); }
+                    _ => {
+                        self.ctx.tx_status_manager.abort(txid);
+                        return Response::Error("WRONGTYPE: Node data is not JSONB".to_string());
+                    }
                 };
 
                 let mut props: Value = match serde_json::from_slice(&current_props_bytes) {
                     Ok(p) => p,
-                    Err(_) => { self.ctx.tx_status_manager.abort(txid); return Response::Error("Failed to deserialize node properties".to_string()); }
+                    Err(_) => {
+                        self.ctx.tx_status_manager.abort(txid);
+                        return Response::Error(
+                            "Failed to deserialize node properties".to_string(),
+                        );
+                    }
                 };
 
                 if let Some(obj) = props.as_object_mut() {
@@ -2049,7 +2793,10 @@ impl StorageExecutor {
 
                 match serde_json::to_vec(&props) {
                     Ok(new_props_bytes) => {
-                        let log_entry = LogEntry::RemoveNodeProperty { id: node_id, property };
+                        let log_entry = LogEntry::RemoveNodeProperty {
+                            id: node_id,
+                            property,
+                        };
                         if !matches!(log_to_wal(log_entry, &self.ctx).await, Response::Ok) {
                             self.ctx.tx_status_manager.abort(txid);
                             return Response::Error("WAL write error".to_string());
@@ -2065,7 +2812,10 @@ impl StorageExecutor {
                         self.ctx.tx_status_manager.commit(txid);
                         Response::Integer(1)
                     }
-                    Err(_) => { self.ctx.tx_status_manager.abort(txid); Response::Error("Failed to serialize updated properties".to_string()) }
+                    Err(_) => {
+                        self.ctx.tx_status_manager.abort(txid);
+                        Response::Error("Failed to serialize updated properties".to_string())
+                    }
                 }
             } else {
                 self.ctx.tx_status_manager.abort(txid);
@@ -2084,24 +2834,36 @@ impl StorageExecutor {
             let pk_key = format!("_pk_rel:{}", rel_id);
 
             let pk_val = match get_visible_db_value(&pk_key, &self.ctx, Some(tx)).await {
-                Some(DbValue::Bytes(pk_val_bytes)) => String::from_utf8(pk_val_bytes).unwrap_or_default(),
+                Some(DbValue::Bytes(pk_val_bytes)) => {
+                    String::from_utf8(pk_val_bytes).unwrap_or_default()
+                }
                 _ => return Response::Integer(0),
             };
-            if pk_val.is_empty() { return Response::Integer(0); }
+            if pk_val.is_empty() {
+                return Response::Integer(0);
+            }
 
             let parts: Vec<&str> = pk_val.splitn(3, ':').collect();
-            if parts.len() != 3 { return Response::Error("Invalid relationship PK value".to_string()); }            
+            if parts.len() != 3 {
+                return Response::Error("Invalid relationship PK value".to_string());
+            }
             let out_key = format!("_edge:out:{}:{}", pk_val, &rel_id);
-            let in_key = format!("_edge:in:{}:{}:{}:{}", parts[2], parts[1], parts[0], &rel_id);
+            let in_key = format!(
+                "_edge:in:{}:{}:{}:{}",
+                parts[2], parts[1], parts[0], &rel_id
+            );
 
-            let current_props_bytes = match get_visible_db_value(&out_key, &self.ctx, Some(tx)).await {
-                Some(DbValue::JsonB(bytes)) => bytes,
-                _ => return Response::Integer(0),
-            };
+            let current_props_bytes =
+                match get_visible_db_value(&out_key, &self.ctx, Some(tx)).await {
+                    Some(DbValue::JsonB(bytes)) => bytes,
+                    _ => return Response::Integer(0),
+                };
 
             let mut props: Value = match serde_json::from_slice(&current_props_bytes) {
                 Ok(p) => p,
-                Err(_) => return Response::Error("Failed to deserialize rel properties".to_string()),
+                Err(_) => {
+                    return Response::Error("Failed to deserialize rel properties".to_string());
+                }
             };
 
             if let Some(obj) = props.as_object_mut() {
@@ -2119,8 +2881,10 @@ impl StorageExecutor {
                         property,
                     };
                     tx.log_entries.write().await.push(log_entry);
-                    tx.writes.insert(out_key, Some(DbValue::JsonB(new_props_bytes.clone())));
-                    tx.writes.insert(in_key, Some(DbValue::JsonB(new_props_bytes)));
+                    tx.writes
+                        .insert(out_key, Some(DbValue::JsonB(new_props_bytes.clone())));
+                    tx.writes
+                        .insert(in_key, Some(DbValue::JsonB(new_props_bytes)));
                     Response::Integer(1)
                 }
                 Err(_) => Response::Error("Failed to serialize updated properties".to_string()),
@@ -2133,38 +2897,72 @@ impl StorageExecutor {
 
             let pk_key = format!("_pk_rel:{}", rel_id);
             let pk_val = match get_visible_db_value(&pk_key, &self.ctx, None).await {
-                Some(DbValue::Bytes(pk_val_bytes)) => String::from_utf8(pk_val_bytes).unwrap_or_default(),
-                _ => { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+                Some(DbValue::Bytes(pk_val_bytes)) => {
+                    String::from_utf8(pk_val_bytes).unwrap_or_default()
+                }
+                _ => {
+                    self.ctx.tx_status_manager.abort(txid);
+                    return Response::Integer(0);
+                }
             };
-            if pk_val.is_empty() { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+            if pk_val.is_empty() {
+                self.ctx.tx_status_manager.abort(txid);
+                return Response::Integer(0);
+            }
 
             let parts: Vec<&str> = pk_val.splitn(3, ':').collect();
-            if parts.len() != 3 { self.ctx.tx_status_manager.abort(txid); return Response::Error("Invalid relationship PK value".to_string()); }
+            if parts.len() != 3 {
+                self.ctx.tx_status_manager.abort(txid);
+                return Response::Error("Invalid relationship PK value".to_string());
+            }
 
             let out_key = format!("_edge:out:{}:{}", pk_val, &rel_id);
-            let in_key = format!("_edge:in:{}:{}:{}:{}", parts[2], parts[1], parts[0], &rel_id);
+            let in_key = format!(
+                "_edge:in:{}:{}:{}:{}",
+                parts[2], parts[1], parts[0], &rel_id
+            );
 
             let out_version_chain_arc = match self.ctx.db.get(&out_key) {
                 Some(vc) => vc.clone(),
-                None => { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+                None => {
+                    self.ctx.tx_status_manager.abort(txid);
+                    return Response::Integer(0);
+                }
             };
             let in_version_chain_arc = match self.ctx.db.get(&in_key) {
                 Some(vc) => vc.clone(),
-                None => { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+                None => {
+                    self.ctx.tx_status_manager.abort(txid);
+                    return Response::Integer(0);
+                }
             };
 
             let mut out_version_chain = out_version_chain_arc.write().await;
-            let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
+            let snapshot = crate::types::Snapshot::new(
+                0,
+                &self.ctx.tx_status_manager,
+                &self.ctx.tx_id_manager,
+            );
 
-            if let Some(latest_version) = out_version_chain.iter_mut().rev().find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager)) {
+            if let Some(latest_version) = out_version_chain
+                .iter_mut()
+                .rev()
+                .find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager))
+            {
                 let current_props_bytes = match &latest_version.value {
                     DbValue::JsonB(bytes) => bytes.clone(),
-                    _ => { self.ctx.tx_status_manager.abort(txid); return Response::Error("WRONGTYPE: Rel data is not JSONB".to_string()); }
+                    _ => {
+                        self.ctx.tx_status_manager.abort(txid);
+                        return Response::Error("WRONGTYPE: Rel data is not JSONB".to_string());
+                    }
                 };
 
                 let mut props: Value = match serde_json::from_slice(&current_props_bytes) {
                     Ok(p) => p,
-                    Err(_) => { self.ctx.tx_status_manager.abort(txid); return Response::Error("Failed to deserialize rel properties".to_string()); }
+                    Err(_) => {
+                        self.ctx.tx_status_manager.abort(txid);
+                        return Response::Error("Failed to deserialize rel properties".to_string());
+                    }
                 };
 
                 if let Some(obj) = props.as_object_mut() {
@@ -2179,7 +2977,10 @@ impl StorageExecutor {
 
                 match serde_json::to_vec(&props) {
                     Ok(new_props_bytes) => {
-                        let log_entry = LogEntry::RemoveRelationshipProperty { id: rel_id, property };
+                        let log_entry = LogEntry::RemoveRelationshipProperty {
+                            id: rel_id,
+                            property,
+                        };
                         if !matches!(log_to_wal(log_entry, &self.ctx).await, Response::Ok) {
                             self.ctx.tx_status_manager.abort(txid);
                             return Response::Error("WAL write error".to_string());
@@ -2194,7 +2995,11 @@ impl StorageExecutor {
                         out_version_chain.push(new_version.clone());
 
                         let mut in_version_chain = in_version_chain_arc.write().await;
-                        if let Some(in_latest) = in_version_chain.iter_mut().rev().find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager)) {
+                        if let Some(in_latest) = in_version_chain
+                            .iter_mut()
+                            .rev()
+                            .find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager))
+                        {
                             in_latest.expirer_txid = txid;
                         }
                         in_version_chain.push(new_version);
@@ -2202,7 +3007,10 @@ impl StorageExecutor {
                         self.ctx.tx_status_manager.commit(txid);
                         Response::Integer(1)
                     }
-                    Err(_) => { self.ctx.tx_status_manager.abort(txid); Response::Error("Failed to serialize updated properties".to_string()) }
+                    Err(_) => {
+                        self.ctx.tx_status_manager.abort(txid);
+                        Response::Error("Failed to serialize updated properties".to_string())
+                    }
                 }
             } else {
                 self.ctx.tx_status_manager.abort(txid);
@@ -2222,25 +3030,37 @@ impl StorageExecutor {
             let pk_key = format!("_pk_rel:{}", rel_id);
 
             let pk_val = match get_visible_db_value(&pk_key, &self.ctx, Some(tx)).await {
-                Some(DbValue::Bytes(pk_val_bytes)) => String::from_utf8(pk_val_bytes).unwrap_or_default(),
+                Some(DbValue::Bytes(pk_val_bytes)) => {
+                    String::from_utf8(pk_val_bytes).unwrap_or_default()
+                }
                 _ => return Response::Integer(0), // Relationship not found
             };
-            if pk_val.is_empty() { return Response::Integer(0); }
+            if pk_val.is_empty() {
+                return Response::Integer(0);
+            }
 
             let parts: Vec<&str> = pk_val.splitn(3, ':').collect();
-            if parts.len() != 3 { return Response::Error("Invalid relationship PK value".to_string()); }
-            
-            let out_key = format!("_edge:out:{}:{}", pk_val, &rel_id);
-            let in_key = format!("_edge:in:{}:{}:{}:{}", parts[2], parts[1], parts[0], &rel_id);
+            if parts.len() != 3 {
+                return Response::Error("Invalid relationship PK value".to_string());
+            }
 
-            let current_props_bytes = match get_visible_db_value(&out_key, &self.ctx, Some(tx)).await {
-                Some(DbValue::JsonB(bytes)) => bytes,
-                _ => return Response::Integer(0), // Rel data not found or wrong type
-            };
+            let out_key = format!("_edge:out:{}:{}", pk_val, &rel_id);
+            let in_key = format!(
+                "_edge:in:{}:{}:{}:{}",
+                parts[2], parts[1], parts[0], &rel_id
+            );
+
+            let current_props_bytes =
+                match get_visible_db_value(&out_key, &self.ctx, Some(tx)).await {
+                    Some(DbValue::JsonB(bytes)) => bytes,
+                    _ => return Response::Integer(0), // Rel data not found or wrong type
+                };
 
             let mut props: Value = match serde_json::from_slice(&current_props_bytes) {
                 Ok(p) => p,
-                Err(_) => return Response::Error("Failed to deserialize rel properties".to_string()),
+                Err(_) => {
+                    return Response::Error("Failed to deserialize rel properties".to_string());
+                }
             };
             let new_value: Value = match serde_json::from_slice(&value_bytes) {
                 Ok(v) => v,
@@ -2261,8 +3081,10 @@ impl StorageExecutor {
                         value: value_bytes,
                     };
                     tx.log_entries.write().await.push(log_entry);
-                    tx.writes.insert(out_key, Some(DbValue::JsonB(new_props_bytes.clone())));
-                    tx.writes.insert(in_key, Some(DbValue::JsonB(new_props_bytes)));
+                    tx.writes
+                        .insert(out_key, Some(DbValue::JsonB(new_props_bytes.clone())));
+                    tx.writes
+                        .insert(in_key, Some(DbValue::JsonB(new_props_bytes)));
                     Response::Integer(1)
                 }
                 Err(_) => Response::Error("Failed to serialize updated properties".to_string()),
@@ -2275,42 +3097,79 @@ impl StorageExecutor {
 
             let pk_key = format!("_pk_rel:{}", rel_id);
             let pk_val = match get_visible_db_value(&pk_key, &self.ctx, None).await {
-                Some(DbValue::Bytes(pk_val_bytes)) => String::from_utf8(pk_val_bytes).unwrap_or_default(),
-                _ => { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+                Some(DbValue::Bytes(pk_val_bytes)) => {
+                    String::from_utf8(pk_val_bytes).unwrap_or_default()
+                }
+                _ => {
+                    self.ctx.tx_status_manager.abort(txid);
+                    return Response::Integer(0);
+                }
             };
-            if pk_val.is_empty() { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+            if pk_val.is_empty() {
+                self.ctx.tx_status_manager.abort(txid);
+                return Response::Integer(0);
+            }
 
             let parts: Vec<&str> = pk_val.splitn(3, ':').collect();
-            if parts.len() != 3 { self.ctx.tx_status_manager.abort(txid); return Response::Error("Invalid relationship PK value".to_string()); }
+            if parts.len() != 3 {
+                self.ctx.tx_status_manager.abort(txid);
+                return Response::Error("Invalid relationship PK value".to_string());
+            }
 
             let out_key = format!("_edge:out:{}:{}", pk_val, &rel_id);
-            let in_key = format!("_edge:in:{}:{}:{}:{}", parts[2], parts[1], parts[0], &rel_id);
+            let in_key = format!(
+                "_edge:in:{}:{}:{}:{}",
+                parts[2], parts[1], parts[0], &rel_id
+            );
 
             let out_version_chain_arc = match self.ctx.db.get(&out_key) {
                 Some(vc) => vc.clone(),
-                None => { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+                None => {
+                    self.ctx.tx_status_manager.abort(txid);
+                    return Response::Integer(0);
+                }
             };
             let in_version_chain_arc = match self.ctx.db.get(&in_key) {
                 Some(vc) => vc.clone(),
-                None => { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+                None => {
+                    self.ctx.tx_status_manager.abort(txid);
+                    return Response::Integer(0);
+                }
             };
 
             let mut out_version_chain = out_version_chain_arc.write().await;
-            let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
+            let snapshot = crate::types::Snapshot::new(
+                0,
+                &self.ctx.tx_status_manager,
+                &self.ctx.tx_id_manager,
+            );
 
-            if let Some(latest_version) = out_version_chain.iter_mut().rev().find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager)) {
+            if let Some(latest_version) = out_version_chain
+                .iter_mut()
+                .rev()
+                .find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager))
+            {
                 let current_props_bytes = match &latest_version.value {
                     DbValue::JsonB(bytes) => bytes.clone(),
-                    _ => { self.ctx.tx_status_manager.abort(txid); return Response::Error("WRONGTYPE: Rel data is not JSONB".to_string()); }
+                    _ => {
+                        self.ctx.tx_status_manager.abort(txid);
+                        return Response::Error("WRONGTYPE: Rel data is not JSONB".to_string());
+                    }
                 };
 
                 let mut props: Value = match serde_json::from_slice(&current_props_bytes) {
                     Ok(p) => p,
-                    Err(_) => { self.ctx.tx_status_manager.abort(txid); return Response::Error("Failed to deserialize rel properties".to_string()); }
+                    Err(_) => {
+                        self.ctx.tx_status_manager.abort(txid);
+                        return Response::Error("Failed to deserialize rel properties".to_string());
+                    }
                 };
                 let new_value: Value = match serde_json::from_slice(&value_bytes) {
                     Ok(v) => v,
-                    Err(_) => { self.ctx.tx_status_manager.abort(txid); return Response::Error("Invalid JSON format for value".to_string()); }
+                    Err(_) => {
+                        self.ctx.tx_status_manager.abort(txid);
+                        return Response::Error("Invalid JSON format for value".to_string());
+                    }
                 };
 
                 if let Some(obj) = props.as_object_mut() {
@@ -2322,7 +3181,11 @@ impl StorageExecutor {
 
                 match serde_json::to_vec(&props) {
                     Ok(new_props_bytes) => {
-                        let log_entry = LogEntry::SetRelationshipProperty { id: rel_id, property, value: value_bytes };
+                        let log_entry = LogEntry::SetRelationshipProperty {
+                            id: rel_id,
+                            property,
+                            value: value_bytes,
+                        };
                         if !matches!(log_to_wal(log_entry, &self.ctx).await, Response::Ok) {
                             self.ctx.tx_status_manager.abort(txid);
                             return Response::Error("WAL write error".to_string());
@@ -2338,7 +3201,11 @@ impl StorageExecutor {
 
                         // Also update the IN edge
                         let mut in_version_chain = in_version_chain_arc.write().await;
-                        if let Some(in_latest) = in_version_chain.iter_mut().rev().find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager)) {
+                        if let Some(in_latest) = in_version_chain
+                            .iter_mut()
+                            .rev()
+                            .find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager))
+                        {
                             in_latest.expirer_txid = txid;
                         }
                         in_version_chain.push(new_version);
@@ -2346,7 +3213,10 @@ impl StorageExecutor {
                         self.ctx.tx_status_manager.commit(txid);
                         Response::Integer(1)
                     }
-                    Err(_) => { self.ctx.tx_status_manager.abort(txid); Response::Error("Failed to serialize updated properties".to_string()) }
+                    Err(_) => {
+                        self.ctx.tx_status_manager.abort(txid);
+                        Response::Error("Failed to serialize updated properties".to_string())
+                    }
                 }
             } else {
                 self.ctx.tx_status_manager.abort(txid);
@@ -2367,22 +3237,29 @@ impl StorageExecutor {
 
             // 1. Find the node's label from its PK
             let label = match get_visible_db_value(&pk_key, &self.ctx, Some(tx)).await {
-                Some(DbValue::Bytes(label_bytes)) => String::from_utf8(label_bytes).unwrap_or_default(),
+                Some(DbValue::Bytes(label_bytes)) => {
+                    String::from_utf8(label_bytes).unwrap_or_default()
+                }
                 _ => return Response::Integer(0), // Node not found
             };
-            if label.is_empty() { return Response::Integer(0); }
+            if label.is_empty() {
+                return Response::Integer(0);
+            }
 
             // 2. Get the node's current properties
             let node_key = format!("_node:{}:{}", label, node_id);
-            let current_props_bytes = match get_visible_db_value(&node_key, &self.ctx, Some(tx)).await {
-                Some(DbValue::JsonB(bytes)) => bytes,
-                _ => return Response::Integer(0), // Node data not found or wrong type
-            };
+            let current_props_bytes =
+                match get_visible_db_value(&node_key, &self.ctx, Some(tx)).await {
+                    Some(DbValue::JsonB(bytes)) => bytes,
+                    _ => return Response::Integer(0), // Node data not found or wrong type
+                };
 
             // 3. Deserialize properties and the new value
             let mut props: Value = match serde_json::from_slice(&current_props_bytes) {
                 Ok(p) => p,
-                Err(_) => return Response::Error("Failed to deserialize node properties".to_string()),
+                Err(_) => {
+                    return Response::Error("Failed to deserialize node properties".to_string());
+                }
             };
             let new_value: Value = match serde_json::from_slice(&value_bytes) {
                 Ok(v) => v,
@@ -2405,7 +3282,8 @@ impl StorageExecutor {
                         value: value_bytes, // Log the raw value we received
                     };
                     tx.log_entries.write().await.push(log_entry);
-                    tx.writes.insert(node_key, Some(DbValue::JsonB(new_props_bytes)));
+                    tx.writes
+                        .insert(node_key, Some(DbValue::JsonB(new_props_bytes)));
                     Response::Integer(1)
                 }
                 Err(_) => Response::Error("Failed to serialize updated properties".to_string()),
@@ -2418,33 +3296,63 @@ impl StorageExecutor {
 
             let pk_key = format!("_pk_node:{}", node_id);
             let label = match get_visible_db_value(&pk_key, &self.ctx, None).await {
-                Some(DbValue::Bytes(label_bytes)) => String::from_utf8(label_bytes).unwrap_or_default(),
-                _ => { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+                Some(DbValue::Bytes(label_bytes)) => {
+                    String::from_utf8(label_bytes).unwrap_or_default()
+                }
+                _ => {
+                    self.ctx.tx_status_manager.abort(txid);
+                    return Response::Integer(0);
+                }
             };
-            if label.is_empty() { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+            if label.is_empty() {
+                self.ctx.tx_status_manager.abort(txid);
+                return Response::Integer(0);
+            }
 
             let node_key = format!("_node:{}:{}", label, node_id);
             let version_chain_arc = match self.ctx.db.get(&node_key) {
                 Some(vc) => vc.clone(),
-                None => { self.ctx.tx_status_manager.abort(txid); return Response::Integer(0); }
+                None => {
+                    self.ctx.tx_status_manager.abort(txid);
+                    return Response::Integer(0);
+                }
             };
 
             let mut version_chain = version_chain_arc.write().await;
-            let snapshot = crate::types::Snapshot::new(0, &self.ctx.tx_status_manager, &self.ctx.tx_id_manager);
+            let snapshot = crate::types::Snapshot::new(
+                0,
+                &self.ctx.tx_status_manager,
+                &self.ctx.tx_id_manager,
+            );
 
-            if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager)) {
+            if let Some(latest_version) = version_chain
+                .iter_mut()
+                .rev()
+                .find(|v| snapshot.is_visible(v, &self.ctx.tx_status_manager))
+            {
                 let current_props_bytes = match &latest_version.value {
                     DbValue::JsonB(bytes) => bytes.clone(),
-                    _ => { self.ctx.tx_status_manager.abort(txid); return Response::Error("WRONGTYPE: Node data is not JSONB".to_string()); }
+                    _ => {
+                        self.ctx.tx_status_manager.abort(txid);
+                        return Response::Error("WRONGTYPE: Node data is not JSONB".to_string());
+                    }
                 };
 
                 let mut props: Value = match serde_json::from_slice(&current_props_bytes) {
                     Ok(p) => p,
-                    Err(_) => { self.ctx.tx_status_manager.abort(txid); return Response::Error("Failed to deserialize node properties".to_string()); }
+                    Err(_) => {
+                        self.ctx.tx_status_manager.abort(txid);
+                        return Response::Error(
+                            "Failed to deserialize node properties".to_string(),
+                        );
+                    }
                 };
                 let new_value: Value = match serde_json::from_slice(&value_bytes) {
                     Ok(v) => v,
-                    Err(_) => { self.ctx.tx_status_manager.abort(txid); return Response::Error("Invalid JSON format for value".to_string()); }
+                    Err(_) => {
+                        self.ctx.tx_status_manager.abort(txid);
+                        return Response::Error("Invalid JSON format for value".to_string());
+                    }
                 };
 
                 if let Some(obj) = props.as_object_mut() {
@@ -2456,7 +3364,11 @@ impl StorageExecutor {
 
                 match serde_json::to_vec(&props) {
                     Ok(new_props_bytes) => {
-                        let log_entry = LogEntry::SetNodeProperty { id: node_id, property, value: value_bytes };
+                        let log_entry = LogEntry::SetNodeProperty {
+                            id: node_id,
+                            property,
+                            value: value_bytes,
+                        };
                         if !matches!(log_to_wal(log_entry, &self.ctx).await, Response::Ok) {
                             self.ctx.tx_status_manager.abort(txid);
                             return Response::Error("WAL write error".to_string());
@@ -2472,7 +3384,10 @@ impl StorageExecutor {
                         self.ctx.tx_status_manager.commit(txid);
                         Response::Integer(1)
                     }
-                    Err(_) => { self.ctx.tx_status_manager.abort(txid); Response::Error("Failed to serialize updated properties".to_string()) }
+                    Err(_) => {
+                        self.ctx.tx_status_manager.abort(txid);
+                        Response::Error("Failed to serialize updated properties".to_string())
+                    }
                 }
             } else {
                 self.ctx.tx_status_manager.abort(txid);
@@ -2541,8 +3456,14 @@ impl StorageExecutor {
                     let start_node_id = parts[0];
                     let rel_type = parts[1];
                     let end_node_id = parts[2];
-                    let out_key = format!("_edge:out:{}:{}:{}:{}", start_node_id, rel_type, end_node_id, id);
-                    let in_key = format!("_edge:in:{}:{}:{}:{}", end_node_id, rel_type, start_node_id, id);
+                    let out_key = format!(
+                        "_edge:out:{}:{}:{}:{}",
+                        start_node_id, rel_type, end_node_id, id
+                    );
+                    let in_key = format!(
+                        "_edge:in:{}:{}:{}:{}",
+                        end_node_id, rel_type, start_node_id, id
+                    );
                     tx.log_entries
                         .write()
                         .await
@@ -2564,8 +3485,14 @@ impl StorageExecutor {
                     let start_node_id = parts[0];
                     let rel_type = parts[1];
                     let end_node_id = parts[2];
-                    let out_key = format!("_edge:out:{}:{}:{}:{}", start_node_id, rel_type, end_node_id, id);
-                    let in_key = format!("_edge:in:{}:{}:{}:{}", end_node_id, rel_type, start_node_id, id);
+                    let out_key = format!(
+                        "_edge:out:{}:{}:{}:{}",
+                        start_node_id, rel_type, end_node_id, id
+                    );
+                    let in_key = format!(
+                        "_edge:in:{}:{}:{}:{}",
+                        end_node_id, rel_type, start_node_id, id
+                    );
                     let txid = self.ctx.tx_id_manager.new_txid();
                     self.ctx.tx_status_manager.begin(txid);
                     let log_entry = LogEntry::DropRelationship { id: id.clone() };

@@ -1,5 +1,5 @@
 use crate::cypher_engine::ast::*;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 // Simple tokenizer for Cypher subset
 fn tokenize(sql: &str) -> Vec<String> {
@@ -91,7 +91,9 @@ impl CypherParser {
     }
 
     fn parse_identifier(&mut self) -> Result<String> {
-        let token = self.current().ok_or_else(|| anyhow!("Expected an identifier"))?;
+        let token = self
+            .current()
+            .ok_or_else(|| anyhow!("Expected an identifier"))?;
         if token.chars().all(|c| c.is_alphanumeric() || c == '_') {
             let identifier = token.to_string();
             self.advance();
@@ -115,14 +117,20 @@ impl CypherParser {
             patterns.push(self.parse_pattern()?);
         }
 
-        let where_clause = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("WHERE")) {
+        let where_clause = if self
+            .current()
+            .map_or(false, |t| t.eq_ignore_ascii_case("WHERE"))
+        {
             self.advance();
             Some(self.parse_expression()?)
         } else {
             None
         };
 
-        Ok(MatchQuery { patterns, where_clause })
+        Ok(MatchQuery {
+            patterns,
+            where_clause,
+        })
     }
 
     fn parse_merge_clause(&mut self) -> Result<MergeClause> {
@@ -132,15 +140,24 @@ impl CypherParser {
         let mut on_create = None;
 
         loop {
-            if self.current().map_or(false, |t| t.eq_ignore_ascii_case("ON")) {
+            if self
+                .current()
+                .map_or(false, |t| t.eq_ignore_ascii_case("ON"))
+            {
                 self.advance(); // Consume ON
-                if self.current().map_or(false, |t| t.eq_ignore_ascii_case("MATCH")) {
+                if self
+                    .current()
+                    .map_or(false, |t| t.eq_ignore_ascii_case("MATCH"))
+                {
                     self.advance(); // Consume MATCH
                     if on_match.is_some() {
                         return Err(anyhow!("Cannot specify ON MATCH more than once"));
                     }
                     on_match = Some(self.parse_set_clause()?);
-                } else if self.current().map_or(false, |t| t.eq_ignore_ascii_case("CREATE")) {
+                } else if self
+                    .current()
+                    .map_or(false, |t| t.eq_ignore_ascii_case("CREATE"))
+                {
                     self.advance(); // Consume CREATE
                     if on_create.is_some() {
                         return Err(anyhow!("Cannot specify ON CREATE more than once"));
@@ -154,7 +171,11 @@ impl CypherParser {
             }
         }
 
-        Ok(MergeClause { pattern, on_match, on_create })
+        Ok(MergeClause {
+            pattern,
+            on_match,
+            on_create,
+        })
     }
 
     fn parse_create_clause(&mut self) -> Result<Pattern> {
@@ -169,7 +190,10 @@ impl CypherParser {
             let property = self.parse_property_access_expression()?;
             self.expect("=")?;
             let expression = self.parse_expression()?;
-            items.push(SetItem { property, expression });
+            items.push(SetItem {
+                property,
+                expression,
+            });
             if self.current() == Some(",") {
                 self.advance();
             } else {
@@ -180,7 +204,10 @@ impl CypherParser {
     }
 
     fn parse_delete_clause(&mut self) -> Result<DeleteClause> {
-        let detach = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("DETACH")) {
+        let detach = if self
+            .current()
+            .map_or(false, |t| t.eq_ignore_ascii_case("DETACH"))
+        {
             self.advance();
             true
         } else {
@@ -197,7 +224,10 @@ impl CypherParser {
                 break;
             }
         }
-        Ok(DeleteClause { expressions, detach })
+        Ok(DeleteClause {
+            expressions,
+            detach,
+        })
     }
 
     fn parse_remove_clause(&mut self) -> Result<RemoveClause> {
@@ -255,7 +285,10 @@ impl CypherParser {
 
     fn parse_node_pattern(&mut self) -> Result<PatternPart> {
         self.expect("(")?;
-        let variable = if self.current() != Some(":") && self.current() != Some(")") && self.current() != Some("{") {
+        let variable = if self.current() != Some(":")
+            && self.current() != Some(")")
+            && self.current() != Some("{")
+        {
             Some(self.parse_identifier()?)
         } else {
             None
@@ -271,7 +304,11 @@ impl CypherParser {
             None
         };
         self.expect(")")?;
-        Ok(PatternPart::Node(NodePattern { variable, labels, properties }))
+        Ok(PatternPart::Node(NodePattern {
+            variable,
+            labels,
+            properties,
+        }))
     }
 
     fn parse_relationship_pattern(&mut self) -> Result<PatternPart> {
@@ -285,7 +322,11 @@ impl CypherParser {
         self.expect("-")?;
 
         self.expect("[")?;
-        let variable = if self.current() != Some(":") && self.current() != Some("]") && self.current() != Some("{") && self.current() != Some("*") {
+        let variable = if self.current() != Some(":")
+            && self.current() != Some("]")
+            && self.current() != Some("{")
+            && self.current() != Some("*")
+        {
             Some(self.parse_identifier()?)
         } else {
             None
@@ -303,15 +344,24 @@ impl CypherParser {
                 let mut min = None;
                 let mut max = None;
                 // Cases: * | *.. | *N | *N.. | *..M | *M..N
-                if self.current().map_or(false, |t| t.chars().all(char::is_numeric) || t == ".") {
-                    if self.current().map_or(false, |t| t.chars().all(char::is_numeric)) {
+                if self
+                    .current()
+                    .map_or(false, |t| t.chars().all(char::is_numeric) || t == ".")
+                {
+                    if self
+                        .current()
+                        .map_or(false, |t| t.chars().all(char::is_numeric))
+                    {
                         let num = self.current().unwrap().parse::<u32>()?;
                         self.advance();
                         min = Some(num);
                         if self.current() == Some(".") {
                             self.advance();
                             self.expect(".")?;
-                            if self.current().map_or(false, |t| t.chars().all(char::is_numeric)) {
+                            if self
+                                .current()
+                                .map_or(false, |t| t.chars().all(char::is_numeric))
+                            {
                                 max = Some(self.current().unwrap().parse::<u32>()?);
                                 self.advance();
                             }
@@ -321,7 +371,11 @@ impl CypherParser {
                     } else if self.current() == Some(".") {
                         self.advance();
                         self.expect(".")?;
-                        max = Some(self.current().ok_or_else(|| anyhow!("Expected a number after *.."))?.parse::<u32>()?);
+                        max = Some(
+                            self.current()
+                                .ok_or_else(|| anyhow!("Expected a number after *.."))?
+                                .parse::<u32>()?,
+                        );
                         self.advance();
                     }
                 }
@@ -353,7 +407,13 @@ impl CypherParser {
             (true, true) => return Err(anyhow!("Invalid relationship pattern: <-->")),
         };
 
-        Ok(PatternPart::Relationship(RelationshipPattern { direction, variable, types, properties, range }))
+        Ok(PatternPart::Relationship(RelationshipPattern {
+            direction,
+            variable,
+            types,
+            properties,
+            range,
+        }))
     }
 
     fn parse_return_clause(&mut self) -> Result<ReturnClause> {
@@ -387,11 +447,17 @@ impl CypherParser {
 
     fn parse_order_by_item(&mut self) -> Result<OrderByItem> {
         let expression = self.parse_expression()?;
-        let asc = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("DESC")) {
+        let asc = if self
+            .current()
+            .map_or(false, |t| t.eq_ignore_ascii_case("DESC"))
+        {
             self.advance();
             false
         } else {
-            if self.current().map_or(false, |t| t.eq_ignore_ascii_case("ASC")) {
+            if self
+                .current()
+                .map_or(false, |t| t.eq_ignore_ascii_case("ASC"))
+            {
                 self.advance();
             }
             true
@@ -401,7 +467,10 @@ impl CypherParser {
 
     fn parse_return_item(&mut self) -> Result<ReturnItem> {
         let expression = self.parse_expression()?;
-        let alias = if self.current().map_or(false, |t| t.eq_ignore_ascii_case("AS")) {
+        let alias = if self
+            .current()
+            .map_or(false, |t| t.eq_ignore_ascii_case("AS"))
+        {
             self.advance();
             Some(self.parse_identifier()?)
         } else {
@@ -439,8 +508,12 @@ impl CypherParser {
     }
 
     fn parse_primary_expression(&mut self) -> Result<Expression> {
-        let token = self.current().ok_or_else(|| anyhow!("Unexpected end of expression"))?;
-        if (token.starts_with('\'') && token.ends_with('\'')) || (token.starts_with('"') && token.ends_with('"')) {
+        let token = self
+            .current()
+            .ok_or_else(|| anyhow!("Unexpected end of expression"))?;
+        if (token.starts_with('\'') && token.ends_with('\''))
+            || (token.starts_with('"') && token.ends_with('"'))
+        {
             let value = token[1..token.len() - 1].to_string();
             self.advance();
             return Ok(Expression::Literal(LiteralValue::String(value)));
@@ -494,22 +567,36 @@ impl CypherParser {
         Ok(args)
     }
 
-
-
     pub fn parse(&mut self) -> Result<CypherQuery> {
         let mut query = CypherQuery::default();
         loop {
             let token = self.current().map(|s| s.to_uppercase());
             match token.as_deref() {
-                Some("OPTIONAL") => query.clauses.push(Clause::OptionalMatch(self.parse_optional_match_clause()?)),
-                Some("MATCH") => query.clauses.push(Clause::Match(self.parse_match_clause()?)),
-                Some("CREATE") => query.clauses.push(Clause::Create(self.parse_create_clause()?)),
-                Some("MERGE") => query.clauses.push(Clause::Merge(self.parse_merge_clause()?)),
-                Some("REMOVE") => query.clauses.push(Clause::Remove(self.parse_remove_clause()?)),
+                Some("OPTIONAL") => query
+                    .clauses
+                    .push(Clause::OptionalMatch(self.parse_optional_match_clause()?)),
+                Some("MATCH") => query
+                    .clauses
+                    .push(Clause::Match(self.parse_match_clause()?)),
+                Some("CREATE") => query
+                    .clauses
+                    .push(Clause::Create(self.parse_create_clause()?)),
+                Some("MERGE") => query
+                    .clauses
+                    .push(Clause::Merge(self.parse_merge_clause()?)),
+                Some("REMOVE") => query
+                    .clauses
+                    .push(Clause::Remove(self.parse_remove_clause()?)),
                 Some("SET") => query.clauses.push(Clause::Set(self.parse_set_clause()?)),
-                Some("DELETE") | Some("DETACH") => query.clauses.push(Clause::Delete(self.parse_delete_clause()?)),
-                Some("RETURN") => query.clauses.push(Clause::Return(self.parse_return_clause()?)),
-                Some("ORDER") => query.clauses.push(Clause::OrderBy(self.parse_order_by_clause()?)),
+                Some("DELETE") | Some("DETACH") => query
+                    .clauses
+                    .push(Clause::Delete(self.parse_delete_clause()?)),
+                Some("RETURN") => query
+                    .clauses
+                    .push(Clause::Return(self.parse_return_clause()?)),
+                Some("ORDER") => query
+                    .clauses
+                    .push(Clause::OrderBy(self.parse_order_by_clause()?)),
                 Some(other) => return Err(anyhow!("Unsupported clause: {}", other)),
                 None => break,
             }

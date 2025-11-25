@@ -1,5 +1,6 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, NaiveDate, NaiveTime};
+use hex;
 use regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -8,7 +9,6 @@ use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
 use uuid::Uuid;
-use hex;
 
 use super::ast::*;
 use crate::schema::{DataType, VirtualSchema};
@@ -44,7 +44,7 @@ pub(crate) fn cast_value_to_type(value: Value, target_type: &DataType) -> Result
                 } else {
                     Err(anyhow!("Invalid numeric value for SMALLINT"))
                 }
-            },
+            }
             Value::String(s) => Ok(serde_json::json!(s.parse::<i16>()?)),
             Value::Bool(b) => Ok(serde_json::json!(if b { 1 } else { 0 })),
             _ => Err(anyhow!("Cannot cast {:?} to SMALLINT", value)),
@@ -120,7 +120,12 @@ pub(crate) fn cast_value_to_type(value: Value, target_type: &DataType) -> Result
         DataType::Varchar(n) => match value {
             Value::String(s) => {
                 if s.len() > *n as usize {
-                    Err(anyhow!("Value too long for type VARCHAR({}): len={} > max={}", n, s.len(), n))
+                    Err(anyhow!(
+                        "Value too long for type VARCHAR({}): len={} > max={}",
+                        n,
+                        s.len(),
+                        n
+                    ))
                 } else {
                     Ok(Value::String(s))
                 }
@@ -128,7 +133,12 @@ pub(crate) fn cast_value_to_type(value: Value, target_type: &DataType) -> Result
             other => {
                 let s = other.to_string();
                 if s.len() > *n as usize {
-                    Err(anyhow!("Value too long for type VARCHAR({}): len={} > max={}", n, s.len(), n))
+                    Err(anyhow!(
+                        "Value too long for type VARCHAR({}): len={} > max={}",
+                        n,
+                        s.len(),
+                        n
+                    ))
                 } else {
                     Ok(Value::String(s))
                 }
@@ -181,7 +191,10 @@ pub(crate) fn cast_value_to_type(value: Value, target_type: &DataType) -> Result
                     Err(anyhow!("Invalid TIMESTAMP format for string: {}", s))
                 }
             }
-            _ => Err(anyhow!("Cannot cast {:?} to TIMESTAMP, expected string", value)),
+            _ => Err(anyhow!(
+                "Cannot cast {:?} to TIMESTAMP, expected string",
+                value
+            )),
         },
         DataType::TimestampTz => match value {
             Value::String(s) => {
@@ -191,14 +204,20 @@ pub(crate) fn cast_value_to_type(value: Value, target_type: &DataType) -> Result
                     Err(anyhow!("Invalid TIMESTAMPTZ format for string: {}", s))
                 }
             }
-            _ => Err(anyhow!("Cannot cast {:?} to TIMESTAMPTZ, expected string", value)),
+            _ => Err(anyhow!(
+                "Cannot cast {:?} to TIMESTAMPTZ, expected string",
+                value
+            )),
         },
         DataType::Date => match value {
             Value::String(s) => {
                 if NaiveDate::parse_from_str(&s, "%Y-%m-%d").is_ok() {
                     Ok(Value::String(s))
                 } else {
-                    Err(anyhow!("Invalid DATE format for string: {}. Expected YYYY-MM-DD.", s))
+                    Err(anyhow!(
+                        "Invalid DATE format for string: {}. Expected YYYY-MM-DD.",
+                        s
+                    ))
                 }
             }
             _ => Err(anyhow!("Cannot cast {:?} to DATE, expected string", value)),
@@ -210,7 +229,10 @@ pub(crate) fn cast_value_to_type(value: Value, target_type: &DataType) -> Result
                 } else if NaiveTime::parse_from_str(&s, "%H:%M:%S%.f").is_ok() {
                     Ok(Value::String(s))
                 } else {
-                    Err(anyhow!("Invalid TIME format for string: {}. Expected HH:MM:SS[.FFF].", s))
+                    Err(anyhow!(
+                        "Invalid TIME format for string: {}. Expected HH:MM:SS[.FFF].",
+                        s
+                    ))
                 }
             }
             _ => Err(anyhow!("Cannot cast {:?} to TIME, expected string", value)),
@@ -223,7 +245,10 @@ pub(crate) fn cast_value_to_type(value: Value, target_type: &DataType) -> Result
                     Err(_) => Err(anyhow!("Invalid hex string for BYTEA")),
                 }
             }
-            _ => Err(anyhow!("Cannot cast {:?} to BYTEA, expected hex string", value)),
+            _ => Err(anyhow!(
+                "Cannot cast {:?} to BYTEA, expected hex string",
+                value
+            )),
         },
         DataType::Uuid => match value {
             Value::String(s) => match Uuid::parse_str(&s) {
@@ -266,7 +291,6 @@ pub(crate) fn cast_value_to_type(value: Value, target_type: &DataType) -> Result
         },
     }
 }
-
 
 use super::execution::execute;
 use futures::stream::TryStreamExt;
@@ -328,7 +352,12 @@ impl Expression {
                 }
                 Expression::BinaryOp { left, op, right } => {
                     let left_val = left
-                        .evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone())
+                        .evaluate_with_context(
+                            row,
+                            outer_row,
+                            ctx.clone(),
+                            transaction_handle.clone(),
+                        )
                         .await?;
 
                     if *op == Operator::In {
@@ -337,7 +366,10 @@ impl Expression {
                                 subquery_plan.as_ref().clone(),
                                 &ctx.index_manager,
                             )?;
-                            let results: Vec<Value> = execute(physical_plan, ctx, Some(row), None, transaction_handle).try_collect().await?;
+                            let results: Vec<Value> =
+                                execute(physical_plan, ctx, Some(row), None, transaction_handle)
+                                    .try_collect()
+                                    .await?;
 
                             let subquery_values: Result<Vec<Value>> = results.iter().map(|result_row| {
                                 let obj = result_row
@@ -349,12 +381,20 @@ impl Expression {
                                     Ok(obj.values().next().unwrap().clone())
                                 }
                             }).collect();
-                            
+
                             return Ok(Value::Bool(subquery_values?.contains(&left_val)));
                         } else if let Expression::List(list) = &**right {
                             let mut values = Vec::new();
                             for expr in list {
-                                values.push(expr.evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone()).await?);
+                                values.push(
+                                    expr.evaluate_with_context(
+                                        row,
+                                        outer_row,
+                                        ctx.clone(),
+                                        transaction_handle.clone(),
+                                    )
+                                    .await?,
+                                );
                             }
                             return Ok(Value::Bool(values.contains(&left_val)));
                         }
@@ -364,7 +404,10 @@ impl Expression {
                         .evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle)
                         .await?;
 
-                    if matches!(*op, Operator::Plus | Operator::Minus | Operator::Multiply | Operator::Divide) {
+                    if matches!(
+                        *op,
+                        Operator::Plus | Operator::Minus | Operator::Multiply | Operator::Divide
+                    ) {
                         let l_num = left_val.as_f64();
                         let r_num = right_val.as_f64();
 
@@ -435,11 +478,35 @@ impl Expression {
                             .unwrap_or(false),
                         (Value::String(l), Value::String(r)) => match op_clone {
                             Operator::Eq => {
-                                if l == r { true } else if let (Ok(l_f64), Ok(r_f64)) = (l.parse::<f64>(), r.parse::<f64>()) { compare_as_f64(l_f64, r_f64) } else { false } }
+                                if l == r {
+                                    true
+                                } else if let (Ok(l_f64), Ok(r_f64)) =
+                                    (l.parse::<f64>(), r.parse::<f64>())
+                                {
+                                    compare_as_f64(l_f64, r_f64)
+                                } else {
+                                    false
+                                }
+                            }
                             Operator::NotEq => {
-                                if l != r { true } else if let (Ok(l_f64), Ok(r_f64)) = (l.parse::<f64>(), r.parse::<f64>()) { !compare_as_f64(l_f64, r_f64) } else { true } }
+                                if l != r {
+                                    true
+                                } else if let (Ok(l_f64), Ok(r_f64)) =
+                                    (l.parse::<f64>(), r.parse::<f64>())
+                                {
+                                    !compare_as_f64(l_f64, r_f64)
+                                } else {
+                                    true
+                                }
+                            }
                             _ => {
-                                if let (Ok(l_f64), Ok(r_f64)) = (l.parse::<f64>(), r.parse::<f64>()) { compare_as_f64(l_f64, r_f64) } else { false } }
+                                if let (Ok(l_f64), Ok(r_f64)) = (l.parse::<f64>(), r.parse::<f64>())
+                                {
+                                    compare_as_f64(l_f64, r_f64)
+                                } else {
+                                    false
+                                }
+                            }
                         },
                         (l, r) => match op_clone {
                             Operator::Eq => l == r,
@@ -451,12 +518,19 @@ impl Expression {
                 }
                 Expression::LogicalOp { left, op, right } => {
                     let left_val = left
-                        .evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone())
+                        .evaluate_with_context(
+                            row,
+                            outer_row,
+                            ctx.clone(),
+                            transaction_handle.clone(),
+                        )
                         .await?;
                     match op {
                         LogicalOperator::And => {
                             if left_val.as_bool().unwrap_or(false) {
-                                right.evaluate_with_context(row, outer_row, ctx, transaction_handle).await
+                                right
+                                    .evaluate_with_context(row, outer_row, ctx, transaction_handle)
+                                    .await
                             } else {
                                 Ok(Value::Bool(false))
                             }
@@ -465,7 +539,9 @@ impl Expression {
                             if left_val.as_bool().unwrap_or(false) {
                                 Ok(Value::Bool(true))
                             } else {
-                                right.evaluate_with_context(row, outer_row, ctx, transaction_handle).await
+                                right
+                                    .evaluate_with_context(row, outer_row, ctx, transaction_handle)
+                                    .await
                             }
                         }
                     }
@@ -475,7 +551,10 @@ impl Expression {
                     if let Some(val) = row.get(&key) {
                         return Ok(val.clone());
                     }
-                    Err(anyhow!("Aggregate function {} used in a context where it was not computed (e.g., HAVING without GROUP BY)", key))
+                    Err(anyhow!(
+                        "Aggregate function {} used in a context where it was not computed (e.g., HAVING without GROUP BY)",
+                        key
+                    ))
                 }
                 Expression::FunctionCall { func, args } => {
                     let function = ctx
@@ -486,16 +565,29 @@ impl Expression {
                     let mut evaluated_args = Vec::new();
                     for arg in args {
                         if let Expression::Subquery(subquery_plan) = arg {
-                             let physical_plan = super::physical_plan::logical_to_physical_plan(
+                            let physical_plan = super::physical_plan::logical_to_physical_plan(
                                 subquery_plan.as_ref().clone(),
                                 &ctx.index_manager,
                             )?;
-                            let results: Vec<Value> = execute(physical_plan, ctx.clone(), Some(row), None, transaction_handle.clone()).try_collect().await?;
+                            let results: Vec<Value> = execute(
+                                physical_plan,
+                                ctx.clone(),
+                                Some(row),
+                                None,
+                                transaction_handle.clone(),
+                            )
+                            .try_collect()
+                            .await?;
                             evaluated_args.push(Value::Array(results));
                         } else {
                             evaluated_args.push(
-                                arg.evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone())
-                                    .await?,
+                                arg.evaluate_with_context(
+                                    row,
+                                    outer_row,
+                                    ctx.clone(),
+                                    transaction_handle.clone(),
+                                )
+                                .await?,
                             );
                         }
                     }
@@ -508,8 +600,13 @@ impl Expression {
                 } => {
                     for (when_expr, then_expr) in when_then_pairs {
                         if when_expr
-                            .evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone())
-                            .await? 
+                            .evaluate_with_context(
+                                row,
+                                outer_row,
+                                ctx.clone(),
+                                transaction_handle.clone(),
+                            )
+                            .await?
                             .as_bool()
                             .unwrap_or(false)
                         {
@@ -526,7 +623,9 @@ impl Expression {
                     Ok(Value::Null)
                 }
                 Expression::Cast { expr, data_type } => {
-                    let value = expr.evaluate_with_context(row, outer_row, ctx, transaction_handle).await?;
+                    let value = expr
+                        .evaluate_with_context(row, outer_row, ctx, transaction_handle)
+                        .await?;
                     cast_value_to_type(value, data_type)
                 }
                 Expression::Subquery(subquery_plan) => {
@@ -535,10 +634,15 @@ impl Expression {
                         &ctx.index_manager,
                     )?;
 
-                    let results: Vec<Value> = execute(physical_plan, ctx, Some(row), None, transaction_handle).try_collect().await?;
+                    let results: Vec<Value> =
+                        execute(physical_plan, ctx, Some(row), None, transaction_handle)
+                            .try_collect()
+                            .await?;
 
                     if results.len() > 1 {
-                        return Err(anyhow!("Subquery for '=' operator must return exactly one row"));
+                        return Err(anyhow!(
+                            "Subquery for '=' operator must return exactly one row"
+                        ));
                     }
                     if results.is_empty() {
                         return Ok(Value::Null);
@@ -558,7 +662,15 @@ impl Expression {
                 Expression::List(list) => {
                     let mut evaluated_list = Vec::new();
                     for expr in list {
-                        evaluated_list.push(expr.evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone()).await?);
+                        evaluated_list.push(
+                            expr.evaluate_with_context(
+                                row,
+                                outer_row,
+                                ctx.clone(),
+                                transaction_handle.clone(),
+                            )
+                            .await?,
+                        );
                     }
                     Ok(Value::Array(evaluated_list))
                 }
@@ -577,7 +689,7 @@ fn like_to_regex(pattern: &str) -> String {
             '_' => regex.push('.'),
             '\\' => {
                 if let Some(escaped_char) = chars.next() {
-                    if ".+*?()|[]{}|^$\\".contains(escaped_char) {  
+                    if ".+*?()|[]{}|^$\\".contains(escaped_char) {
                         regex.push('\\');
                     } else if escaped_char == '\\' {
                         regex.push('\\');
@@ -603,12 +715,32 @@ fn like_to_regex(pattern: &str) -> String {
 pub enum Expression {
     Column(String),
     Literal(Value),
-    BinaryOp { left: Box<Expression>, op: Operator, right: Box<Expression> },
-    LogicalOp { left: Box<Expression>, op: LogicalOperator, right: Box<Expression> },
-    AggregateFunction { func: String, arg: Box<Expression> },
-    FunctionCall { func: String, args: Vec<Expression> },
-    Case { when_then_pairs: Vec<(Box<Expression>, Box<Expression>)>, else_expression: Option<Box<Expression>> },
-    Cast { expr: Box<Expression>, data_type: DataType },
+    BinaryOp {
+        left: Box<Expression>,
+        op: Operator,
+        right: Box<Expression>,
+    },
+    LogicalOp {
+        left: Box<Expression>,
+        op: LogicalOperator,
+        right: Box<Expression>,
+    },
+    AggregateFunction {
+        func: String,
+        arg: Box<Expression>,
+    },
+    FunctionCall {
+        func: String,
+        args: Vec<Expression>,
+    },
+    Case {
+        when_then_pairs: Vec<(Box<Expression>, Box<Expression>)>,
+        else_expression: Option<Box<Expression>>,
+    },
+    Cast {
+        expr: Box<Expression>,
+        data_type: DataType,
+    },
     Subquery(Box<LogicalPlan>),
     List(Vec<Expression>),
 }
@@ -629,10 +761,17 @@ impl fmt::Display for Expression {
                 write!(f, "{}({})", func, arg)
             }
             Expression::FunctionCall { func, args } => {
-                let args_str = args.iter().map(|arg| format!("{}", arg)).collect::<Vec<String>>().join(", ");
+                let args_str = args
+                    .iter()
+                    .map(|arg| format!("{}", arg))
+                    .collect::<Vec<String>>()
+                    .join(", ");
                 write!(f, "{}({})", func, args_str)
             }
-            Expression::Case { when_then_pairs, else_expression, } => {
+            Expression::Case {
+                when_then_pairs,
+                else_expression,
+            } => {
                 write!(f, "CASE")?;
                 for (when, then) in when_then_pairs {
                     write!(f, " WHEN {} THEN {}", when, then)?;
@@ -645,7 +784,11 @@ impl fmt::Display for Expression {
             Expression::Cast { expr, data_type } => write!(f, "CAST({} AS {})", expr, data_type),
             Expression::Subquery(_) => write!(f, "(SELECT ...subquery...)"),
             Expression::List(list) => {
-                let items = list.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(", ");
+                let items = list
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 write!(f, "({})", items)
             }
         }
@@ -653,7 +796,10 @@ impl fmt::Display for Expression {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LogicalOperator { And, Or, }
+pub enum LogicalOperator {
+    And,
+    Or,
+}
 
 impl fmt::Display for LogicalOperator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -665,7 +811,21 @@ impl fmt::Display for LogicalOperator {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Operator { Eq, NotEq, Lt, LtEq, Gt, GtEq, Like, ILike, In, Plus, Minus, Multiply, Divide, }
+pub enum Operator {
+    Eq,
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+    Like,
+    ILike,
+    In,
+    Plus,
+    Minus,
+    Multiply,
+    Divide,
+}
 
 impl fmt::Display for Operator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -689,13 +849,18 @@ impl fmt::Display for Operator {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LogicalPlan {
-    TableScan { table_name: String },
+    TableScan {
+        table_name: String,
+    },
     GraphMatch {
         query: String,
         returns: Vec<(String, String)>,
         alias: String,
     },
-    SubqueryScan { alias: String, input: Box<LogicalPlan> },
+    SubqueryScan {
+        alias: String,
+        input: Box<LogicalPlan>,
+    },
     RecursiveCteScan {
         alias: String,
         column_aliases: Vec<String>,
@@ -707,34 +872,110 @@ pub enum LogicalPlan {
         cte_name: String,
         alias: String,
     },
-    Join { left: Box<LogicalPlan>, right: Box<LogicalPlan>, condition: Expression, join_type: JoinType },
-    Filter { input: Box<LogicalPlan>, predicate: Expression },
-    Projection { input: Box<LogicalPlan>, expressions: Vec<(Expression, Option<String>)> },
-    Aggregate { input: Box<LogicalPlan>, group_expressions: Vec<Expression>, agg_expressions: Vec<Expression> },
-    Sort { input: Box<LogicalPlan>, sort_expressions: Vec<(Expression, bool)> },
-    Limit { input: Box<LogicalPlan>, limit: Option<usize>, offset: Option<usize> },
-    DistinctOn { input: Box<LogicalPlan>, expressions: Vec<Expression> },
-    CreateTable { table_name: String, columns: Vec<ColumnDef>, if_not_exists: bool, constraints: Vec<TableConstraint> },
-    CreateSchema { schema_name: String },
-    CreateView { view_name: String, query: SelectStatement },
-    Insert { table_name: String, columns: Vec<String>, source: Box<LogicalPlan>, on_conflict: Option<(Vec<String>, OnConflictAction)>, returning: Vec<(Expression, Option<String>)> },
-    Delete { table_name: String, from: Box<LogicalPlan>, returning: Vec<(Expression, Option<String>)> },
-    Update { table_name: String, from: Box<LogicalPlan>, set: Vec<(String, Expression)>, returning: Vec<(Expression, Option<String>)> },
-    DropTable { table_name: String },
-    DropView { view_name: String },
-    AlterTable { table_name: String, action: AlterTableAction },
-    UnionAll { left: Box<LogicalPlan>, right: Box<LogicalPlan> },
-    Intersect { left: Box<LogicalPlan>, right: Box<LogicalPlan> },
-    Except { left: Box<LogicalPlan>, right: Box<LogicalPlan> },
-    CreateIndex { statement: CreateIndexStatement },
-    Values { values: Vec<Vec<Expression>> },
+    Join {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+        condition: Expression,
+        join_type: JoinType,
+    },
+    Filter {
+        input: Box<LogicalPlan>,
+        predicate: Expression,
+    },
+    Projection {
+        input: Box<LogicalPlan>,
+        expressions: Vec<(Expression, Option<String>)>,
+    },
+    Aggregate {
+        input: Box<LogicalPlan>,
+        group_expressions: Vec<Expression>,
+        agg_expressions: Vec<Expression>,
+    },
+    Sort {
+        input: Box<LogicalPlan>,
+        sort_expressions: Vec<(Expression, bool)>,
+    },
+    Limit {
+        input: Box<LogicalPlan>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    },
+    DistinctOn {
+        input: Box<LogicalPlan>,
+        expressions: Vec<Expression>,
+    },
+    CreateTable {
+        table_name: String,
+        columns: Vec<ColumnDef>,
+        if_not_exists: bool,
+        constraints: Vec<TableConstraint>,
+    },
+    CreateSchema {
+        schema_name: String,
+    },
+    CreateView {
+        view_name: String,
+        query: SelectStatement,
+    },
+    Insert {
+        table_name: String,
+        columns: Vec<String>,
+        source: Box<LogicalPlan>,
+        on_conflict: Option<(Vec<String>, OnConflictAction)>,
+        returning: Vec<(Expression, Option<String>)>,
+    },
+    Delete {
+        table_name: String,
+        from: Box<LogicalPlan>,
+        returning: Vec<(Expression, Option<String>)>,
+    },
+    Update {
+        table_name: String,
+        from: Box<LogicalPlan>,
+        set: Vec<(String, Expression)>,
+        returning: Vec<(Expression, Option<String>)>,
+    },
+    DropTable {
+        table_name: String,
+    },
+    DropView {
+        view_name: String,
+    },
+    AlterTable {
+        table_name: String,
+        action: AlterTableAction,
+    },
+    UnionAll {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+    },
+    Intersect {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+    },
+    Except {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+    },
+    CreateIndex {
+        statement: CreateIndexStatement,
+    },
+    Values {
+        values: Vec<Vec<Expression>>,
+    },
     BeginTransaction,
     CommitTransaction,
     RollbackTransaction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum JoinType { Inner, Left, Right, FullOuter, Cross, }
+pub enum JoinType {
+    Inner,
+    Left,
+    Right,
+    FullOuter,
+    Cross,
+}
 
 pub(crate) fn simple_expr_to_expression(
     expr: SimpleExpression,
@@ -748,9 +989,8 @@ pub(crate) fn simple_expr_to_expression(
         SimpleExpression::Literal(val) => {
             let json_val = match val {
                 SimpleValue::String(s) => Value::String(s),
-                SimpleValue::Number(n) => {
-                    serde_json::from_str(&n).map_err(|e| anyhow!("Invalid number literal: {}", e))? 
-                }
+                SimpleValue::Number(n) => serde_json::from_str(&n)
+                    .map_err(|e| anyhow!("Invalid number literal: {}", e))?,
                 SimpleValue::Boolean(b) => Value::Bool(b),
                 SimpleValue::Null => Value::Null,
             };
@@ -775,11 +1015,19 @@ pub(crate) fn simple_expr_to_expression(
             };
             Ok(Expression::BinaryOp {
                 left: Box::new(simple_expr_to_expression(
-                    *left, schema_cache, view_cache, function_registry, active_recursive_alias
+                    *left,
+                    schema_cache,
+                    view_cache,
+                    function_registry,
+                    active_recursive_alias,
                 )?),
                 op,
                 right: Box::new(simple_expr_to_expression(
-                    *right, schema_cache, view_cache, function_registry, active_recursive_alias
+                    *right,
+                    schema_cache,
+                    view_cache,
+                    function_registry,
+                    active_recursive_alias,
                 )?),
             })
         }
@@ -791,11 +1039,19 @@ pub(crate) fn simple_expr_to_expression(
             };
             Ok(Expression::LogicalOp {
                 left: Box::new(simple_expr_to_expression(
-                    *left, schema_cache, view_cache, function_registry, active_recursive_alias
+                    *left,
+                    schema_cache,
+                    view_cache,
+                    function_registry,
+                    active_recursive_alias,
                 )?),
                 op,
                 right: Box::new(simple_expr_to_expression(
-                    *right, schema_cache, view_cache, function_registry, active_recursive_alias
+                    *right,
+                    schema_cache,
+                    view_cache,
+                    function_registry,
+                    active_recursive_alias,
                 )?),
             })
         }
@@ -813,7 +1069,15 @@ pub(crate) fn simple_expr_to_expression(
         SimpleExpression::FunctionCall { func, args } => {
             let args_expr = args
                 .into_iter()
-                .map(|e| simple_expr_to_expression(e, schema_cache, view_cache, function_registry, active_recursive_alias))
+                .map(|e| {
+                    simple_expr_to_expression(
+                        e,
+                        schema_cache,
+                        view_cache,
+                        function_registry,
+                        active_recursive_alias,
+                    )
+                })
                 .collect::<Result<_>>()?;
             Ok(Expression::FunctionCall {
                 func,
@@ -827,10 +1091,18 @@ pub(crate) fn simple_expr_to_expression(
                 .map(|(w, t)| {
                     Ok((
                         Box::new(simple_expr_to_expression(
-                            w, schema_cache, view_cache, function_registry, active_recursive_alias
+                            w,
+                            schema_cache,
+                            view_cache,
+                            function_registry,
+                            active_recursive_alias,
                         )?),
                         Box::new(simple_expr_to_expression(
-                            t, schema_cache, view_cache, function_registry, active_recursive_alias
+                            t,
+                            schema_cache,
+                            view_cache,
+                            function_registry,
+                            active_recursive_alias,
                         )?),
                     ))
                 })
@@ -838,7 +1110,11 @@ pub(crate) fn simple_expr_to_expression(
 
             let else_expression = if let Some(else_expr) = case_expr.else_expression {
                 Some(Box::new(simple_expr_to_expression(
-                    *else_expr, schema_cache, view_cache, function_registry, active_recursive_alias
+                    *else_expr,
+                    schema_cache,
+                    view_cache,
+                    function_registry,
+                    active_recursive_alias,
                 )?))
             } else {
                 None
@@ -853,20 +1129,37 @@ pub(crate) fn simple_expr_to_expression(
             let dt = DataType::from_str(&data_type)?;
             Ok(Expression::Cast {
                 expr: Box::new(simple_expr_to_expression(
-                    *expr, schema_cache, view_cache, function_registry, active_recursive_alias
+                    *expr,
+                    schema_cache,
+                    view_cache,
+                    function_registry,
+                    active_recursive_alias,
                 )?),
                 data_type: dt,
             })
         }
         SimpleExpression::Subquery(select_statement) => {
-            let logical_plan =
-                ast_to_logical_plan_inner(AstStatement::Select(*select_statement), schema_cache, view_cache, function_registry, active_recursive_alias)?;
+            let logical_plan = ast_to_logical_plan_inner(
+                AstStatement::Select(*select_statement),
+                schema_cache,
+                view_cache,
+                function_registry,
+                active_recursive_alias,
+            )?;
             Ok(Expression::Subquery(Box::new(logical_plan)))
         }
         SimpleExpression::List(list) => {
             let expressions = list
                 .into_iter()
-                .map(|e| simple_expr_to_expression(e, schema_cache, view_cache, function_registry, active_recursive_alias))
+                .map(|e| {
+                    simple_expr_to_expression(
+                        e,
+                        schema_cache,
+                        view_cache,
+                        function_registry,
+                        active_recursive_alias,
+                    )
+                })
                 .collect::<Result<_>>()?;
             Ok(Expression::List(expressions))
         }
@@ -901,13 +1194,20 @@ fn validate_expression(
             if name.contains('.') {
                 let parts: Vec<&str> = name.split('.').collect();
                 if parts.len() != 2 {
-                    return Err(anyhow!("Invalid column format: {}. Expected table.column", name));
+                    return Err(anyhow!(
+                        "Invalid column format: {}. Expected table.column",
+                        name
+                    ));
                 }
                 let table_name = parts[0];
                 let column_name = parts[1];
                 if let Some(schema) = schemas.get(table_name) {
                     if !schema.columns.contains_key(column_name) {
-                        return Err(anyhow!("Column '{}' does not exist in table '{}'", column_name, table_name));
+                        return Err(anyhow!(
+                            "Column '{}' does not exist in table '{}'",
+                            column_name,
+                            table_name
+                        ));
                     }
                 }
             // If table not in schema map, we allow it (schemaless table)
@@ -921,11 +1221,19 @@ fn validate_expression(
                 }
 
                 if found_in.is_empty() {
-                    return Err(anyhow!("Column '{}' not found in any of the tables with schemas: {:?}", name, schemas.keys().collect::<Vec<_>>()));
+                    return Err(anyhow!(
+                        "Column '{}' not found in any of the tables with schemas: {:?}",
+                        name,
+                        schemas.keys().collect::<Vec<_>>()
+                    ));
                 }
 
                 if found_in.len() > 1 {
-                    return Err(anyhow!("Column '{}' is ambiguous and exists in tables: {:?}", name, found_in));
+                    return Err(anyhow!(
+                        "Column '{}' is ambiguous and exists in tables: {:?}",
+                        name,
+                        found_in
+                    ));
                 }
             }
             Ok(())
@@ -940,7 +1248,12 @@ fn validate_expression(
         }
         SimpleExpression::AggregateFunction { arg, .. } => {
             if arg != "*" {
-                validate_expression(&SimpleExpression::Column(arg.clone()), schemas, view_cache, function_registry)?;
+                validate_expression(
+                    &SimpleExpression::Column(arg.clone()),
+                    schemas,
+                    view_cache,
+                    function_registry,
+                )?;
             }
             Ok(())
         }
@@ -972,13 +1285,19 @@ fn validate_expression(
             let mut sub_schemas = HashMap::new();
             if let TableReference::Table { name, alias } = &select_statement.from {
                 if let Some(schema) = schemas.get(name) {
-                    sub_schemas.insert(alias.clone().unwrap_or_else(|| name.clone()), schema.clone());
+                    sub_schemas.insert(
+                        alias.clone().unwrap_or_else(|| name.clone()),
+                        schema.clone(),
+                    );
                 }
             }
             for join in &select_statement.joins {
                 if let TableReference::Table { name, alias } = &join.table {
                     if let Some(schema) = schemas.get(name) {
-                        sub_schemas.insert(alias.clone().unwrap_or_else(|| name.clone()), schema.clone());
+                        sub_schemas.insert(
+                            alias.clone().unwrap_or_else(|| name.clone()),
+                            schema.clone(),
+                        );
                     }
                 }
             }
@@ -1025,14 +1344,12 @@ fn ast_to_logical_plan_inner(
             view_name: statement.view_name,
             query: statement.query,
         }),
-        AstStatement::CreateTable(statement) => {
-            Ok(LogicalPlan::CreateTable {
-                table_name: statement.table_name,
-                columns: statement.columns,
-                if_not_exists: statement.if_not_exists,
-                constraints: statement.constraints,
-            })
-        }
+        AstStatement::CreateTable(statement) => Ok(LogicalPlan::CreateTable {
+            table_name: statement.table_name,
+            columns: statement.columns,
+            if_not_exists: statement.if_not_exists,
+            constraints: statement.constraints,
+        }),
         AstStatement::DropTable(statement) => Ok(LogicalPlan::DropTable {
             table_name: statement.table_name,
         }),
@@ -1046,12 +1363,16 @@ fn ast_to_logical_plan_inner(
             if let Some(with_clause) = statement.with.take() {
                 if with_clause.recursive {
                     if with_clause.ctes.len() > 1 {
-                        return Err(anyhow!("Only one CTE is supported in a RECURSIVE WITH clause for now."));
+                        return Err(anyhow!(
+                            "Only one CTE is supported in a RECURSIVE WITH clause for now."
+                        ));
                     }
                     let cte = &with_clause.ctes[0];
                     let cte_alias = cte.alias.clone();
 
-                    let (non_recursive_query, recursive_query, union_all) = if let Some(set_op) = &cte.query.set_operator {
+                    let (non_recursive_query, recursive_query, union_all) = if let Some(set_op) =
+                        &cte.query.set_operator
+                    {
                         if set_op.operator != SetOperatorType::Union {
                             return Err(anyhow!("Recursive CTE must use UNION or UNION ALL"));
                         }
@@ -1062,9 +1383,21 @@ fn ast_to_logical_plan_inner(
                         return Err(anyhow!("Recursive CTE query must be a UNION or UNION ALL"));
                     };
 
-                    let non_recursive_plan = ast_to_logical_plan_inner(AstStatement::Select(non_recursive_query), schema_cache, &temp_view_cache, function_registry, None)?;
-                    
-                    let recursive_plan = ast_to_logical_plan_inner(AstStatement::Select(recursive_query), schema_cache, &temp_view_cache, function_registry, Some(&cte_alias))?;
+                    let non_recursive_plan = ast_to_logical_plan_inner(
+                        AstStatement::Select(non_recursive_query),
+                        schema_cache,
+                        &temp_view_cache,
+                        function_registry,
+                        None,
+                    )?;
+
+                    let recursive_plan = ast_to_logical_plan_inner(
+                        AstStatement::Select(recursive_query),
+                        schema_cache,
+                        &temp_view_cache,
+                        function_registry,
+                        Some(&cte_alias),
+                    )?;
 
                     let recursive_cte_plan = LogicalPlan::RecursiveCteScan {
                         alias: cte_alias.clone(),
@@ -1076,11 +1409,19 @@ fn ast_to_logical_plan_inner(
                     planned_ctes.insert(cte_alias, recursive_cte_plan);
                 } else {
                     for cte in with_clause.ctes {
-                        if view_cache.contains_key(&cte.alias) || planned_ctes.contains_key(&cte.alias) {
-                            return Err(anyhow!("CTE name '{}' conflicts with an existing view or another CTE.", cte.alias));
+                        if view_cache.contains_key(&cte.alias)
+                            || planned_ctes.contains_key(&cte.alias)
+                        {
+                            return Err(anyhow!(
+                                "CTE name '{}' conflicts with an existing view or another CTE.",
+                                cte.alias
+                            ));
                         }
                         if temp_view_cache.contains_key(&cte.alias) {
-                            return Err(anyhow!("Duplicate CTE name '{}' in WITH clause.", cte.alias));
+                            return Err(anyhow!(
+                                "Duplicate CTE name '{}' in WITH clause.",
+                                cte.alias
+                            ));
                         }
                         let view_def = crate::types::ViewDefinition {
                             name: cte.alias.clone(),
@@ -1101,14 +1442,17 @@ fn ast_to_logical_plan_inner(
             match &statement.from {
                 TableReference::Table { name, alias } => {
                     if let Some(schema) = schema_cache.get(name) {
-                        schemas_in_scope.insert(alias.clone().unwrap_or_else(|| name.clone()), schema.clone());
+                        schemas_in_scope.insert(
+                            alias.clone().unwrap_or_else(|| name.clone()),
+                            schema.clone(),
+                        );
                     }
                 }
                 TableReference::Subquery(_, _alias) => {
                     // Subquery validation is complex; we'd need to infer its output schema.
                     // For now, we skip validation for columns coming from a subquery.
                 }
-                TableReference::GraphMatch {..} => {
+                TableReference::GraphMatch { .. } => {
                     // Validation for GRAPH_MATCH columns is handled by the cypher engine.
                 }
             }
@@ -1116,7 +1460,10 @@ fn ast_to_logical_plan_inner(
             for join in &statement.joins {
                 if let TableReference::Table { name, alias } = &join.table {
                     if let Some(schema) = schema_cache.get(name) {
-                        schemas_in_scope.insert(alias.clone().unwrap_or_else(|| name.clone()), schema.clone());
+                        schemas_in_scope.insert(
+                            alias.clone().unwrap_or_else(|| name.clone()),
+                            schema.clone(),
+                        );
                     }
                 }
             }
@@ -1126,16 +1473,31 @@ fn ast_to_logical_plan_inner(
                 validate_expression(&col.expr, &schemas_in_scope, view_cache, function_registry)?;
             }
             if let Some(where_clause) = &statement.where_clause {
-                validate_expression(where_clause, &schemas_in_scope, view_cache, function_registry)?;
+                validate_expression(
+                    where_clause,
+                    &schemas_in_scope,
+                    view_cache,
+                    function_registry,
+                )?;
             }
             for group_expr in &statement.group_by {
                 validate_expression(group_expr, &schemas_in_scope, view_cache, function_registry)?;
             }
             for order_expr in &statement.order_by {
-                validate_expression(&order_expr.expression, &schemas_in_scope, view_cache, function_registry)?;
+                validate_expression(
+                    &order_expr.expression,
+                    &schemas_in_scope,
+                    view_cache,
+                    function_registry,
+                )?;
             }
             for join in &statement.joins {
-                validate_expression(&join.on_condition, &schemas_in_scope, view_cache, function_registry)?;
+                validate_expression(
+                    &join.on_condition,
+                    &schemas_in_scope,
+                    view_cache,
+                    function_registry,
+                )?;
             }
             // --- VALIDATION END ---
 
@@ -1144,7 +1506,10 @@ fn ast_to_logical_plan_inner(
                     if let Some(cte_plan) = planned_ctes.get(&name) {
                         let base_plan = cte_plan.clone();
                         if let Some(alias_name) = alias {
-                            LogicalPlan::SubqueryScan { alias: alias_name, input: Box::new(base_plan) }
+                            LogicalPlan::SubqueryScan {
+                                alias: alias_name,
+                                input: Box::new(base_plan),
+                            }
                         } else {
                             base_plan
                         }
@@ -1155,28 +1520,49 @@ fn ast_to_logical_plan_inner(
                         }
                     } else {
                         let base_plan = if let Some(view_def) = view_cache.get(&name) {
-                            ast_to_logical_plan_inner(AstStatement::Select(view_def.query.clone()), schema_cache, view_cache, function_registry, active_recursive_alias)?
+                            ast_to_logical_plan_inner(
+                                AstStatement::Select(view_def.query.clone()),
+                                schema_cache,
+                                view_cache,
+                                function_registry,
+                                active_recursive_alias,
+                            )?
                         } else {
                             LogicalPlan::TableScan { table_name: name }
                         };
 
                         if let Some(alias_name) = alias {
-                            LogicalPlan::SubqueryScan { alias: alias_name, input: Box::new(base_plan) }
+                            LogicalPlan::SubqueryScan {
+                                alias: alias_name,
+                                input: Box::new(base_plan),
+                            }
                         } else {
                             base_plan
                         }
                     }
                 }
                 TableReference::Subquery(subquery_select, alias) => {
-                    let sub_plan = ast_to_logical_plan_inner(AstStatement::Select(*subquery_select), schema_cache, view_cache, function_registry, active_recursive_alias)?;
+                    let sub_plan = ast_to_logical_plan_inner(
+                        AstStatement::Select(*subquery_select),
+                        schema_cache,
+                        view_cache,
+                        function_registry,
+                        active_recursive_alias,
+                    )?;
                     LogicalPlan::SubqueryScan {
                         alias,
                         input: Box::new(sub_plan),
                     }
                 }
-                TableReference::GraphMatch { query, returns, alias } => {
-                    LogicalPlan::GraphMatch { query, returns, alias }
-                }
+                TableReference::GraphMatch {
+                    query,
+                    returns,
+                    alias,
+                } => LogicalPlan::GraphMatch {
+                    query,
+                    returns,
+                    alias,
+                },
             };
 
             for join in statement.joins {
@@ -1198,35 +1584,59 @@ fn ast_to_logical_plan_inner(
                             }
                         } else {
                             let base_plan = if let Some(view_def) = view_cache.get(&name) {
-                                ast_to_logical_plan_inner(AstStatement::Select(view_def.query.clone()), schema_cache, view_cache, function_registry, active_recursive_alias)?
+                                ast_to_logical_plan_inner(
+                                    AstStatement::Select(view_def.query.clone()),
+                                    schema_cache,
+                                    view_cache,
+                                    function_registry,
+                                    active_recursive_alias,
+                                )?
                             } else {
                                 LogicalPlan::TableScan { table_name: name }
                             };
                             if let Some(alias_name) = alias {
-                                LogicalPlan::SubqueryScan { alias: alias_name, input: Box::new(base_plan) }
+                                LogicalPlan::SubqueryScan {
+                                    alias: alias_name,
+                                    input: Box::new(base_plan),
+                                }
                             } else {
                                 base_plan
                             }
                         }
                     }
                     TableReference::Subquery(subquery_select, alias) => {
-                        let sub_plan = ast_to_logical_plan_inner(AstStatement::Select(*subquery_select), schema_cache, view_cache, function_registry, active_recursive_alias)?;
+                        let sub_plan = ast_to_logical_plan_inner(
+                            AstStatement::Select(*subquery_select),
+                            schema_cache,
+                            view_cache,
+                            function_registry,
+                            active_recursive_alias,
+                        )?;
                         LogicalPlan::SubqueryScan {
                             alias,
                             input: Box::new(sub_plan),
                         }
                     }
-                    TableReference::GraphMatch { query, returns, alias } => {
-                        LogicalPlan::GraphMatch { query, returns, alias }
-                    }
+                    TableReference::GraphMatch {
+                        query,
+                        returns,
+                        alias,
+                    } => LogicalPlan::GraphMatch {
+                        query,
+                        returns,
+                        alias,
+                    },
                 };
 
                 plan = LogicalPlan::Join {
                     left: Box::new(plan),
                     right: Box::new(right_plan),
                     condition: simple_expr_to_expression(
-                        join.on_condition, 
-                        schema_cache, view_cache, function_registry, active_recursive_alias
+                        join.on_condition,
+                        schema_cache,
+                        view_cache,
+                        function_registry,
+                        active_recursive_alias,
                     )?,
                     join_type,
                 };
@@ -1237,7 +1647,10 @@ fn ast_to_logical_plan_inner(
                     input: Box::new(plan),
                     predicate: simple_expr_to_expression(
                         selection,
-                        schema_cache, view_cache, function_registry, active_recursive_alias
+                        schema_cache,
+                        view_cache,
+                        function_registry,
+                        active_recursive_alias,
                     )?,
                 };
             }
@@ -1246,8 +1659,14 @@ fn ast_to_logical_plan_inner(
                 .columns
                 .into_iter()
                 .map(|c| {
-                    simple_expr_to_expression(c.expr, schema_cache, view_cache, function_registry, active_recursive_alias)
-                        .map(|expr| (expr, c.alias))
+                    simple_expr_to_expression(
+                        c.expr,
+                        schema_cache,
+                        view_cache,
+                        function_registry,
+                        active_recursive_alias,
+                    )
+                    .map(|expr| (expr, c.alias))
                 })
                 .collect::<Result<_>>()?;
 
@@ -1269,22 +1688,31 @@ fn ast_to_logical_plan_inner(
                     .group_by
                     .clone()
                     .into_iter()
-                    .map(|e| simple_expr_to_expression(e, schema_cache, view_cache, function_registry, active_recursive_alias))
+                    .map(|e| {
+                        simple_expr_to_expression(
+                            e,
+                            schema_cache,
+                            view_cache,
+                            function_registry,
+                            active_recursive_alias,
+                        )
+                    })
                     .collect::<Result<_>>()?;
 
                 for proj_expr in &non_agg_expressions {
-                    if !group_expressions.iter().any(|g_expr| {
-                        match (proj_expr, g_expr) {
+                    if !group_expressions
+                        .iter()
+                        .any(|g_expr| match (proj_expr, g_expr) {
                             (Expression::Column(p), Expression::Column(g)) => p == g,
                             _ => false,
-                        }
-                    }) {
+                        })
+                    {
                         if let Expression::Column(name) = proj_expr {
                             if name != "*" {
                                 return Err(anyhow!(
-                        "Column '{}' must appear in the GROUP BY clause or be used in an aggregate function",
-                        name
-                    ));
+                                    "Column '{}' must appear in the GROUP BY clause or be used in an aggregate function",
+                                    name
+                                ));
                             }
                         }
                     }
@@ -1301,7 +1729,10 @@ fn ast_to_logical_plan_inner(
                         input: Box::new(plan),
                         predicate: simple_expr_to_expression(
                             having_clause,
-                            schema_cache, view_cache, function_registry, active_recursive_alias
+                            schema_cache,
+                            view_cache,
+                            function_registry,
+                            active_recursive_alias,
                         )?,
                     };
                 }
@@ -1336,18 +1767,26 @@ fn ast_to_logical_plan_inner(
                 // Build the right-hand side plan.
                 let right_plan_unprojected = ast_to_logical_plan_inner(
                     AstStatement::Select(*set_operator_clause.select),
-                    schema_cache, view_cache, function_registry, active_recursive_alias
+                    schema_cache,
+                    view_cache,
+                    function_registry,
+                    active_recursive_alias,
                 )?;
 
                 // The right plan will have a projection on top. We need to deconstruct it
                 // and rebuild it with the left side's aliases.
-                let (right_input, right_expressions) =
-                    if let LogicalPlan::Projection { input, expressions } = right_plan_unprojected {
-                        (input, expressions)
-                    } else {
-                        // This should not be reached if the right side is a valid SELECT query
-                        return Err(anyhow!("Right side of set operator did not produce a projection plan"));
-                    };
+                let (right_input, right_expressions) = if let LogicalPlan::Projection {
+                    input,
+                    expressions,
+                } = right_plan_unprojected
+                {
+                    (input, expressions)
+                } else {
+                    // This should not be reached if the right side is a valid SELECT query
+                    return Err(anyhow!(
+                        "Right side of set operator did not produce a projection plan"
+                    ));
+                };
 
                 // Create a new projection for the right side, using its original expressions
                 // but with the aliases from the left side.
@@ -1366,10 +1805,16 @@ fn ast_to_logical_plan_inner(
                 plan = match set_operator_clause.operator {
                     SetOperatorType::Union => {
                         if set_operator_clause.all {
-                            LogicalPlan::UnionAll { left: Box::new(plan), right: Box::new(right_plan_reprojected) }
+                            LogicalPlan::UnionAll {
+                                left: Box::new(plan),
+                                right: Box::new(right_plan_reprojected),
+                            }
                         } else {
                             // UNION (DISTINCT) is UnionAll followed by DistinctOn
-                            let union_all_plan = LogicalPlan::UnionAll { left: Box::new(plan), right: Box::new(right_plan_reprojected) };
+                            let union_all_plan = LogicalPlan::UnionAll {
+                                left: Box::new(plan),
+                                right: Box::new(right_plan_reprojected),
+                            };
                             let distinct_expressions = left_output_names
                                 .into_iter()
                                 .map(Expression::Column)
@@ -1379,9 +1824,15 @@ fn ast_to_logical_plan_inner(
                                 expressions: distinct_expressions,
                             }
                         }
+                    }
+                    SetOperatorType::Intersect => LogicalPlan::Intersect {
+                        left: Box::new(plan),
+                        right: Box::new(right_plan_reprojected),
                     },
-                    SetOperatorType::Intersect => LogicalPlan::Intersect { left: Box::new(plan), right: Box::new(right_plan_reprojected) },
-                    SetOperatorType::Except => LogicalPlan::Except { left: Box::new(plan), right: Box::new(right_plan_reprojected) },
+                    SetOperatorType::Except => LogicalPlan::Except {
+                        left: Box::new(plan),
+                        right: Box::new(right_plan_reprojected),
+                    },
                 };
 
                 // Now apply Sort, DistinctOn, and Limit to the combined plan.
@@ -1392,8 +1843,14 @@ fn ast_to_logical_plan_inner(
                             .order_by
                             .into_iter()
                             .map(|o| {
-                                simple_expr_to_expression(o.expression, schema_cache, view_cache, function_registry, active_recursive_alias)
-                                    .map(|e| (e, o.asc))
+                                simple_expr_to_expression(
+                                    o.expression,
+                                    schema_cache,
+                                    view_cache,
+                                    function_registry,
+                                    active_recursive_alias,
+                                )
+                                .map(|e| (e, o.asc))
                             })
                             .collect::<Result<_>>()?,
                     };
@@ -1403,7 +1860,15 @@ fn ast_to_logical_plan_inner(
                     let distinct_expressions: Vec<Expression> = statement
                         .distinct_on
                         .into_iter()
-                        .map(|e| simple_expr_to_expression(e, schema_cache, view_cache, function_registry, active_recursive_alias))
+                        .map(|e| {
+                            simple_expr_to_expression(
+                                e,
+                                schema_cache,
+                                view_cache,
+                                function_registry,
+                                active_recursive_alias,
+                            )
+                        })
                         .collect::<Result<_>>()?;
                     plan = LogicalPlan::DistinctOn {
                         input: Box::new(plan),
@@ -1427,8 +1892,14 @@ fn ast_to_logical_plan_inner(
                             .order_by
                             .into_iter()
                             .map(|o| {
-                                simple_expr_to_expression(o.expression, schema_cache, view_cache, function_registry, active_recursive_alias)
-                                    .map(|e| (e, o.asc))
+                                simple_expr_to_expression(
+                                    o.expression,
+                                    schema_cache,
+                                    view_cache,
+                                    function_registry,
+                                    active_recursive_alias,
+                                )
+                                .map(|e| (e, o.asc))
                             })
                             .collect::<Result<_>>()?,
                     };
@@ -1443,7 +1914,15 @@ fn ast_to_logical_plan_inner(
                     let distinct_expressions: Vec<Expression> = statement
                         .distinct_on
                         .into_iter()
-                        .map(|e| simple_expr_to_expression(e, schema_cache, view_cache, function_registry, active_recursive_alias))
+                        .map(|e| {
+                            simple_expr_to_expression(
+                                e,
+                                schema_cache,
+                                view_cache,
+                                function_registry,
+                                active_recursive_alias,
+                            )
+                        })
                         .collect::<Result<_>>()?;
                     plan = LogicalPlan::DistinctOn {
                         input: Box::new(plan),
@@ -1467,7 +1946,11 @@ fn ast_to_logical_plan_inner(
                 if let Some(schema) = schema_cache.get(&statement.table) {
                     for col in &statement.columns {
                         if !schema.columns.contains_key(col) {
-                            return Err(anyhow!("Column '{}' does not exist in table '{}'", col, statement.table));
+                            return Err(anyhow!(
+                                "Column '{}' does not exist in table '{}'",
+                                col,
+                                statement.table
+                            ));
                         }
                     }
                 }
@@ -1481,7 +1964,13 @@ fn ast_to_logical_plan_inner(
                             row_values
                                 .into_iter()
                                 .map(|e| {
-                                    simple_expr_to_expression(e, schema_cache, view_cache, function_registry, active_recursive_alias)
+                                    simple_expr_to_expression(
+                                        e,
+                                        schema_cache,
+                                        view_cache,
+                                        function_registry,
+                                        active_recursive_alias,
+                                    )
                                 })
                                 .collect::<Result<Vec<_>>>()
                         })
@@ -1491,26 +1980,40 @@ fn ast_to_logical_plan_inner(
                         let expected_len = expressions[0].len();
                         for (idx, row) in expressions.iter().enumerate().skip(1) {
                             if row.len() != expected_len {
-                                return Err(anyhow!("VALUES row {} has {} values, expected {}", idx + 1, row.len(), expected_len));
+                                return Err(anyhow!(
+                                    "VALUES row {} has {} values, expected {}",
+                                    idx + 1,
+                                    row.len(),
+                                    expected_len
+                                ));
                             }
                         }
                     }
-                    LogicalPlan::Values { values: expressions }
+                    LogicalPlan::Values {
+                        values: expressions,
+                    }
                 }
-                InsertSource::Select(select_stmt) => {
-                    ast_to_logical_plan_inner(
-                        AstStatement::Select(*select_stmt),
-                        schema_cache, view_cache, function_registry, active_recursive_alias
-                    )?
-                }
+                InsertSource::Select(select_stmt) => ast_to_logical_plan_inner(
+                    AstStatement::Select(*select_stmt),
+                    schema_cache,
+                    view_cache,
+                    function_registry,
+                    active_recursive_alias,
+                )?,
             };
 
             let returning = statement
                 .returning
                 .into_iter()
                 .map(|c| {
-                    simple_expr_to_expression(c.expr, schema_cache, view_cache, function_registry, active_recursive_alias)
-                        .map(|expr| (expr, c.alias))
+                    simple_expr_to_expression(
+                        c.expr,
+                        schema_cache,
+                        view_cache,
+                        function_registry,
+                        active_recursive_alias,
+                    )
+                    .map(|expr| (expr, c.alias))
                 })
                 .collect::<Result<_>>()?;
 
@@ -1521,7 +2024,14 @@ fn ast_to_logical_plan_inner(
                         let new_set = set
                             .into_iter()
                             .map(|(col, expr)| {
-                                simple_expr_to_expression(expr, schema_cache, view_cache, function_registry, active_recursive_alias).map(|e| (col, e))
+                                simple_expr_to_expression(
+                                    expr,
+                                    schema_cache,
+                                    view_cache,
+                                    function_registry,
+                                    active_recursive_alias,
+                                )
+                                .map(|e| (col, e))
                             })
                             .collect::<Result<Vec<_>>>()?;
                         OnConflictAction::DoUpdate(new_set)
@@ -1552,7 +2062,12 @@ fn ast_to_logical_plan_inner(
             }
 
             if let Some(where_clause) = &statement.where_clause {
-                validate_expression(where_clause, &schemas_in_scope, view_cache, function_registry)?;
+                validate_expression(
+                    where_clause,
+                    &schemas_in_scope,
+                    view_cache,
+                    function_registry,
+                )?;
             }
 
             let mut plan = LogicalPlan::TableScan {
@@ -1562,7 +2077,9 @@ fn ast_to_logical_plan_inner(
             if !statement.using_list.is_empty() {
                 let mut from_plan = plan;
                 for using_table in statement.using_list {
-                    let right_plan = LogicalPlan::TableScan { table_name: using_table };
+                    let right_plan = LogicalPlan::TableScan {
+                        table_name: using_table,
+                    };
                     from_plan = LogicalPlan::Join {
                         left: Box::new(from_plan),
                         right: Box::new(right_plan),
@@ -1576,7 +2093,13 @@ fn ast_to_logical_plan_inner(
             if let Some(selection) = statement.where_clause {
                 plan = LogicalPlan::Filter {
                     input: Box::new(plan),
-                    predicate: simple_expr_to_expression(selection, schema_cache, view_cache, function_registry, active_recursive_alias)?,
+                    predicate: simple_expr_to_expression(
+                        selection,
+                        schema_cache,
+                        view_cache,
+                        function_registry,
+                        active_recursive_alias,
+                    )?,
                 };
             }
 
@@ -1584,8 +2107,14 @@ fn ast_to_logical_plan_inner(
                 .returning
                 .into_iter()
                 .map(|c| {
-                    simple_expr_to_expression(c.expr, schema_cache, view_cache, function_registry, active_recursive_alias)
-                        .map(|expr| (expr, c.alias))
+                    simple_expr_to_expression(
+                        c.expr,
+                        schema_cache,
+                        view_cache,
+                        function_registry,
+                        active_recursive_alias,
+                    )
+                    .map(|expr| (expr, c.alias))
                 })
                 .collect::<Result<_>>()?;
 
@@ -1609,13 +2138,22 @@ fn ast_to_logical_plan_inner(
             for (col, expr) in &statement.set {
                 if let Some(schema) = schemas_in_scope.get(&statement.table) {
                     if !schema.columns.contains_key(col) {
-                        return Err(anyhow!("Column '{}' does not exist in table '{}'", col, statement.table));
+                        return Err(anyhow!(
+                            "Column '{}' does not exist in table '{}'",
+                            col,
+                            statement.table
+                        ));
                     }
                 }
                 validate_expression(expr, &schemas_in_scope, view_cache, function_registry)?;
             }
             if let Some(where_clause) = &statement.where_clause {
-                validate_expression(where_clause, &schemas_in_scope, view_cache, function_registry)?;
+                validate_expression(
+                    where_clause,
+                    &schemas_in_scope,
+                    view_cache,
+                    function_registry,
+                )?;
             }
 
             let mut plan = LogicalPlan::TableScan {
@@ -1625,7 +2163,9 @@ fn ast_to_logical_plan_inner(
             if !statement.from_list.is_empty() {
                 let mut from_plan = plan;
                 for from_table in statement.from_list {
-                    let right_plan = LogicalPlan::TableScan { table_name: from_table };
+                    let right_plan = LogicalPlan::TableScan {
+                        table_name: from_table,
+                    };
                     from_plan = LogicalPlan::Join {
                         left: Box::new(from_plan),
                         right: Box::new(right_plan),
@@ -1639,21 +2179,42 @@ fn ast_to_logical_plan_inner(
             if let Some(selection) = statement.where_clause {
                 plan = LogicalPlan::Filter {
                     input: Box::new(plan),
-                    predicate: simple_expr_to_expression(selection, schema_cache, view_cache, function_registry, active_recursive_alias)?,
+                    predicate: simple_expr_to_expression(
+                        selection,
+                        schema_cache,
+                        view_cache,
+                        function_registry,
+                        active_recursive_alias,
+                    )?,
                 };
             }
             let set = statement
                 .set
                 .into_iter()
-                .map(|(col, expr)| simple_expr_to_expression(expr, schema_cache, view_cache, function_registry, active_recursive_alias).map(|e| (col, e)))
+                .map(|(col, expr)| {
+                    simple_expr_to_expression(
+                        expr,
+                        schema_cache,
+                        view_cache,
+                        function_registry,
+                        active_recursive_alias,
+                    )
+                    .map(|e| (col, e))
+                })
                 .collect::<Result<Vec<_>>>()?;
 
             let returning = statement
                 .returning
                 .into_iter()
                 .map(|c| {
-                    simple_expr_to_expression(c.expr, schema_cache, view_cache, function_registry, active_recursive_alias)
-                        .map(|expr| (expr, c.alias))
+                    simple_expr_to_expression(
+                        c.expr,
+                        schema_cache,
+                        view_cache,
+                        function_registry,
+                        active_recursive_alias,
+                    )
+                    .map(|expr| (expr, c.alias))
                 })
                 .collect::<Result<_>>()?;
 
@@ -1676,8 +2237,8 @@ fn ast_to_logical_plan_inner(
                 table_name: statement.table_name,
                 from: Box::new(plan),
                 returning: Vec::new(),
-            }) 
-        },
+            })
+        }
         AstStatement::CreateIndex(statement) => Ok(LogicalPlan::CreateIndex { statement }),
         AstStatement::BeginStatement => Ok(LogicalPlan::BeginTransaction),
         AstStatement::CommitStatement => Ok(LogicalPlan::CommitTransaction),

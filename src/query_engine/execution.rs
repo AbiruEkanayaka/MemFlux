@@ -1,22 +1,28 @@
-use crate::transaction::{Transaction, TransactionHandle};
 use crate::config::DurabilityLevel;
-use std::sync::atomic::Ordering;
-use anyhow::{anyhow, Result};
+use crate::transaction::{Transaction, TransactionHandle};
+use anyhow::{Result, anyhow};
 use async_stream::try_stream;
 use futures::stream::{Stream, StreamExt, TryStreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
+use std::sync::atomic::Ordering;
 
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::{oneshot, RwLock};
-
+use tokio::sync::{RwLock, oneshot};
 
 use super::ast::{AlterTableAction, TableConstraint};
-use super::logical_plan::{cast_value_to_type, Expression, JoinType, LogicalOperator, LogicalPlan, Operator};
+use super::logical_plan::{
+    Expression, JoinType, LogicalOperator, LogicalPlan, Operator, cast_value_to_type,
+};
 use super::physical_plan::PhysicalPlan;
-use crate::schema::{ColumnDefinition, DataType, VirtualSchema, SCHEMA_PREFIX, VIEW_PREFIX, SchemaSource};
-use crate::types::{AppContext, Command, DbValue, LogEntry, LogRequest, PersistenceRequest, Response, SchemaCache, ViewDefinition};
+use crate::schema::{
+    ColumnDefinition, DataType, SCHEMA_PREFIX, SchemaSource, VIEW_PREFIX, VirtualSchema,
+};
+use crate::types::{
+    AppContext, Command, DbValue, LogEntry, LogRequest, PersistenceRequest, Response, SchemaCache,
+    ViewDefinition,
+};
 
 pub const SCHEMALIST_PREFIX: &str = "_internal:schemalist:";
 
@@ -31,7 +37,11 @@ macro_rules! log_and_wait_qe {
                 ack: ack_tx,
                 durability: $ctx.config.durability.clone(),
             };
-            if $logger.send(PersistenceRequest::Log(log_req)).await.is_err() {
+            if $logger
+                .send(PersistenceRequest::Log(log_req))
+                .await
+                .is_err()
+            {
                 Err(anyhow!("Persistence engine is down"))
             } else {
                 match ack_rx.await {
@@ -142,7 +152,7 @@ fn compare_typed_values(
 
 async fn project_row<'a>(
     row: &'a Row,
-    expressions: &'a Vec<(Expression, Option<String>)>, 
+    expressions: &'a Vec<(Expression, Option<String>)>,
     ctx: Arc<AppContext>,
     outer_row: Option<&'a Row>,
     _working_tables: Option<&'a HashMap<String, Vec<Row>>>,
@@ -170,7 +180,9 @@ async fn project_row<'a>(
         }
     } else {
         for (expr, alias) in expressions {
-            let val = expr.evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone()).await?;
+            let val = expr
+                .evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone())
+                .await?;
             let name = alias.clone().unwrap_or_else(|| expr.to_string());
             new_row[name] = val;
         }
@@ -750,7 +762,7 @@ pub fn execute<'a>(
                 // 2. Delete data
                 let prefix = format!("{}:", table_name);
                 let keys_to_delete: Vec<String> = ctx.db.iter().filter(|r| r.key().starts_with(&prefix)).map(|r| r.key().clone()).collect();
-                
+
                 for key in keys_to_delete {
                     let log_entry = LogEntry::Delete { key: key.clone() };
                     // Use a lower durability for data deletion for performance, similar to TABLE.DROP
@@ -1002,7 +1014,7 @@ pub fn execute<'a>(
                         // 2. Rewrite data
                         let table_prefix = format!("{}:", table_name);
                         let keys_to_update: Vec<_> = ctx.db.iter().filter(|e| e.key().starts_with(&table_prefix)).map(|e| e.key().clone()).collect();
-                        
+
                         for key in keys_to_update {
                             let (new_bytes, should_update) = {
                                 let entry = match ctx.db.get(&key) { Some(e) => e, None => continue };
@@ -1419,7 +1431,7 @@ pub fn execute<'a>(
                             }
                         }
                     }
-                    
+
                     // Otherwise, for complex subqueries (e.g. from a projection), wrap the whole row.
                     new_row[alias.clone()] = row;
                     yield new_row;
@@ -1481,7 +1493,7 @@ pub fn execute<'a>(
 
                 let rename_row_columns = |row: Row, aliases: &[String], original_cols: &Option<Vec<String>>| -> Result<Row> {
                     let obj = row.as_object().ok_or_else(|| anyhow!("Recursive CTE row is not an object"))?;
-                    
+
                     if aliases.is_empty() {
                         return Ok(Value::Object(obj.clone()));
                     }
@@ -1709,7 +1721,11 @@ async fn run_agg_fn<'a>(
         "SUM" => {
             let mut sum = 0.0;
             for row in rows {
-                if let Some(n) = arg.evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone()).await?.as_f64() {
+                if let Some(n) = arg
+                    .evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone())
+                    .await?
+                    .as_f64()
+                {
                     sum += n;
                 }
             }
@@ -1719,17 +1735,27 @@ async fn run_agg_fn<'a>(
             let mut sum = 0.0;
             let mut count = 0;
             for row in rows {
-                if let Some(n) = arg.evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone()).await?.as_f64() {
+                if let Some(n) = arg
+                    .evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone())
+                    .await?
+                    .as_f64()
+                {
                     sum += n;
                     count += 1;
                 }
             }
-            if count > 0 { json!(sum / count as f64) } else { Value::Null }
+            if count > 0 {
+                json!(sum / count as f64)
+            } else {
+                Value::Null
+            }
         }
         "MIN" => {
             let mut min = Value::Null;
             for row in rows {
-                let val = arg.evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone()).await?;
+                let val = arg
+                    .evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone())
+                    .await?;
                 if min.is_null() || (!val.is_null() && val.as_f64() < min.as_f64()) {
                     min = val;
                 }
@@ -1739,7 +1765,9 @@ async fn run_agg_fn<'a>(
         "MAX" => {
             let mut max = Value::Null;
             for row in rows {
-                let val = arg.evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone()).await?;
+                let val = arg
+                    .evaluate_with_context(row, outer_row, ctx.clone(), transaction_handle.clone())
+                    .await?;
                 if max.is_null() || (!val.is_null() && val.as_f64() > max.as_f64()) {
                     max = val;
                 }
@@ -1750,10 +1778,6 @@ async fn run_agg_fn<'a>(
     };
     Ok(result)
 }
-
-
-
-
 
 async fn apply_on_delete_actions(
     parent_table_name: &str,
@@ -1769,7 +1793,12 @@ async fn apply_on_delete_actions(
                     let parent_key_values: Vec<Value> = fk
                         .references_columns
                         .iter()
-                        .map(|col_name| parent_row_data.get(col_name).cloned().unwrap_or(Value::Null))
+                        .map(|col_name| {
+                            parent_row_data
+                                .get(col_name)
+                                .cloned()
+                                .unwrap_or(Value::Null)
+                        })
                         .collect();
 
                     if parent_key_values.iter().any(|v| v.is_null()) {
@@ -1802,25 +1831,56 @@ async fn apply_on_delete_actions(
                             input: Box::new(scan_plan),
                             predicate,
                         };
-                        let physical_plan =
-                            super::physical_plan::logical_to_physical_plan(filter_plan, &ctx.index_manager)?;
+                        let physical_plan = super::physical_plan::logical_to_physical_plan(
+                            filter_plan,
+                            &ctx.index_manager,
+                        )?;
 
-                        let results: Vec<Value> = execute(physical_plan, ctx.clone(), None, None, transaction_handle.clone()).try_collect().await?;
+                        let results: Vec<Value> = execute(
+                            physical_plan,
+                            ctx.clone(),
+                            None,
+                            None,
+                            transaction_handle.clone(),
+                        )
+                        .try_collect()
+                        .await?;
 
                         if !results.is_empty() {
-                            let on_delete_action = fk.on_delete.as_deref().unwrap_or("NO ACTION").to_uppercase();
+                            let on_delete_action = fk
+                                .on_delete
+                                .as_deref()
+                                .unwrap_or("NO ACTION")
+                                .to_uppercase();
                             match on_delete_action.as_str() {
                                 "CASCADE" => {
-                                    let executor = crate::storage_executor::StorageExecutor::new(ctx.clone(), transaction_handle.clone().unwrap());
-                                    executor.delete_rows(&child_schema.table_name, results).await?;
+                                    let executor = crate::storage_executor::StorageExecutor::new(
+                                        ctx.clone(),
+                                        transaction_handle.clone().unwrap(),
+                                    );
+                                    executor
+                                        .delete_rows(&child_schema.table_name, results)
+                                        .await?;
                                 }
                                 "SET NULL" => {
                                     let mut set_clauses = Vec::new();
                                     for col_name in &fk.columns {
-                                        set_clauses.push((col_name.clone(), Expression::Literal(Value::Null)));
+                                        set_clauses.push((
+                                            col_name.clone(),
+                                            Expression::Literal(Value::Null),
+                                        ));
                                     }
-                                    let executor = crate::storage_executor::StorageExecutor::new(ctx.clone(), transaction_handle.clone().unwrap());
-                                    executor.update_rows(&child_schema.table_name, results, &set_clauses).await?;
+                                    let executor = crate::storage_executor::StorageExecutor::new(
+                                        ctx.clone(),
+                                        transaction_handle.clone().unwrap(),
+                                    );
+                                    executor
+                                        .update_rows(
+                                            &child_schema.table_name,
+                                            results,
+                                            &set_clauses,
+                                        )
+                                        .await?;
                                 }
                                 "SET DEFAULT" => {
                                     let mut set_clauses = Vec::new();
@@ -1829,15 +1889,30 @@ async fn apply_on_delete_actions(
                                             .ok_or_else(|| anyhow!("Column '{}' not found in child table '{}' for SET DEFAULT", col_name, child_schema.table_name))?;
 
                                         if let Some(default_expr) = &col_def.default {
-                                            set_clauses.push((col_name.clone(), default_expr.clone()));
+                                            set_clauses
+                                                .push((col_name.clone(), default_expr.clone()));
                                         } else {
-                                            return Err(anyhow!("Cannot SET DEFAULT because column '{}' in table '{}' has no default value", col_name, child_schema.table_name));
+                                            return Err(anyhow!(
+                                                "Cannot SET DEFAULT because column '{}' in table '{}' has no default value",
+                                                col_name,
+                                                child_schema.table_name
+                                            ));
                                         }
                                     }
-                                    let executor = crate::storage_executor::StorageExecutor::new(ctx.clone(), transaction_handle.clone().unwrap());
-                                    executor.update_rows(&child_schema.table_name, results, &set_clauses).await?;
+                                    let executor = crate::storage_executor::StorageExecutor::new(
+                                        ctx.clone(),
+                                        transaction_handle.clone().unwrap(),
+                                    );
+                                    executor
+                                        .update_rows(
+                                            &child_schema.table_name,
+                                            results,
+                                            &set_clauses,
+                                        )
+                                        .await?;
                                 }
-                                _ => { // RESTRICT or NO ACTION
+                                _ => {
+                                    // RESTRICT or NO ACTION
                                     return Err(anyhow!(
                                         "Delete on table '{}' violates foreign key constraint on table '{}'",
                                         parent_table_name,
@@ -1870,13 +1945,23 @@ async fn apply_on_update_actions(
                     let old_parent_key_values: Vec<Value> = fk
                         .references_columns
                         .iter()
-                        .map(|col_name| old_parent_row_data.get(col_name).cloned().unwrap_or(Value::Null))
+                        .map(|col_name| {
+                            old_parent_row_data
+                                .get(col_name)
+                                .cloned()
+                                .unwrap_or(Value::Null)
+                        })
                         .collect();
 
                     let new_parent_key_values: Vec<Value> = fk
                         .references_columns
                         .iter()
-                        .map(|col_name| new_parent_row_data.get(col_name).cloned().unwrap_or(Value::Null))
+                        .map(|col_name| {
+                            new_parent_row_data
+                                .get(col_name)
+                                .cloned()
+                                .unwrap_or(Value::Null)
+                        })
                         .collect();
 
                     // If the key didn't change, no action is needed.
@@ -1914,29 +1999,67 @@ async fn apply_on_update_actions(
                             input: Box::new(scan_plan),
                             predicate,
                         };
-                        let physical_plan =
-                            super::physical_plan::logical_to_physical_plan(filter_plan, &ctx.index_manager)?;
+                        let physical_plan = super::physical_plan::logical_to_physical_plan(
+                            filter_plan,
+                            &ctx.index_manager,
+                        )?;
 
-                        let results: Vec<Value> = execute(physical_plan, ctx.clone(), None, None, transaction_handle.clone()).try_collect().await?;
+                        let results: Vec<Value> = execute(
+                            physical_plan,
+                            ctx.clone(),
+                            None,
+                            None,
+                            transaction_handle.clone(),
+                        )
+                        .try_collect()
+                        .await?;
 
                         if !results.is_empty() {
-                            let on_update_action = fk.on_update.as_deref().unwrap_or("NO ACTION").to_uppercase();
+                            let on_update_action = fk
+                                .on_update
+                                .as_deref()
+                                .unwrap_or("NO ACTION")
+                                .to_uppercase();
                             match on_update_action.as_str() {
                                 "CASCADE" => {
                                     let mut set_clauses = Vec::new();
                                     for (i, col_name) in fk.columns.iter().enumerate() {
-                                        set_clauses.push((col_name.clone(), Expression::Literal(new_parent_key_values[i].clone())));
+                                        set_clauses.push((
+                                            col_name.clone(),
+                                            Expression::Literal(new_parent_key_values[i].clone()),
+                                        ));
                                     }
-                                    let executor = crate::storage_executor::StorageExecutor::new(ctx.clone(), transaction_handle.clone().unwrap());
-                                    executor.update_rows(&child_schema.table_name, results, &set_clauses).await?;
+                                    let executor = crate::storage_executor::StorageExecutor::new(
+                                        ctx.clone(),
+                                        transaction_handle.clone().unwrap(),
+                                    );
+                                    executor
+                                        .update_rows(
+                                            &child_schema.table_name,
+                                            results,
+                                            &set_clauses,
+                                        )
+                                        .await?;
                                 }
                                 "SET NULL" => {
                                     let mut set_clauses = Vec::new();
                                     for col_name in &fk.columns {
-                                        set_clauses.push((col_name.clone(), Expression::Literal(Value::Null)));
+                                        set_clauses.push((
+                                            col_name.clone(),
+                                            Expression::Literal(Value::Null),
+                                        ));
                                     }
-                                    let executor = crate::storage_executor::StorageExecutor::new(ctx.clone(), transaction_handle.clone().unwrap());
-                                    executor.update_rows(&child_schema.table_name, results, &set_clauses).await?;
+                                    let executor = crate::storage_executor::StorageExecutor::new(
+                                        ctx.clone(),
+                                        transaction_handle.clone().unwrap(),
+                                    );
+                                    executor
+                                        .update_rows(
+                                            &child_schema.table_name,
+                                            results,
+                                            &set_clauses,
+                                        )
+                                        .await?;
                                 }
                                 "SET DEFAULT" => {
                                     let mut set_clauses = Vec::new();
@@ -1945,15 +2068,30 @@ async fn apply_on_update_actions(
                                             .ok_or_else(|| anyhow!("Column '{}' not found in child table '{}' for SET DEFAULT", col_name, child_schema.table_name))?;
 
                                         if let Some(default_expr) = &col_def.default {
-                                            set_clauses.push((col_name.clone(), default_expr.clone()));
+                                            set_clauses
+                                                .push((col_name.clone(), default_expr.clone()));
                                         } else {
-                                            return Err(anyhow!("Cannot SET DEFAULT because column '{}' in table '{}' has no default value", col_name, child_schema.table_name));
+                                            return Err(anyhow!(
+                                                "Cannot SET DEFAULT because column '{}' in table '{}' has no default value",
+                                                col_name,
+                                                child_schema.table_name
+                                            ));
                                         }
                                     }
-                                    let executor = crate::storage_executor::StorageExecutor::new(ctx.clone(), transaction_handle.clone().unwrap());
-                                    executor.update_rows(&child_schema.table_name, results, &set_clauses).await?;
+                                    let executor = crate::storage_executor::StorageExecutor::new(
+                                        ctx.clone(),
+                                        transaction_handle.clone().unwrap(),
+                                    );
+                                    executor
+                                        .update_rows(
+                                            &child_schema.table_name,
+                                            results,
+                                            &set_clauses,
+                                        )
+                                        .await?;
                                 }
-                                _ => { // RESTRICT or NO ACTION
+                                _ => {
+                                    // RESTRICT or NO ACTION
                                     return Err(anyhow!(
                                         "Update on table '{}' violates foreign key constraint on table '{}'",
                                         parent_table_name,

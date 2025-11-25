@@ -1,7 +1,7 @@
 use crate::cypher_engine::ast::{self, Row};
-use crate::cypher_engine::logical_plan::{LogicalPlan, JoinType};
-use anyhow::Result;
+use crate::cypher_engine::logical_plan::{JoinType, LogicalPlan};
 use crate::indexing::IndexManager;
+use anyhow::Result;
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -10,7 +10,8 @@ pub enum PhysicalPlan {
         variable: String,
         label: String,
     },
-    IndexScan { // The result of an optimization
+    IndexScan {
+        // The result of an optimization
         variable: String,
         label: String,
         property: String,
@@ -80,15 +81,20 @@ pub fn logical_to_physical_plan(
         LogicalPlan::NodeByLabelScan { variable, label } => {
             Ok(PhysicalPlan::NodeScan { variable, label })
         }
-        LogicalPlan::Filter {
-            predicate,
-            input,
-        } => {
+        LogicalPlan::Filter { predicate, input } => {
             // Optimization: Check if this is a filter on an indexed property
-            if let LogicalPlan::NodeByLabelScan { ref variable, ref label } = *input {
+            if let LogicalPlan::NodeByLabelScan {
+                ref variable,
+                ref label,
+            } = *input
+            {
                 if let ast::Expression::BinaryOp { left, op, right } = &predicate {
                     if op == "=" {
-                        if let (ast::Expression::Property(var_expr, prop), ast::Expression::Literal(val)) = (&**left, &**right) {
+                        if let (
+                            ast::Expression::Property(var_expr, prop),
+                            ast::Expression::Literal(val),
+                        ) = (&**left, &**right)
+                        {
                             if let ast::Expression::Variable(var_name) = &**var_expr {
                                 if var_name == variable {
                                     let json_val = match val {
@@ -124,72 +130,81 @@ pub fn logical_to_physical_plan(
                 input: Box::new(logical_to_physical_plan(*input, index_manager)?),
             })
         }
-        LogicalPlan::Expand { start_node_var, rel_var, end_node_var, rel_type, direction, path_variable, input, is_optional, range } => {
-            Ok(PhysicalPlan::Expand {
-                start_node_var,
-                rel_var,
-                end_node_var,
-                rel_type,
-                direction,
-                path_variable,
-                input: Box::new(logical_to_physical_plan(*input, index_manager)?),
-                is_optional,
-                range,
-            })
-        }
-        LogicalPlan::Projection { expressions, input } => {
-            Ok(PhysicalPlan::Projection {
-                expressions,
-                input: Box::new(logical_to_physical_plan(*input, index_manager)?),
-            })
-        }
-        LogicalPlan::Join { left, right, condition, join_type } => {
-            Ok(PhysicalPlan::Join {
-                left: Box::new(logical_to_physical_plan(*left, index_manager)?),
-                right: Box::new(logical_to_physical_plan(*right, index_manager)?),
-                condition,
-                join_type,
-            })
-        }
-        LogicalPlan::Create { pattern, input } => {
-            Ok(PhysicalPlan::Create {
-                pattern,
-                input: Box::new(logical_to_physical_plan(*input, index_manager)?),
-            })
-        }
-        LogicalPlan::Merge { pattern, on_create, on_match, input } => {
-            Ok(PhysicalPlan::Merge {
-                pattern,
-                on_create,
-                on_match,
-                input: Box::new(logical_to_physical_plan(*input, index_manager)?),
-            })
-        }
-        LogicalPlan::Remove { items, input } => {
-            Ok(PhysicalPlan::Remove {
-                items,
-                input: Box::new(logical_to_physical_plan(*input, index_manager)?),
-            })
-        }
-        LogicalPlan::Set { items, input } => {
-            Ok(PhysicalPlan::Set {
-                items,
-                input: Box::new(logical_to_physical_plan(*input, index_manager)?),
-            })
-        }
-        LogicalPlan::Delete { expressions, detach, input } => {
-            Ok(PhysicalPlan::Delete {
-                expressions,
-                detach,
-                input: Box::new(logical_to_physical_plan(*input, index_manager)?),
-            })
-        }
-        LogicalPlan::Sort { input, sort_expressions } => {
-            Ok(PhysicalPlan::Sort {
-                input: Box::new(logical_to_physical_plan(*input, index_manager)?),
-                sort_expressions,
-            })
-        }
+        LogicalPlan::Expand {
+            start_node_var,
+            rel_var,
+            end_node_var,
+            rel_type,
+            direction,
+            path_variable,
+            input,
+            is_optional,
+            range,
+        } => Ok(PhysicalPlan::Expand {
+            start_node_var,
+            rel_var,
+            end_node_var,
+            rel_type,
+            direction,
+            path_variable,
+            input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+            is_optional,
+            range,
+        }),
+        LogicalPlan::Projection { expressions, input } => Ok(PhysicalPlan::Projection {
+            expressions,
+            input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+        }),
+        LogicalPlan::Join {
+            left,
+            right,
+            condition,
+            join_type,
+        } => Ok(PhysicalPlan::Join {
+            left: Box::new(logical_to_physical_plan(*left, index_manager)?),
+            right: Box::new(logical_to_physical_plan(*right, index_manager)?),
+            condition,
+            join_type,
+        }),
+        LogicalPlan::Create { pattern, input } => Ok(PhysicalPlan::Create {
+            pattern,
+            input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+        }),
+        LogicalPlan::Merge {
+            pattern,
+            on_create,
+            on_match,
+            input,
+        } => Ok(PhysicalPlan::Merge {
+            pattern,
+            on_create,
+            on_match,
+            input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+        }),
+        LogicalPlan::Remove { items, input } => Ok(PhysicalPlan::Remove {
+            items,
+            input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+        }),
+        LogicalPlan::Set { items, input } => Ok(PhysicalPlan::Set {
+            items,
+            input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+        }),
+        LogicalPlan::Delete {
+            expressions,
+            detach,
+            input,
+        } => Ok(PhysicalPlan::Delete {
+            expressions,
+            detach,
+            input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+        }),
+        LogicalPlan::Sort {
+            input,
+            sort_expressions,
+        } => Ok(PhysicalPlan::Sort {
+            input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+            sort_expressions,
+        }),
         LogicalPlan::Dummy => Ok(PhysicalPlan::Dummy),
     }
 }

@@ -1,6 +1,6 @@
 use crate::cypher_engine::ast::{self, CypherQuery};
 use crate::indexing::IndexManager;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -233,11 +233,7 @@ fn build_and_cost_single_pattern_plan(
                     .variable
                     .clone()
                     .unwrap_or_else(|| format!("_anon_node_{}", bound_variables.len()));
-                let end_node_label = end_node_pattern
-                    .labels
-                    .get(0)
-                    .cloned()
-                    .unwrap_or_default();
+                let end_node_label = end_node_pattern.labels.get(0).cloned().unwrap_or_default();
                 bound_variables.insert(end_node_var.clone(), end_node_label);
 
                 let rel_var = rel_pattern
@@ -275,7 +271,8 @@ fn build_and_cost_single_pattern_plan(
         }
     }
 
-    let mut final_pattern_plan = pattern_plan.ok_or_else(|| anyhow!("Could not build plan for pattern"))?;
+    let mut final_pattern_plan =
+        pattern_plan.ok_or_else(|| anyhow!("Could not build plan for pattern"))?;
     for p in predicates {
         final_pattern_plan = LogicalPlan::Filter {
             predicate: p,
@@ -295,13 +292,27 @@ fn build_plan_from_match(
     if !matches!(input_plan, LogicalPlan::Dummy) && query.patterns.len() == 1 {
         let pattern = &query.patterns[0];
         if pattern.parts.len() == 3 {
-            if let (Some(ast::PatternPart::Node(start_node_pattern)), Some(ast::PatternPart::Relationship(rel_pattern)), Some(ast::PatternPart::Node(end_node_pattern))) = (pattern.parts.get(0), pattern.parts.get(1), pattern.parts.get(2)) {
+            if let (
+                Some(ast::PatternPart::Node(start_node_pattern)),
+                Some(ast::PatternPart::Relationship(rel_pattern)),
+                Some(ast::PatternPart::Node(end_node_pattern)),
+            ) = (
+                pattern.parts.get(0),
+                pattern.parts.get(1),
+                pattern.parts.get(2),
+            ) {
                 if let Some(start_node_var) = &start_node_pattern.variable {
-                    let end_node_var = end_node_pattern.variable.clone().unwrap_or_else(|| format!("_anon_node_{}", start_node_var));
-                    
+                    let end_node_var = end_node_pattern
+                        .variable
+                        .clone()
+                        .unwrap_or_else(|| format!("_anon_node_{}", start_node_var));
+
                     let mut plan = LogicalPlan::Expand {
                         start_node_var: start_node_var.clone(),
-                        rel_var: rel_pattern.variable.clone().unwrap_or_else(|| format!("_anon_rel_{}", start_node_var)),
+                        rel_var: rel_pattern
+                            .variable
+                            .clone()
+                            .unwrap_or_else(|| format!("_anon_rel_{}", start_node_var)),
                         end_node_var: end_node_var.clone(),
                         rel_type: rel_pattern.types.get(0).cloned().unwrap_or_default(),
                         direction: rel_pattern.direction.clone(),
@@ -371,7 +382,8 @@ fn build_plan_from_match(
         }
     }
 
-    let mut final_plan = final_plan.ok_or_else(|| anyhow!("Could not build a plan from the MATCH clause"))?;
+    let mut final_plan =
+        final_plan.ok_or_else(|| anyhow!("Could not build a plan from the MATCH clause"))?;
 
     if let Some(predicate) = query.where_clause {
         final_plan = LogicalPlan::Filter {

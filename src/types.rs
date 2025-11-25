@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::{RwLock, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::config::{Config, DurabilityLevel};
@@ -114,8 +114,8 @@ pub struct VersionedValue {
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub txid: TxId,
-    pub xmin: TxId,          // The oldest active transaction ID.
-    pub xmax: TxId,          // The next transaction ID to be handed out.
+    pub xmin: TxId,         // The oldest active transaction ID.
+    pub xmax: TxId,         // The next transaction ID to be handed out.
     pub xip: HashSet<TxId>, // The set of in-progress transaction IDs.
 }
 
@@ -139,7 +139,11 @@ impl Snapshot {
     }
 
     /// Checks if a given version is visible to the transaction owning this snapshot.
-    pub fn is_visible(&self, version: &VersionedValue, status_manager: &TransactionStatusManager) -> bool {
+    pub fn is_visible(
+        &self,
+        version: &VersionedValue,
+        status_manager: &TransactionStatusManager,
+    ) -> bool {
         // Rule 1: The creating transaction is the current transaction.
         // The version is visible if it hasn't also been expired by the same transaction.
         if version.creator_txid == self.txid {
@@ -264,24 +268,70 @@ impl SerializableDbValue {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum LogEntry {
-    SetBytes { key: String, value: Vec<u8> },
-    SetJsonB { key: String, value: Vec<u8> },
-    Delete { key: String },
-    JsonSet { path: String, value: String },
-    JsonDelete { path: String },
-    LPush { key: String, values: Vec<Vec<u8>> },
-    RPush { key: String, values: Vec<Vec<u8>> },
-    LPop { key: String, count: usize },
-    RPop { key: String, count: usize },
-    SAdd { key: String, members: Vec<Vec<u8>> },
-    SRem { key: String, members: Vec<Vec<u8>> },
-    RenameTable { old_name: String, new_name: String },
-    BeginTransaction { id: Uuid },
-    CommitTransaction { id: Uuid },
-    RollbackTransaction { id: Uuid },
-    Savepoint { name: String },
-    RollbackToSavepoint { name: String },
-    ReleaseSavepoint { name: String },
+    SetBytes {
+        key: String,
+        value: Vec<u8>,
+    },
+    SetJsonB {
+        key: String,
+        value: Vec<u8>,
+    },
+    Delete {
+        key: String,
+    },
+    JsonSet {
+        path: String,
+        value: String,
+    },
+    JsonDelete {
+        path: String,
+    },
+    LPush {
+        key: String,
+        values: Vec<Vec<u8>>,
+    },
+    RPush {
+        key: String,
+        values: Vec<Vec<u8>>,
+    },
+    LPop {
+        key: String,
+        count: usize,
+    },
+    RPop {
+        key: String,
+        count: usize,
+    },
+    SAdd {
+        key: String,
+        members: Vec<Vec<u8>>,
+    },
+    SRem {
+        key: String,
+        members: Vec<Vec<u8>>,
+    },
+    RenameTable {
+        old_name: String,
+        new_name: String,
+    },
+    BeginTransaction {
+        id: Uuid,
+    },
+    CommitTransaction {
+        id: Uuid,
+    },
+    RollbackTransaction {
+        id: Uuid,
+    },
+    Savepoint {
+        name: String,
+    },
+    RollbackToSavepoint {
+        name: String,
+    },
+    ReleaseSavepoint {
+        name: String,
+    },
     // Graph Operations
     AddNode {
         id: String,
@@ -372,7 +422,6 @@ impl FunctionRegistry {
     pub fn register(&mut self, name: &str, func: ScalarFunction) {
         self.functions.insert(name.to_uppercase(), func);
     }
-
 
     pub fn get(&self, name: &str) -> Option<&ScalarFunction> {
         self.functions.get(&name.to_uppercase())

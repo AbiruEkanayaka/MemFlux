@@ -138,7 +138,8 @@ impl fmt::Display for Expression {
             Expression::Property(expr, prop) => write!(f, "{}.{}", expr, prop),
             Expression::Literal(lit) => write!(f, "{}", lit),
             Expression::Map(props) => {
-                let items: Vec<String> = props.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
+                let items: Vec<String> =
+                    props.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
                 write!(f, "{{{}}}", items.join(", "))
             }
             Expression::BinaryOp { left, op, right } => write!(f, "{} {} {}", left, op, right),

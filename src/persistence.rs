@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use lz4_flex;
 use rayon::prelude::*;
 use std::io::{Read, Write};
@@ -7,14 +7,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio::task::{self, JoinHandle};
 
-
 use crate::config::Config;
 use crate::types::{
     Db, DbValue, LogEntry, PersistenceRequest, SerializableDbValue, Snapshot, SnapshotEntry,
     TransactionIdManager, TransactionStatusManager, VersionedValue,
 };
-use tokio::sync::RwLock;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 pub struct PersistenceEngine {
     receiver: mpsc::Receiver<PersistenceRequest>,
@@ -51,7 +50,7 @@ impl PersistenceEngine {
     }
 
     async fn fsync_loop(file: File, mut receiver: mpsc::Receiver<()>) {
-        use tokio::time::{sleep, Duration};
+        use tokio::time::{Duration, sleep};
         loop {
             if receiver.recv().await.is_none() {
                 break;
@@ -136,10 +135,7 @@ impl PersistenceEngine {
                 .await?;
             wal_file_to_truncate.set_len(0).await?;
 
-            println!(
-                "Compacted WAL file {} has been truncated.",
-                &wal_to_compact
-            );
+            println!("Compacted WAL file {} has been truncated.", &wal_to_compact);
 
             Ok(wal_to_compact)
         })
@@ -366,7 +362,6 @@ impl PersistenceEngine {
     }
 }
 
-
 pub async fn load_db_from_disk(
     snapshot_path: &str,
     primary_wal_path: &str,
@@ -410,7 +405,7 @@ async fn load_from_snapshot(snapshot_path: &str, db: &Db) -> Result<()> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(e) => return Err(e.into()),
         };
-        
+
         let reader = std::io::BufReader::new(file);
         let mut lz4_reader = lz4_flex::frame::FrameDecoder::new(reader);
         let mut total_count = 0;
@@ -448,9 +443,10 @@ async fn load_from_snapshot(snapshot_path: &str, db: &Db) -> Result<()> {
             });
             total_count += batch_count as i32;
         }
-        
+
         Ok(total_count)
-    }).await??;
+    })
+    .await??;
 
     if count > 0 {
         println!(
@@ -515,14 +511,18 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                 // It overwrites the latest version.
                 let mut parts = path.splitn(2, '.');
                 if let Some(key) = parts.next() {
-                    let value: serde_json::Value = serde_json::from_str(&value).unwrap_or(serde_json::Value::Null);
-                    let version_chain_arc = db.entry(key.to_string()).or_insert_with(|| {
-                        Arc::new(RwLock::new(vec![VersionedValue {
-                            value: DbValue::JsonB(b"{}".to_vec()),
-                            creator_txid: 0,
-                            expirer_txid: 0,
-                        }]))
-                    }).clone();
+                    let value: serde_json::Value =
+                        serde_json::from_str(&value).unwrap_or(serde_json::Value::Null);
+                    let version_chain_arc = db
+                        .entry(key.to_string())
+                        .or_insert_with(|| {
+                            Arc::new(RwLock::new(vec![VersionedValue {
+                                value: DbValue::JsonB(b"{}".to_vec()),
+                                creator_txid: 0,
+                                expirer_txid: 0,
+                            }]))
+                        })
+                        .clone();
                     let mut version_chain = version_chain_arc.write().await;
                     if let Some(latest_version) = version_chain.last_mut() {
                         let mut current_val: serde_json::Value = match &latest_version.value {
@@ -553,7 +553,7 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                         drop(entry);
                         let mut version_chain = version_chain_arc.write().await;
                         if let Some(latest_version) = version_chain.last_mut() {
-                             let mut current_val: serde_json::Value = match &latest_version.value {
+                            let mut current_val: serde_json::Value = match &latest_version.value {
                                 DbValue::Json(v) => v.clone(),
                                 DbValue::JsonB(b) => serde_json::from_slice(b).unwrap_or_default(),
                                 _ => continue,
@@ -564,7 +564,9 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                             } else {
                                 let mut pointer_parts: Vec<&str> = inner_path.split('.').collect();
                                 let final_key = pointer_parts.pop().unwrap();
-                                let parent_pointer = crate::storage_executor::json_path_to_pointer(&pointer_parts.join("."));
+                                let parent_pointer = crate::storage_executor::json_path_to_pointer(
+                                    &pointer_parts.join("."),
+                                );
 
                                 if let Some(target) = current_val.pointer_mut(&parent_pointer) {
                                     if let Some(obj) = target.as_object_mut() {
@@ -580,13 +582,16 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                 }
             }
             LogEntry::LPush { key, values } => {
-                let version_chain_arc = db.entry(key).or_insert_with(|| {
-                    Arc::new(RwLock::new(vec![VersionedValue {
-                        value: DbValue::List(RwLock::new(VecDeque::new())),
-                        creator_txid: 0,
-                        expirer_txid: 0,
-                    }]))
-                }).clone();
+                let version_chain_arc = db
+                    .entry(key)
+                    .or_insert_with(|| {
+                        Arc::new(RwLock::new(vec![VersionedValue {
+                            value: DbValue::List(RwLock::new(VecDeque::new())),
+                            creator_txid: 0,
+                            expirer_txid: 0,
+                        }]))
+                    })
+                    .clone();
                 if let Some(latest_version) = version_chain_arc.write().await.last_mut() {
                     if let DbValue::List(list_lock) = &mut latest_version.value {
                         let mut list = list_lock.write().await;
@@ -597,13 +602,16 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                 }
             }
             LogEntry::RPush { key, values } => {
-                let version_chain_arc = db.entry(key).or_insert_with(|| {
-                    Arc::new(RwLock::new(vec![VersionedValue {
-                        value: DbValue::List(RwLock::new(VecDeque::new())),
-                        creator_txid: 0,
-                        expirer_txid: 0,
-                    }]))
-                }).clone();
+                let version_chain_arc = db
+                    .entry(key)
+                    .or_insert_with(|| {
+                        Arc::new(RwLock::new(vec![VersionedValue {
+                            value: DbValue::List(RwLock::new(VecDeque::new())),
+                            creator_txid: 0,
+                            expirer_txid: 0,
+                        }]))
+                    })
+                    .clone();
                 if let Some(latest_version) = version_chain_arc.write().await.last_mut() {
                     if let DbValue::List(list_lock) = &mut latest_version.value {
                         let mut list = list_lock.write().await;
@@ -646,13 +654,16 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                 }
             }
             LogEntry::SAdd { key, members } => {
-                let version_chain_arc = db.entry(key).or_insert_with(|| {
-                    Arc::new(RwLock::new(vec![VersionedValue {
-                        value: DbValue::Set(RwLock::new(HashSet::new())),
-                        creator_txid: 0,
-                        expirer_txid: 0,
-                    }]))
-                }).clone();
+                let version_chain_arc = db
+                    .entry(key)
+                    .or_insert_with(|| {
+                        Arc::new(RwLock::new(vec![VersionedValue {
+                            value: DbValue::Set(RwLock::new(HashSet::new())),
+                            creator_txid: 0,
+                            expirer_txid: 0,
+                        }]))
+                    })
+                    .clone();
                 if let Some(latest_version) = version_chain_arc.write().await.last_mut() {
                     if let DbValue::Set(set_lock) = &mut latest_version.value {
                         let mut set = set_lock.write().await;
@@ -711,14 +722,21 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                                         creator_txid: 0,
                                         expirer_txid: 0,
                                     };
-                                    db.insert(new_schema_key, Arc::new(RwLock::new(vec![new_version])));
+                                    db.insert(
+                                        new_schema_key,
+                                        Arc::new(RwLock::new(vec![new_version])),
+                                    );
                                 }
                             }
                         }
                     }
                 }
             }
-            LogEntry::AddNode { id, label, properties } => {
+            LogEntry::AddNode {
+                id,
+                label,
+                properties,
+            } => {
                 let node_key = format!("_node:{}:{}", label, id);
                 let pk_key = format!("_pk_node:{}", id);
 
@@ -753,7 +771,11 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                 }
                 db.remove(&pk_key);
             }
-            LogEntry::SetNodeProperty { id, property, value } => {
+            LogEntry::SetNodeProperty {
+                id,
+                property,
+                value,
+            } => {
                 let pk_key = format!("_pk_node:{}", id);
                 if let Some(entry) = db.get(&pk_key) {
                     let version_chain_arc = entry.value().clone();
@@ -769,12 +791,21 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                                     let mut node_vc = node_vc_arc.write().await;
                                     if let Some(node_latest_version) = node_vc.last_mut() {
                                         if let DbValue::JsonB(bytes) = &node_latest_version.value {
-                                            if let Ok(mut props) = serde_json::from_slice::<serde_json::Value>(bytes) {
-                                                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&value) {
+                                            if let Ok(mut props) =
+                                                serde_json::from_slice::<serde_json::Value>(bytes)
+                                            {
+                                                if let Ok(val) =
+                                                    serde_json::from_slice::<serde_json::Value>(
+                                                        &value,
+                                                    )
+                                                {
                                                     if let Some(obj) = props.as_object_mut() {
                                                         obj.insert(property, val);
-                                                        if let Ok(new_bytes) = serde_json::to_vec(&props) {
-                                                            node_latest_version.value = DbValue::JsonB(new_bytes);
+                                                        if let Ok(new_bytes) =
+                                                            serde_json::to_vec(&props)
+                                                        {
+                                                            node_latest_version.value =
+                                                                DbValue::JsonB(new_bytes);
                                                         }
                                                     }
                                                 }
@@ -787,7 +818,11 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                     }
                 }
             }
-            LogEntry::SetRelationshipProperty { id, property, value } => {
+            LogEntry::SetRelationshipProperty {
+                id,
+                property,
+                value,
+            } => {
                 let pk_key = format!("_pk_rel:{}", id);
                 if let Some(entry) = db.get(&pk_key) {
                     let version_chain_arc = entry.value().clone();
@@ -801,8 +836,14 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                                     let start_node_id = parts[0];
                                     let rel_type = parts[1];
                                     let end_node_id = parts[2];
-                                    let out_key = format!("_edge:out:{}:{}:{}:{}", start_node_id, rel_type, end_node_id, id);
-                                    let in_key = format!("_edge:in:{}:{}:{}:{}", end_node_id, rel_type, start_node_id, id);
+                                    let out_key = format!(
+                                        "_edge:out:{}:{}:{}:{}",
+                                        start_node_id, rel_type, end_node_id, id
+                                    );
+                                    let in_key = format!(
+                                        "_edge:in:{}:{}:{}:{}",
+                                        end_node_id, rel_type, start_node_id, id
+                                    );
 
                                     for key in [out_key, in_key] {
                                         if let Some(edge_entry) = db.get(&key) {
@@ -810,13 +851,27 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                                             drop(edge_entry);
                                             let mut edge_vc = edge_vc_arc.write().await;
                                             if let Some(edge_latest_version) = edge_vc.last_mut() {
-                                                if let DbValue::JsonB(bytes) = &edge_latest_version.value {
-                                                    if let Ok(mut props) = serde_json::from_slice::<serde_json::Value>(bytes) {
-                                                        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&value) {
-                                                            if let Some(obj) = props.as_object_mut() {
+                                                if let DbValue::JsonB(bytes) =
+                                                    &edge_latest_version.value
+                                                {
+                                                    if let Ok(mut props) =
+                                                        serde_json::from_slice::<serde_json::Value>(
+                                                            bytes,
+                                                        )
+                                                    {
+                                                        if let Ok(val) = serde_json::from_slice::<
+                                                            serde_json::Value,
+                                                        >(
+                                                            &value
+                                                        ) {
+                                                            if let Some(obj) = props.as_object_mut()
+                                                            {
                                                                 obj.insert(property.clone(), val);
-                                                                if let Ok(new_bytes) = serde_json::to_vec(&props) {
-                                                                    edge_latest_version.value = DbValue::JsonB(new_bytes);
+                                                                if let Ok(new_bytes) =
+                                                                    serde_json::to_vec(&props)
+                                                                {
+                                                                    edge_latest_version.value =
+                                                                        DbValue::JsonB(new_bytes);
                                                                 }
                                                             }
                                                         }
@@ -847,11 +902,16 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                                     let mut node_vc = node_vc_arc.write().await;
                                     if let Some(node_latest_version) = node_vc.last_mut() {
                                         if let DbValue::JsonB(bytes) = &node_latest_version.value {
-                                            if let Ok(mut props) = serde_json::from_slice::<serde_json::Value>(bytes) {
+                                            if let Ok(mut props) =
+                                                serde_json::from_slice::<serde_json::Value>(bytes)
+                                            {
                                                 if let Some(obj) = props.as_object_mut() {
                                                     obj.remove(&property);
-                                                    if let Ok(new_bytes) = serde_json::to_vec(&props) {
-                                                        node_latest_version.value = DbValue::JsonB(new_bytes);
+                                                    if let Ok(new_bytes) =
+                                                        serde_json::to_vec(&props)
+                                                    {
+                                                        node_latest_version.value =
+                                                            DbValue::JsonB(new_bytes);
                                                     }
                                                 }
                                             }
@@ -877,8 +937,14 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                                     let start_node_id = parts[0];
                                     let rel_type = parts[1];
                                     let end_node_id = parts[2];
-                                    let out_key = format!("_edge:out:{}:{}:{}:{}", start_node_id, rel_type, end_node_id, id);
-                                    let in_key = format!("_edge:in:{}:{}:{}:{}", end_node_id, rel_type, start_node_id, id);
+                                    let out_key = format!(
+                                        "_edge:out:{}:{}:{}:{}",
+                                        start_node_id, rel_type, end_node_id, id
+                                    );
+                                    let in_key = format!(
+                                        "_edge:in:{}:{}:{}:{}",
+                                        end_node_id, rel_type, start_node_id, id
+                                    );
 
                                     for key in [out_key, in_key] {
                                         if let Some(edge_entry) = db.get(&key) {
@@ -886,12 +952,21 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                                             drop(edge_entry);
                                             let mut edge_vc = edge_vc_arc.write().await;
                                             if let Some(edge_latest_version) = edge_vc.last_mut() {
-                                                if let DbValue::JsonB(bytes) = &edge_latest_version.value {
-                                                    if let Ok(mut props) = serde_json::from_slice::<serde_json::Value>(bytes) {
+                                                if let DbValue::JsonB(bytes) =
+                                                    &edge_latest_version.value
+                                                {
+                                                    if let Ok(mut props) =
+                                                        serde_json::from_slice::<serde_json::Value>(
+                                                            bytes,
+                                                        )
+                                                    {
                                                         if let Some(obj) = props.as_object_mut() {
                                                             obj.remove(&property);
-                                                            if let Ok(new_bytes) = serde_json::to_vec(&props) {
-                                                                edge_latest_version.value = DbValue::JsonB(new_bytes);
+                                                            if let Ok(new_bytes) =
+                                                                serde_json::to_vec(&props)
+                                                            {
+                                                                edge_latest_version.value =
+                                                                    DbValue::JsonB(new_bytes);
                                                             }
                                                         }
                                                     }
@@ -905,9 +980,21 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                     }
                 }
             }
-            LogEntry::AddRelationship { id, start_node_id, end_node_id, rel_type, properties } => {
-                let out_key = format!("_edge:out:{}:{}:{}:{}", start_node_id, rel_type, end_node_id, id);
-                let in_key = format!("_edge:in:{}:{}:{}:{}", end_node_id, rel_type, start_node_id, id);
+            LogEntry::AddRelationship {
+                id,
+                start_node_id,
+                end_node_id,
+                rel_type,
+                properties,
+            } => {
+                let out_key = format!(
+                    "_edge:out:{}:{}:{}:{}",
+                    start_node_id, rel_type, end_node_id, id
+                );
+                let in_key = format!(
+                    "_edge:in:{}:{}:{}:{}",
+                    end_node_id, rel_type, start_node_id, id
+                );
                 let pk_key = format!("_pk_rel:{}", id);
                 let pk_val = format!("{}:{}:{}", start_node_id, rel_type, end_node_id);
 
@@ -940,8 +1027,14 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                                     let start_node_id = parts[0];
                                     let rel_type = parts[1];
                                     let end_node_id = parts[2];
-                                    let out_key = format!("_edge:out:{}:{}:{}:{}", start_node_id, rel_type, end_node_id, id);
-                                    let in_key = format!("_edge:in:{}:{}:{}:{}", end_node_id, rel_type, start_node_id, id);
+                                    let out_key = format!(
+                                        "_edge:out:{}:{}:{}:{}",
+                                        start_node_id, rel_type, end_node_id, id
+                                    );
+                                    let in_key = format!(
+                                        "_edge:in:{}:{}:{}:{}",
+                                        end_node_id, rel_type, start_node_id, id
+                                    );
                                     db.remove(&out_key);
                                     db.remove(&in_key);
                                 }

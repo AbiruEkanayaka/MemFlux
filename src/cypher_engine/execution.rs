@@ -3,13 +3,18 @@ use crate::cypher_engine::physical_plan::PhysicalPlan;
 use crate::storage_executor::get_visible_db_value;
 use crate::transaction::TransactionHandle;
 use crate::types::{AppContext, DbValue};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_stream::try_stream;
 use futures::stream::{Stream, StreamExt, TryStreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
-async fn evaluate_expression(expr: &ast::Expression, row: &Row, ctx: Arc<AppContext>, transaction_handle: TransactionHandle) -> Result<Value> {
+async fn evaluate_expression(
+    expr: &ast::Expression,
+    row: &Row,
+    ctx: Arc<AppContext>,
+    transaction_handle: TransactionHandle,
+) -> Result<Value> {
     match expr {
         ast::Expression::Literal(lit) => match lit {
             ast::LiteralValue::String(s) => Ok(Value::String(s.clone())),
@@ -24,14 +29,27 @@ async fn evaluate_expression(expr: &ast::Expression, row: &Row, ctx: Arc<AppCont
         ast::Expression::Map(props) => {
             let mut map = serde_json::Map::new();
             for (key, value_expr) in props {
-                let value = Box::pin(evaluate_expression(value_expr, row, ctx.clone(), transaction_handle.clone())).await?;
+                let value = Box::pin(evaluate_expression(
+                    value_expr,
+                    row,
+                    ctx.clone(),
+                    transaction_handle.clone(),
+                ))
+                .await?;
                 map.insert(key.clone(), value);
             }
             Ok(Value::Object(map))
         }
         ast::Expression::BinaryOp { left, op, right } => {
-            let left_val = Box::pin(evaluate_expression(left, row, ctx.clone(), transaction_handle.clone())).await?;
-            let right_val = Box::pin(evaluate_expression(right, row, ctx, transaction_handle)).await?;
+            let left_val = Box::pin(evaluate_expression(
+                left,
+                row,
+                ctx.clone(),
+                transaction_handle.clone(),
+            ))
+            .await?;
+            let right_val =
+                Box::pin(evaluate_expression(right, row, ctx, transaction_handle)).await?;
             match op.as_str() {
                 "=" => Ok(json!(left_val == right_val)),
                 _ => Err(anyhow!("Unsupported operator: {}", op)),
@@ -40,12 +58,22 @@ async fn evaluate_expression(expr: &ast::Expression, row: &Row, ctx: Arc<AppCont
         ast::Expression::FunctionCall { func, args } => {
             let mut evaluated_args = Vec::new();
             for arg in args {
-                evaluated_args.push(Box::pin(evaluate_expression(arg, row, ctx.clone(), transaction_handle.clone())).await?);
+                evaluated_args.push(
+                    Box::pin(evaluate_expression(
+                        arg,
+                        row,
+                        ctx.clone(),
+                        transaction_handle.clone(),
+                    ))
+                    .await?,
+                );
             }
 
             match func.to_lowercase().as_str() {
                 "id" => {
-                    if evaluated_args.len() != 1 { return Err(anyhow!("id() expects 1 argument")); }
+                    if evaluated_args.len() != 1 {
+                        return Err(anyhow!("id() expects 1 argument"));
+                    }
                     let entity = &evaluated_args[0];
                     if let Some(id) = entity.get("_id").and_then(|v| v.as_str()) {
                         Ok(json!(id))
@@ -54,7 +82,9 @@ async fn evaluate_expression(expr: &ast::Expression, row: &Row, ctx: Arc<AppCont
                     }
                 }
                 "labels" => {
-                    if evaluated_args.len() != 1 { return Err(anyhow!("labels() expects 1 argument")); }
+                    if evaluated_args.len() != 1 {
+                        return Err(anyhow!("labels() expects 1 argument"));
+                    }
                     let entity = &evaluated_args[0];
                     if let Some(label) = entity.get("_label").and_then(|v| v.as_str()) {
                         Ok(json!([label]))
@@ -63,7 +93,9 @@ async fn evaluate_expression(expr: &ast::Expression, row: &Row, ctx: Arc<AppCont
                     }
                 }
                 "type" => {
-                    if evaluated_args.len() != 1 { return Err(anyhow!("type() expects 1 argument")); }
+                    if evaluated_args.len() != 1 {
+                        return Err(anyhow!("type() expects 1 argument"));
+                    }
                     let entity = &evaluated_args[0];
                     if let Some(rel_type) = entity.get("_type").and_then(|v| v.as_str()) {
                         Ok(json!(rel_type))
@@ -72,7 +104,9 @@ async fn evaluate_expression(expr: &ast::Expression, row: &Row, ctx: Arc<AppCont
                     }
                 }
                 "properties" => {
-                    if evaluated_args.len() != 1 { return Err(anyhow!("properties() expects 1 argument")); }
+                    if evaluated_args.len() != 1 {
+                        return Err(anyhow!("properties() expects 1 argument"));
+                    }
                     let entity = &evaluated_args[0];
                     if let Some(obj) = entity.as_object() {
                         let mut new_obj = obj.clone();
@@ -83,7 +117,9 @@ async fn evaluate_expression(expr: &ast::Expression, row: &Row, ctx: Arc<AppCont
                     }
                 }
                 "size" => {
-                    if evaluated_args.len() != 1 { return Err(anyhow!("size() expects 1 argument")); }
+                    if evaluated_args.len() != 1 {
+                        return Err(anyhow!("size() expects 1 argument"));
+                    }
                     let arg = &evaluated_args[0];
                     if let Some(s) = arg.as_str() {
                         Ok(json!(s.len() as i64))
@@ -98,18 +134,66 @@ async fn evaluate_expression(expr: &ast::Expression, row: &Row, ctx: Arc<AppCont
         }
         ast::Expression::ShortestPath(pattern) => {
             // 1. Extract start and end node variables from the pattern.
-            let start_node_pattern = pattern.parts.get(0).and_then(|p| if let ast::PatternPart::Node(n) = p { Some(n) } else { None }).ok_or_else(|| anyhow!("shortestPath pattern must start with a node"))?;
-            let end_node_pattern = pattern.parts.get(2).and_then(|p| if let ast::PatternPart::Node(n) = p { Some(n) } else { None }).ok_or_else(|| anyhow!("shortestPath pattern must have an end node"))?;
-            let rel_pattern = pattern.parts.get(1).and_then(|p| if let ast::PatternPart::Relationship(r) = p { Some(r) } else { None }).ok_or_else(|| anyhow!("shortestPath pattern must have a relationship"))?;
+            let start_node_pattern = pattern
+                .parts
+                .get(0)
+                .and_then(|p| {
+                    if let ast::PatternPart::Node(n) = p {
+                        Some(n)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| anyhow!("shortestPath pattern must start with a node"))?;
+            let end_node_pattern = pattern
+                .parts
+                .get(2)
+                .and_then(|p| {
+                    if let ast::PatternPart::Node(n) = p {
+                        Some(n)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| anyhow!("shortestPath pattern must have an end node"))?;
+            let rel_pattern = pattern
+                .parts
+                .get(1)
+                .and_then(|p| {
+                    if let ast::PatternPart::Relationship(r) = p {
+                        Some(r)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| anyhow!("shortestPath pattern must have a relationship"))?;
 
-            let start_var = start_node_pattern.variable.as_ref().ok_or_else(|| anyhow!("shortestPath start node must be a bound variable"))?;
-            let end_var = end_node_pattern.variable.as_ref().ok_or_else(|| anyhow!("shortestPath end node must be a bound variable"))?;
+            let start_var = start_node_pattern
+                .variable
+                .as_ref()
+                .ok_or_else(|| anyhow!("shortestPath start node must be a bound variable"))?;
+            let end_var = end_node_pattern
+                .variable
+                .as_ref()
+                .ok_or_else(|| anyhow!("shortestPath end node must be a bound variable"))?;
 
             // 2. Get node IDs from the current row context.
-            let start_node_obj = row.get(start_var).ok_or_else(|| anyhow!("Start node variable '{}' not found in row", start_var))?;
-            let end_node_obj = row.get(end_var).ok_or_else(|| anyhow!("End node variable '{}' not found in row", end_var))?;
-            let start_id = start_node_obj.get("_id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("Start node ID not found"))?.to_string();
-            let end_id = end_node_obj.get("_id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("End node ID not found"))?.to_string();
+            let start_node_obj = row
+                .get(start_var)
+                .ok_or_else(|| anyhow!("Start node variable '{}' not found in row", start_var))?;
+            let end_node_obj = row
+                .get(end_var)
+                .ok_or_else(|| anyhow!("End node variable '{}' not found in row", end_var))?;
+            let start_id = start_node_obj
+                .get("_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("Start node ID not found"))?
+                .to_string();
+            let end_id = end_node_obj
+                .get("_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("End node ID not found"))?
+                .to_string();
 
             if start_id == end_id {
                 return Ok(json!([start_node_obj]));
@@ -119,7 +203,8 @@ async fn evaluate_expression(expr: &ast::Expression, row: &Row, ctx: Arc<AppCont
             let mut q: std::collections::VecDeque<String> = std::collections::VecDeque::new();
             q.push_back(start_id.clone());
 
-            let mut predecessors: std::collections::HashMap<String, (String, Value)> = std::collections::HashMap::new();
+            let mut predecessors: std::collections::HashMap<String, (String, Value)> =
+                std::collections::HashMap::new();
             let mut visited = std::collections::HashSet::new();
             visited.insert(start_id.clone());
 
@@ -144,7 +229,9 @@ async fn evaluate_expression(expr: &ast::Expression, row: &Row, ctx: Arc<AppCont
                 for entry in ctx.db.iter() {
                     if entry.key().starts_with(&out_prefix_base) {
                         let parts: Vec<&str> = entry.key().split(':').collect();
-                        if parts.len() < 6 { continue; } // _edge:out:start_id:type:end_id:rel_id
+                        if parts.len() < 6 {
+                            continue;
+                        } // _edge:out:start_id:type:end_id:rel_id
 
                         let rel_type_in_db = parts[3]; // The actual relationship type in the DB
 
@@ -154,14 +241,20 @@ async fn evaluate_expression(expr: &ast::Expression, row: &Row, ctx: Arc<AppCont
 
                             if !visited.contains(&neighbor_id) {
                                 visited.insert(neighbor_id.clone());
-                                if let Some(DbValue::JsonB(rel_bytes)) = get_visible_db_value(entry.key(), &ctx, tx_opt).await {
-                                    let mut rel_props = serde_json::from_slice::<Value>(&rel_bytes)?;
+                                if let Some(DbValue::JsonB(rel_bytes)) =
+                                    get_visible_db_value(entry.key(), &ctx, tx_opt).await
+                                {
+                                    let mut rel_props =
+                                        serde_json::from_slice::<Value>(&rel_bytes)?;
                                     if let Some(obj) = rel_props.as_object_mut() {
                                         obj.insert("_start_id".to_string(), json!(current_node_id));
                                         obj.insert("_end_id".to_string(), json!(neighbor_id));
                                     }
 
-                                    predecessors.insert(neighbor_id.clone(), (current_node_id.clone(), rel_props));
+                                    predecessors.insert(
+                                        neighbor_id.clone(),
+                                        (current_node_id.clone(), rel_props),
+                                    );
                                     q.push_back(neighbor_id);
                                 }
                             }
@@ -176,13 +269,35 @@ async fn evaluate_expression(expr: &ast::Expression, row: &Row, ctx: Arc<AppCont
                 let mut current_id = end_id;
 
                 while current_id != start_id {
-                    let (predecessor_id, rel_obj) = predecessors.get(&current_id).ok_or_else(|| anyhow!("Path reconstruction failed"))?;
-                    
+                    let (predecessor_id, rel_obj) = predecessors
+                        .get(&current_id)
+                        .ok_or_else(|| anyhow!("Path reconstruction failed"))?;
+
                     // Fetch the node object for the current ID
                     let pk_key = format!("_pk_node:{}", current_id);
-                    let label = String::from_utf8(get_visible_db_value(&pk_key, &ctx, tx_opt).await.and_then(|v| if let DbValue::Bytes(b) = v { Some(b) } else { None }).unwrap_or_default())?;
+                    let label = String::from_utf8(
+                        get_visible_db_value(&pk_key, &ctx, tx_opt)
+                            .await
+                            .and_then(|v| {
+                                if let DbValue::Bytes(b) = v {
+                                    Some(b)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_default(),
+                    )?;
                     let node_key = format!("_node:{}:{}", label, current_id);
-                    let node_bytes = get_visible_db_value(&node_key, &ctx, tx_opt).await.and_then(|v| if let DbValue::JsonB(b) = v { Some(b) } else { None }).unwrap_or_default();
+                    let node_bytes = get_visible_db_value(&node_key, &ctx, tx_opt)
+                        .await
+                        .and_then(|v| {
+                            if let DbValue::JsonB(b) = v {
+                                Some(b)
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default();
                     let mut node_obj = serde_json::from_slice::<Value>(&node_bytes)?;
                     if let Some(obj) = node_obj.as_object_mut() {
                         obj.insert("_id".to_string(), json!(current_id));
@@ -191,7 +306,7 @@ async fn evaluate_expression(expr: &ast::Expression, row: &Row, ctx: Arc<AppCont
 
                     path.push_front(node_obj);
                     path.push_front(rel_obj.clone());
-                    
+
                     current_id = predecessor_id.clone();
                 }
                 path.push_front(start_node_obj.clone());
@@ -204,13 +319,22 @@ async fn evaluate_expression(expr: &ast::Expression, row: &Row, ctx: Arc<AppCont
 }
 
 fn compare_cypher_values(val_a: &Value, val_b: &Value) -> std::cmp::Ordering {
-    if val_a.is_null() && val_b.is_null() { return std::cmp::Ordering::Equal; }
-    if val_a.is_null() { return std::cmp::Ordering::Less; } // NULLS FIRST
-    if val_b.is_null() { return std::cmp::Ordering::Greater; }
+    if val_a.is_null() && val_b.is_null() {
+        return std::cmp::Ordering::Equal;
+    }
+    if val_a.is_null() {
+        return std::cmp::Ordering::Less;
+    } // NULLS FIRST
+    if val_b.is_null() {
+        return std::cmp::Ordering::Greater;
+    }
 
     match (val_a, val_b) {
-        (Value::Number(n_a), Value::Number(n_b)) =>
-            n_a.as_f64().unwrap_or(f64::NAN).partial_cmp(&n_b.as_f64().unwrap_or(f64::NAN)).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Number(n_a), Value::Number(n_b)) => n_a
+            .as_f64()
+            .unwrap_or(f64::NAN)
+            .partial_cmp(&n_b.as_f64().unwrap_or(f64::NAN))
+            .unwrap_or(std::cmp::Ordering::Equal),
         (Value::String(s_a), Value::String(s_b)) => s_a.cmp(s_b),
         (Value::Bool(b_a), Value::Bool(b_b)) => b_a.cmp(b_b),
         _ => val_a.to_string().cmp(&val_b.to_string()),
@@ -857,7 +981,7 @@ pub fn execute<'a>(
                             if let ast::Expression::Variable(var_name) = &**var_expr {
                                 let entity_val = row.get(var_name).ok_or_else(|| anyhow!("Variable '{}' not found for SET", var_name))?;
                                 let entity_id = entity_val.get("_id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("Entity ID not found for variable '{}'", var_name))?;
-                                
+
                                 let value_to_set = evaluate_expression(&item.expression, &row, ctx.clone(), transaction_handle.clone()).await?;
                                 let value_bytes = serde_json::to_vec(&value_to_set)?;
 
@@ -926,7 +1050,7 @@ pub fn execute<'a>(
                         if let ast::Expression::Variable(var_name) = expr {
                             let node_val = row.get(var_name).ok_or_else(|| anyhow!("Variable '{}' not found for DELETE", var_name))?;
                             let node_id = node_val.get("_id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("Node ID not found for variable '{}'", var_name))?;
-                            
+
                             if detach {
                                 // Find and delete all relationships connected to this node
                                 let out_prefix = format!("_edge:out:{}:", node_id);
@@ -934,7 +1058,7 @@ pub fn execute<'a>(
 
                                 let mut rel_ids_to_delete = Vec::new();
 
-                                { 
+                                {
                                     let tx_guard = transaction_handle.read().await;
                                     let tx_ref = tx_guard.as_ref();
 
@@ -967,7 +1091,7 @@ pub fn execute<'a>(
                                         }
                                     }
                                 }
-                                
+
                                 for rel_id in rel_ids_to_delete {
                                     let response = storage_executor.graph_delete(rel_id).await;
                                     if let crate::types::Response::Error(e) = response {

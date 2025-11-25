@@ -1,5 +1,5 @@
 pub mod ffi;
-use anyhow::{Result};
+use anyhow::Result;
 use dashmap::DashMap;
 use futures::{Stream, StreamExt};
 use serde_json::Value;
@@ -16,8 +16,8 @@ pub mod memory;
 pub mod persistence;
 pub mod protocol;
 pub mod query_engine;
-pub mod storage_executor;
 pub mod schema;
+pub mod storage_executor;
 pub mod transaction;
 pub mod types;
 pub mod vacuum;
@@ -26,16 +26,17 @@ pub mod vacuum;
 use crate::config::Config;
 use crate::indexing::IndexManager;
 use crate::memory::MemoryManager;
-use crate::persistence::{load_db_from_disk, PersistenceEngine};
+use crate::persistence::{PersistenceEngine, load_db_from_disk};
 use crate::query_engine::functions;
-use crate::schema::{load_schemas_from_db, VIEW_PREFIX, VirtualSchema, ColumnDefinition, DataType, SchemaSource};
+use crate::schema::{
+    ColumnDefinition, DataType, SchemaSource, VIEW_PREFIX, VirtualSchema, load_schemas_from_db,
+};
 use crate::transaction::TransactionHandle;
 use crate::types::{
-    AppContext, Db, FunctionRegistry, PersistenceRequest, TransactionIdManager,
-    TransactionStatusManager, ViewCache, ViewDefinition, DbValue, SchemaCache,
+    AppContext, Db, DbValue, FunctionRegistry, PersistenceRequest, SchemaCache,
+    TransactionIdManager, TransactionStatusManager, ViewCache, ViewDefinition,
 };
 use std::collections::{BTreeMap, HashSet};
-
 
 /// The main database instance, providing the primary API for interaction.
 pub struct MemFluxDB {
@@ -97,18 +98,24 @@ impl MemFluxDB {
         };
 
         let schema_cache = Arc::new(DashMap::new());
-        if let Err(e) = load_schemas_from_db(&db, &schema_cache, &tx_status_manager, &tx_id_manager).await {
+        if let Err(e) =
+            load_schemas_from_db(&db, &schema_cache, &tx_status_manager, &tx_id_manager).await
+        {
             eprintln!("Warning: Could not load virtual schemas: {}.", e);
         } else if !schema_cache.is_empty() {
             println!("Loaded {} virtual schemas.", schema_cache.len());
         }
 
-        if let Err(e) = load_graph_schemas_from_db(&db, &schema_cache, &tx_status_manager, &tx_id_manager).await {
+        if let Err(e) =
+            load_graph_schemas_from_db(&db, &schema_cache, &tx_status_manager, &tx_id_manager).await
+        {
             eprintln!("Warning: Could not load graph virtual schemas: {}.", e);
         }
 
         let view_cache = Arc::new(DashMap::new());
-        if let Err(e) = load_views_from_db(&db, &view_cache, &tx_status_manager, &tx_id_manager).await {
+        if let Err(e) =
+            load_views_from_db(&db, &view_cache, &tx_status_manager, &tx_id_manager).await
+        {
             eprintln!("Warning: Could not load views: {}.", e);
         } else if !view_cache.is_empty() {
             println!("Loaded {} views.", view_cache.len());
@@ -269,7 +276,7 @@ impl MemFluxDB {
         cypher: &'a str,
         transaction_handle: TransactionHandle,
     ) -> impl Stream<Item = Result<Value>> + Send + 'a {
-        use cypher_engine::{parser, logical_plan, physical_plan, execution};
+        use cypher_engine::{execution, logical_plan, parser, physical_plan};
 
         async_stream::try_stream! {
             let plan_result = (|| {
@@ -339,14 +346,16 @@ impl MemFluxDB {
                 while let Some(result) = stream.next().await {
                     match result {
                         Ok(value) => {
-                            if let Some(count) = value.get("rows_affected").and_then(|v| v.as_i64()) {
+                            if let Some(count) = value.get("rows_affected").and_then(|v| v.as_i64())
+                            {
                                 final_response = types::Response::Integer(count);
                             } else {
                                 final_response = types::Response::Ok; // Or some other success indicator
                             }
                         }
                         Err(e) => {
-                            encountered_error = Some(types::Response::Error(format!("Execution Error: {}", e)));
+                            encountered_error =
+                                Some(types::Response::Error(format!("Execution Error: {}", e)));
                             break; // Stop processing on first error
                         }
                     }
@@ -450,7 +459,11 @@ pub async fn load_graph_schemas_from_db(
         if key.starts_with("_pk_node:") {
             if let Some(version_chain_lock) = db.get(&key) {
                 let version_chain = version_chain_lock.read().await;
-                if let Some(version) = version_chain.iter().rev().find(|v| startup_snapshot.is_visible(v, tx_status_manager)) {
+                if let Some(version) = version_chain
+                    .iter()
+                    .rev()
+                    .find(|v| startup_snapshot.is_visible(v, tx_status_manager))
+                {
                     if let DbValue::Bytes(label_bytes) = &version.value {
                         if let Ok(label) = String::from_utf8(label_bytes.clone()) {
                             node_labels.insert(label);
@@ -459,10 +472,10 @@ pub async fn load_graph_schemas_from_db(
                 }
             }
         } else if key.starts_with("_edge:out:") {
-             let parts: Vec<&str> = key.split(':').collect();
-             if parts.len() >= 4 {
-                 rel_types.insert(parts[3].to_string());
-             }
+            let parts: Vec<&str> = key.split(':').collect();
+            if parts.len() >= 4 {
+                rel_types.insert(parts[3].to_string());
+            }
         }
     }
 
@@ -471,18 +484,24 @@ pub async fn load_graph_schemas_from_db(
             continue; // Don't overwrite native schemas
         }
         let mut columns = BTreeMap::new();
-        columns.insert("_id".to_string(), ColumnDefinition {
-            data_type: DataType::Text,
-            nullable: false,
-            default: None,
-        });
+        columns.insert(
+            "_id".to_string(),
+            ColumnDefinition {
+                data_type: DataType::Text,
+                nullable: false,
+                default: None,
+            },
+        );
         // All node properties are treated as JSONB for now. We can infer this later.
         // A generic 'properties' column is a good start.
-        columns.insert("properties".to_string(), ColumnDefinition {
-            data_type: DataType::JsonB,
-            nullable: true,
-            default: None,
-        });
+        columns.insert(
+            "properties".to_string(),
+            ColumnDefinition {
+                data_type: DataType::JsonB,
+                nullable: true,
+                default: None,
+            },
+        );
 
         let schema = VirtualSchema {
             table_name: label.clone(),
@@ -500,35 +519,55 @@ pub async fn load_graph_schemas_from_db(
             continue; // Don't overwrite
         }
         let mut columns = BTreeMap::new();
-        columns.insert("_id".to_string(), ColumnDefinition {
-            data_type: DataType::Text,
-            nullable: false,
-            default: None,
-        });
-        columns.insert("_from_id".to_string(), ColumnDefinition {
-            data_type: DataType::Text,
-            nullable: false,
-            default: None,
-        });
-        columns.insert("_to_id".to_string(), ColumnDefinition {
-            data_type: DataType::Text,
-            nullable: false,
-            default: None,
-        });
-        columns.insert("properties".to_string(), ColumnDefinition {
-            data_type: DataType::JsonB,
-            nullable: true,
-            default: None,
-        });
+        columns.insert(
+            "_id".to_string(),
+            ColumnDefinition {
+                data_type: DataType::Text,
+                nullable: false,
+                default: None,
+            },
+        );
+        columns.insert(
+            "_from_id".to_string(),
+            ColumnDefinition {
+                data_type: DataType::Text,
+                nullable: false,
+                default: None,
+            },
+        );
+        columns.insert(
+            "_to_id".to_string(),
+            ColumnDefinition {
+                data_type: DataType::Text,
+                nullable: false,
+                default: None,
+            },
+        );
+        columns.insert(
+            "properties".to_string(),
+            ColumnDefinition {
+                data_type: DataType::JsonB,
+                nullable: true,
+                default: None,
+            },
+        );
 
         let schema = VirtualSchema {
             table_name: rel_type.clone(),
             columns,
-            column_order: vec!["_id".to_string(), "_from_id".to_string(), "_to_id".to_string(), "properties".to_string()],
+            column_order: vec![
+                "_id".to_string(),
+                "_from_id".to_string(),
+                "_to_id".to_string(),
+                "properties".to_string(),
+            ],
             constraints: vec![],
             source: SchemaSource::GraphRelationship,
         };
-        println!("Registering virtual table for graph relationship type: {}", rel_type);
+        println!(
+            "Registering virtual table for graph relationship type: {}",
+            rel_type
+        );
         schema_cache.insert(rel_type, Arc::new(schema));
     }
 

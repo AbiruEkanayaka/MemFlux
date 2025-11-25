@@ -137,7 +137,6 @@ fn default_true() -> bool {
     true
 }
 
-
 impl Default for Config {
     fn default() -> Self {
         Self {

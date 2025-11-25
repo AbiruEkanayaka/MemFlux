@@ -37,9 +37,9 @@ impl<K: Eq + Hash + Clone> ArcCache<K> {
 
     pub fn prime(&mut self, keys: Vec<K>) {
         for key in keys.into_iter().take(self.capacity) {
-             self.t1.push_front(key.clone());
-             self.t1_keys.insert(key);
-         }
+            self.t1.push_front(key.clone());
+            self.t1_keys.insert(key);
+        }
     }
 
     fn remove_from_deque(deque: &mut VecDeque<K>, key: &K) -> Option<K> {
@@ -68,8 +68,8 @@ impl<K: Eq + Hash + Clone> ArcCache<K> {
 
         // Case 2: Miss, check ghost lists
         if self.b1_keys.contains(key) {
-                        let delta = if self.b1.len() >= self.b2.len() { 
-                1 
+            let delta = if self.b1.len() >= self.b2.len() {
+                1
             } else if self.b1.len() == 0 {
                 1
             } else {
@@ -85,8 +85,8 @@ impl<K: Eq + Hash + Clone> ArcCache<K> {
         }
 
         if self.b2_keys.contains(key) {
-                        let delta = if self.b2.len() >= self.b1.len() { 
-                1 
+            let delta = if self.b2.len() >= self.b1.len() {
+                1
             } else if self.b2.len() == 0 {
                 1
             } else {

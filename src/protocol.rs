@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
 use crate::types::Command;
@@ -37,12 +37,3 @@ where
     .to_uppercase();
     Ok(Some(Command { name, args }))
 }
-
-
-
-
-
-
-
-
-

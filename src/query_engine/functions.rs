@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Datelike, Local, Timelike};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub fn register_string_functions(registry: &mut crate::types::FunctionRegistry) {
     registry.register("LOWER", Box::new(lower));
@@ -29,11 +29,28 @@ fn compare_values(op: &str, left: &Value, right: &Value) -> Result<bool> {
     match op {
         "=" | "!=" => {
             let eq = match (left, right) {
-                (Value::Number(l), Value::Number(r)) => (l.as_f64().unwrap_or(f64::NAN) - r.as_f64().unwrap_or(f64::NAN)).abs() < f64::EPSILON,
-                (Value::Number(l), Value::String(rs)) => rs.parse::<f64>().ok().map(|r| (l.as_f64().unwrap_or(f64::NAN) - r).abs() < f64::EPSILON).unwrap_or(left == right),
-                (Value::String(ls), Value::Number(r)) => ls.parse::<f64>().ok().map(|l| (l - r.as_f64().unwrap_or(f64::NAN)).abs() < f64::EPSILON).unwrap_or(left == right),
+                (Value::Number(l), Value::Number(r)) => {
+                    (l.as_f64().unwrap_or(f64::NAN) - r.as_f64().unwrap_or(f64::NAN)).abs()
+                        < f64::EPSILON
+                }
+                (Value::Number(l), Value::String(rs)) => rs
+                    .parse::<f64>()
+                    .ok()
+                    .map(|r| (l.as_f64().unwrap_or(f64::NAN) - r).abs() < f64::EPSILON)
+                    .unwrap_or(left == right),
+                (Value::String(ls), Value::Number(r)) => ls
+                    .parse::<f64>()
+                    .ok()
+                    .map(|l| (l - r.as_f64().unwrap_or(f64::NAN)).abs() < f64::EPSILON)
+                    .unwrap_or(left == right),
                 (Value::String(ls), Value::String(rs)) => {
-                    if ls == rs { true } else if let (Ok(lf), Ok(rf)) = (ls.parse::<f64>(), rs.parse::<f64>()) { (lf - rf).abs() < f64::EPSILON } else { false }
+                    if ls == rs {
+                        true
+                    } else if let (Ok(lf), Ok(rf)) = (ls.parse::<f64>(), rs.parse::<f64>()) {
+                        (lf - rf).abs() < f64::EPSILON
+                    } else {
+                        false
+                    }
                 }
                 _ => left == right,
             };
@@ -67,7 +84,13 @@ fn handle_any_all(op: &str, quantifier: &str, args: Vec<Value>) -> Result<Value>
     let left_val = &args[0];
     let subquery_result = match &args[1] {
         Value::Array(arr) => arr,
-        _ => return Err(anyhow!("Second argument to {} {} must be an array (subquery result)", op, quantifier)),
+        _ => {
+            return Err(anyhow!(
+                "Second argument to {} {} must be an array (subquery result)",
+                op,
+                quantifier
+            ));
+        }
     };
 
     if subquery_result.is_empty() {
@@ -98,7 +121,11 @@ fn handle_any_all(op: &str, quantifier: &str, args: Vec<Value>) -> Result<Value>
                     Value::Null
                 }
             } else {
-                return Err(anyhow!("Subquery for {} {} must return exactly one column", op, quantifier));
+                return Err(anyhow!(
+                    "Subquery for {} {} must return exactly one column",
+                    op,
+                    quantifier
+                ));
             }
         } else {
             // Direct value
@@ -141,19 +168,43 @@ fn handle_any_all(op: &str, quantifier: &str, args: Vec<Value>) -> Result<Value>
     }
 }
 
-fn eq_any(args: Vec<Value>) -> Result<Value> { handle_any_all("=", "ANY", args) }
-fn ne_any(args: Vec<Value>) -> Result<Value> { handle_any_all("!=", "ANY", args) }
-fn gt_any(args: Vec<Value>) -> Result<Value> { handle_any_all(">", "ANY", args) }
-fn lt_any(args: Vec<Value>) -> Result<Value> { handle_any_all("<", "ANY", args) }
-fn ge_any(args: Vec<Value>) -> Result<Value> { handle_any_all(">=", "ANY", args) }
-fn le_any(args: Vec<Value>) -> Result<Value> { handle_any_all("<=", "ANY", args) }
+fn eq_any(args: Vec<Value>) -> Result<Value> {
+    handle_any_all("=", "ANY", args)
+}
+fn ne_any(args: Vec<Value>) -> Result<Value> {
+    handle_any_all("!=", "ANY", args)
+}
+fn gt_any(args: Vec<Value>) -> Result<Value> {
+    handle_any_all(">", "ANY", args)
+}
+fn lt_any(args: Vec<Value>) -> Result<Value> {
+    handle_any_all("<", "ANY", args)
+}
+fn ge_any(args: Vec<Value>) -> Result<Value> {
+    handle_any_all(">=", "ANY", args)
+}
+fn le_any(args: Vec<Value>) -> Result<Value> {
+    handle_any_all("<=", "ANY", args)
+}
 
-fn eq_all(args: Vec<Value>) -> Result<Value> { handle_any_all("=", "ALL", args) }
-fn ne_all(args: Vec<Value>) -> Result<Value> { handle_any_all("!=", "ALL", args) }
-fn gt_all(args: Vec<Value>) -> Result<Value> { handle_any_all(">", "ALL", args) }
-fn lt_all(args: Vec<Value>) -> Result<Value> { handle_any_all("<", "ALL", args) }
-fn ge_all(args: Vec<Value>) -> Result<Value> { handle_any_all(">=", "ALL", args) }
-fn le_all(args: Vec<Value>) -> Result<Value> { handle_any_all("<=", "ALL", args) }
+fn eq_all(args: Vec<Value>) -> Result<Value> {
+    handle_any_all("=", "ALL", args)
+}
+fn ne_all(args: Vec<Value>) -> Result<Value> {
+    handle_any_all("!=", "ALL", args)
+}
+fn gt_all(args: Vec<Value>) -> Result<Value> {
+    handle_any_all(">", "ALL", args)
+}
+fn lt_all(args: Vec<Value>) -> Result<Value> {
+    handle_any_all("<", "ALL", args)
+}
+fn ge_all(args: Vec<Value>) -> Result<Value> {
+    handle_any_all(">=", "ALL", args)
+}
+fn le_all(args: Vec<Value>) -> Result<Value> {
+    handle_any_all("<=", "ALL", args)
+}
 
 // This function will be evaluated in `Expression::FunctionCall`
 fn exists(args: Vec<Value>) -> Result<Value> {
@@ -342,5 +393,3 @@ fn date_part(args: Vec<Value>) -> Result<Value> {
 
     Ok(json!(result))
 }
-
-

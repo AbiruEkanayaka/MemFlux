@@ -1,10 +1,10 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
+use memflux::MemFluxDB;
 use memflux::config::Config;
 use memflux::protocol::parse_command_from_stream;
 use memflux::transaction::TransactionHandle;
 use memflux::types::Response;
-use memflux::MemFluxDB;
 
 use std::fs::File;
 use std::io::BufReader as StdBufReader;
@@ -102,8 +102,8 @@ async fn main() -> Result<()> {
             } else {
                 if let Err(e) = handle_connection(stream, db_clone).await {
                     if e.downcast_ref::<std::io::Error>().map_or(true, |io_err| {
-                                io_err.kind() != std::io::ErrorKind::BrokenPipe
-                            }) {
+                        io_err.kind() != std::io::ErrorKind::BrokenPipe
+                    }) {
                         eprintln!("Connection error from {}: {:?}", peer_addr, e);
                     }
                 }
@@ -132,7 +132,9 @@ where
                                 == db.app_context.config.requirepass
                         {
                             authenticated = true;
-                            writer.write_all(&Response::Ok.into_protocol_format()).await?;
+                            writer
+                                .write_all(&Response::Ok.into_protocol_format())
+                                .await?;
                         } else {
                             let response = Response::Error("Invalid password".to_string());
                             writer.write_all(&response.into_protocol_format()).await?;
@@ -145,7 +147,9 @@ where
                     continue;
                 }
 
-                let response = db.execute_command(command, transaction_handle.clone()).await;
+                let response = db
+                    .execute_command(command, transaction_handle.clone())
+                    .await;
                 writer.write_all(&response.into_protocol_format()).await?;
             }
             Ok(None) => {

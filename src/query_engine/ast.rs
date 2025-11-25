@@ -1,5 +1,4 @@
-
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub enum SimpleValue {
@@ -11,7 +10,10 @@ pub enum SimpleValue {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub enum TableReference {
-    Table { name: String, alias: Option<String> },
+    Table {
+        name: String,
+        alias: Option<String>,
+    },
     Subquery(Box<SelectStatement>, String), // Subquery and its alias
     GraphMatch {
         query: String,
@@ -222,10 +224,19 @@ pub enum AlterTableAction {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TableConstraint {
-    Unique { name: Option<String>, columns: Vec<String> },
-    PrimaryKey { name: Option<String>, columns: Vec<String> },
+    Unique {
+        name: Option<String>,
+        columns: Vec<String>,
+    },
+    PrimaryKey {
+        name: Option<String>,
+        columns: Vec<String>,
+    },
     ForeignKey(ForeignKeyClause),
-    Check { name: Option<String>, expression: SimpleExpression },
+    Check {
+        name: Option<String>,
+        expression: SimpleExpression,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -285,12 +296,3 @@ pub struct UpdateStatement {
     pub where_clause: Option<SimpleExpression>,
     pub returning: Vec<SelectColumn>,
 }
-
-
-
-
-
-
-
-
-

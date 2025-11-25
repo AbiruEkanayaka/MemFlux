@@ -1,6 +1,6 @@
+use crate::MemFluxDB;
 use crate::config::{Config, FFIConfig};
 use crate::types::{Command, Response};
-use crate::MemFluxDB;
 use libc::{c_char, size_t};
 use once_cell::sync::Lazy;
 use std::ffi::{CStr, CString};
@@ -79,7 +79,9 @@ pub extern "C" fn memflux_close(handle: *mut MemFluxDBSharedHandle) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn memflux_cursor_open(handle: *mut MemFluxDBSharedHandle) -> *mut MemFluxCursorHandle {
+pub extern "C" fn memflux_cursor_open(
+    handle: *mut MemFluxDBSharedHandle,
+) -> *mut MemFluxCursorHandle {
     if handle.is_null() {
         return std::ptr::null_mut();
     }
@@ -125,7 +127,7 @@ pub extern "C" fn memflux_exec(
             return Box::into_raw(Box::new(response_to_ffi(err_resp)));
         }
     };
-    
+
     let command_parts: Vec<String> = match shlex::split(command_str) {
         Some(parts) => parts,
         None => {
@@ -140,10 +142,15 @@ pub extern "C" fn memflux_exec(
     }
 
     let command_name = command_parts[0].to_uppercase();
-    let args: Vec<Vec<u8>> = command_parts.iter().map(|s| s.as_bytes().to_vec()).collect();
+    let args: Vec<Vec<u8>> = command_parts
+        .iter()
+        .map(|s| s.as_bytes().to_vec())
+        .collect();
 
-    let command = Command { name: command_name, args };
-
+    let command = Command {
+        name: command_name,
+        args,
+    };
 
     let response = TOKIO_RUNTIME.block_on(db.execute_command(command, transaction_handle));
 

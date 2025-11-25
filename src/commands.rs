@@ -1,6 +1,6 @@
-
-use crate::storage_executor::{get_visible_db_value, json_path_to_pointer, StorageExecutor};
 use crate::config::DurabilityLevel;
+use crate::indexing::Index;
+use crate::storage_executor::{StorageExecutor, get_visible_db_value, json_path_to_pointer};
 use crate::transaction::{Transaction, TransactionHandle};
 use crate::types::*;
 use crate::vacuum;
@@ -9,7 +9,6 @@ use std::collections::HashSet;
 use std::str;
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use crate::indexing::Index;
 
 async fn handle_graph_addnode(
     command: Command,
@@ -17,9 +16,7 @@ async fn handle_graph_addnode(
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() != 3 {
-        return Response::Error(
-            "GRAPH.ADDNODE requires <label> and <properties_json>".to_string(),
-        );
+        return Response::Error("GRAPH.ADDNODE requires <label> and <properties_json>".to_string());
     }
     let label = match String::from_utf8(command.args[1].clone()) {
         Ok(l) => l,
@@ -116,7 +113,9 @@ async fn handle_graph_getrels(
     transaction_handle: TransactionHandle,
 ) -> Response {
     if command.args.len() < 2 || command.args.len() > 4 {
-        return Response::Error("GRAPH.GETRELS requires <node_id> [OUT|IN|BOTH] [type]".to_string());
+        return Response::Error(
+            "GRAPH.GETRELS requires <node_id> [OUT|IN|BOTH] [type]".to_string(),
+        );
     }
     let node_id = match String::from_utf8(command.args[1].clone()) {
         Ok(id) => id,
@@ -244,7 +243,6 @@ async fn handle_graph_setnodeprop(
         .graph_set_node_property(node_id, property, value_json)
         .await
 }
-
 
 async fn handle_row_set(
     command: Command,
@@ -458,7 +456,12 @@ async fn handle_table_create(
         durability: ctx.config.durability.clone(),
     };
 
-    if ctx.logger.send(PersistenceRequest::Log(log_req)).await.is_err() {
+    if ctx
+        .logger
+        .send(PersistenceRequest::Log(log_req))
+        .await
+        .is_err()
+    {
         return Response::Error("Persistence engine is down".to_string());
     }
 
@@ -469,8 +472,10 @@ async fn handle_table_create(
                 creator_txid: 0, // System transaction
                 expirer_txid: 0,
             };
-            ctx.db
-                .insert(schema_key, Arc::new(tokio::sync::RwLock::new(vec![version])));
+            ctx.db.insert(
+                schema_key,
+                Arc::new(tokio::sync::RwLock::new(vec![version])),
+            );
             ctx.schema_cache.insert(table_name, Arc::new(schema));
             Response::Ok
         }
@@ -497,14 +502,20 @@ async fn handle_table_drop(
     }
 
     // Acquire a lock for the table to prevent concurrent operations.
-    let table_lock = ctx.table_locks.entry(table_name.clone()).or_default().clone();
+    let table_lock = ctx
+        .table_locks
+        .entry(table_name.clone())
+        .or_default()
+        .clone();
     let _lock_guard = table_lock.lock().await;
 
     // 1. Collect all keys to delete upfront.
     let schema_key = format!("{}{}", crate::schema::SCHEMA_PREFIX, table_name);
     let data_prefix = format!("{}:", table_name);
-    
-    let mut keys_to_delete: Vec<String> = ctx.db.iter()
+
+    let mut keys_to_delete: Vec<String> = ctx
+        .db
+        .iter()
         .filter(|r| r.key().starts_with(&data_prefix))
         .map(|r| r.key().clone())
         .collect();
@@ -521,7 +532,12 @@ async fn handle_table_drop(
             durability: ctx.config.durability.clone(),
         };
 
-        if ctx.logger.send(PersistenceRequest::Log(log_req)).await.is_err() {
+        if ctx
+            .logger
+            .send(PersistenceRequest::Log(log_req))
+            .await
+            .is_err()
+        {
             return Response::Error("Persistence engine is down".to_string());
         }
         ack_receivers.push(ack_rx);
@@ -532,8 +548,14 @@ async fn handle_table_drop(
     for result in results {
         match result {
             Ok(Ok(())) => { /* WAL write successful */ }
-            Ok(Err(e)) => return Response::Error(format!("WAL write error during DROP TABLE: {}", e)),
-            Err(_) => return Response::Error("Persistence engine dropped ACK channel during DROP TABLE".to_string()),
+            Ok(Err(e)) => {
+                return Response::Error(format!("WAL write error during DROP TABLE: {}", e));
+            }
+            Err(_) => {
+                return Response::Error(
+                    "Persistence engine dropped ACK channel during DROP TABLE".to_string(),
+                );
+            }
         }
     }
 
@@ -545,7 +567,10 @@ async fn handle_table_drop(
     ctx.schema_cache.remove(&table_name);
 
     // The lock is released when _lock_guard goes out of scope.
-    Response::SimpleString(format!("OK. Dropped table and {} associated rows.", deleted_data_count))
+    Response::SimpleString(format!(
+        "OK. Dropped table and {} associated rows.",
+        deleted_data_count
+    ))
 }
 
 async fn handle_table_describe(
@@ -562,12 +587,10 @@ async fn handle_table_describe(
     };
 
     match ctx.schema_cache.get(&table_name) {
-        Some(schema) => {
-            match serde_json::to_vec_pretty(&**schema) {
-                Ok(json_bytes) => Response::Bytes(json_bytes),
-                Err(e) => Response::Error(format!("Failed to serialize schema: {}", e)),
-            }
-        }
+        Some(schema) => match serde_json::to_vec_pretty(&**schema) {
+            Ok(json_bytes) => Response::Bytes(json_bytes),
+            Err(e) => Response::Error(format!("Failed to serialize schema: {}", e)),
+        },
         None => Response::Error(format!("Table '{}' not found", table_name)),
     }
 }
@@ -622,7 +645,9 @@ pub async fn process_command(
         "GRAPH.ADDREL" => handle_graph_addrel(command, ctx.clone(), transaction_handle).await,
         "GRAPH.GETRELS" => handle_graph_getrels(command, ctx.clone(), transaction_handle).await,
         "GRAPH.DELETE" => handle_graph_delete(command, ctx.clone(), transaction_handle).await,
-        "GRAPH.SETNODEPROP" => handle_graph_setnodeprop(command, ctx.clone(), transaction_handle).await,
+        "GRAPH.SETNODEPROP" => {
+            handle_graph_setnodeprop(command, ctx.clone(), transaction_handle).await
+        }
         "ROW.SET" => handle_row_set(command, ctx.clone(), transaction_handle).await,
         "ROW.GET" => handle_row_get(command, ctx.clone(), transaction_handle).await,
         "ROW.DELETE" => handle_row_delete(command, ctx.clone(), transaction_handle).await,
@@ -638,12 +663,21 @@ pub async fn process_command(
 
 async fn handle_refresh_graph_schemas(command: Command, ctx: Arc<AppContext>) -> Response {
     if !ctx.config.requirepass.is_empty() {
-        if command.args.len() < 2 || String::from_utf8_lossy(&command.args[1]) != ctx.config.requirepass {
+        if command.args.len() < 2
+            || String::from_utf8_lossy(&command.args[1]) != ctx.config.requirepass
+        {
             return Response::Error("Unauthorized".to_string());
         }
     }
 
-    if let Err(e) = crate::load_graph_schemas_from_db(&ctx.db, &ctx.schema_cache, &ctx.tx_status_manager, &ctx.tx_id_manager).await {
+    if let Err(e) = crate::load_graph_schemas_from_db(
+        &ctx.db,
+        &ctx.schema_cache,
+        &ctx.tx_status_manager,
+        &ctx.tx_id_manager,
+    )
+    .await
+    {
         return Response::Error(format!("Failed to refresh graph schemas: {}", e));
     }
     Response::Ok
@@ -653,14 +687,11 @@ async fn handle_vacuum(ctx: Arc<AppContext>) -> Response {
     match vacuum::vacuum(&ctx).await {
         Ok((versions_removed, keys_removed)) => Response::SimpleString(format!(
             "Removed {} versions and {} keys",
-            versions_removed,
-            keys_removed
+            versions_removed, keys_removed
         )),
         Err(e) => Response::Error(format!("VACUUM failed: {}", e)),
     }
 }
-
-
 
 async fn db_value_to_response(value: &DbValue, key: &str, ctx: &Arc<AppContext>) -> Response {
     if ctx.memory.is_enabled() {
@@ -734,11 +765,9 @@ async fn handle_delete(
         return Response::Error("Invalid key(s) provided".to_string());
     }
 
-let executor = StorageExecutor::new(ctx, transaction_handle);
+    let executor = StorageExecutor::new(ctx, transaction_handle);
     return executor.delete(keys).await;
 }
-
-
 
 async fn handle_json_set(
     command: Command,
@@ -768,7 +797,12 @@ async fn handle_json_set(
         return Response::Error(format!(
             "JSON.SET requires 2 or 3 arguments, got {}. Args: {:?}",
             command.args.len() - 1,
-            command.args.iter().skip(1).map(|a| String::from_utf8_lossy(a).to_string()).collect::<Vec<String>>()
+            command
+                .args
+                .iter()
+                .skip(1)
+                .map(|a| String::from_utf8_lossy(a).to_string())
+                .collect::<Vec<String>>()
         ));
     };
 
@@ -924,7 +958,10 @@ async fn handle_lpop(
     };
     let was_count_provided = command.args.len() == 3;
     let count = if was_count_provided {
-        match str::from_utf8(&command.args[2]).unwrap_or("1").parse::<usize>() {
+        match str::from_utf8(&command.args[2])
+            .unwrap_or("1")
+            .parse::<usize>()
+        {
             Ok(c) => c,
             Err(_) => return Response::Error("Invalid count".to_string()),
         }
@@ -962,7 +999,10 @@ async fn handle_rpop(
     };
     let was_count_provided = command.args.len() == 3;
     let count = if was_count_provided {
-        match str::from_utf8(&command.args[2]).unwrap_or("1").parse::<usize>() {
+        match str::from_utf8(&command.args[2])
+            .unwrap_or("1")
+            .parse::<usize>()
+        {
             Ok(c) => c,
             Err(_) => return Response::Error("Invalid count".to_string()),
         }
@@ -1037,7 +1077,7 @@ async fn handle_lrange(
         Err(_) => return Response::Error("Invalid stop index".to_string()),
     };
 
-        let tx_guard = transaction_handle.read().await;
+    let tx_guard = transaction_handle.read().await;
     match get_visible_db_value(&key, &ctx, tx_guard.as_ref()).await {
         Some(DbValue::List(list_lock)) => {
             let list = list_lock.read().await;
@@ -1114,7 +1154,7 @@ async fn handle_smembers(
         Err(_) => return Response::Error("Invalid key".to_string()),
     };
 
-        let tx_guard = transaction_handle.read().await;
+    let tx_guard = transaction_handle.read().await;
     match get_visible_db_value(&key, &ctx, tx_guard.as_ref()).await {
         Some(DbValue::Set(set_lock)) => {
             let set = set_lock.read().await;
@@ -1139,7 +1179,7 @@ async fn handle_scard(
         Err(_) => return Response::Error("Invalid key".to_string()),
     };
 
-        let tx_guard = transaction_handle.read().await;
+    let tx_guard = transaction_handle.read().await;
     match get_visible_db_value(&key, &ctx, tx_guard.as_ref()).await {
         Some(DbValue::Set(set_lock)) => {
             let set = set_lock.read().await;
@@ -1164,7 +1204,7 @@ async fn handle_sismember(
     };
     let member = &command.args[2];
 
-        let tx_guard = transaction_handle.read().await;
+    let tx_guard = transaction_handle.read().await;
     match get_visible_db_value(&key, &ctx, tx_guard.as_ref()).await {
         Some(DbValue::Set(set_lock)) => {
             let set = set_lock.read().await;
@@ -1391,7 +1431,11 @@ pub async fn handle_idx_create(command: Command, ctx: Arc<AppContext>) -> Respon
     if ctx.index_manager.indexes.contains_key(&full_index_name) {
         return Response::Error(format!("Index on this prefix and path already exists"));
     }
-    if ctx.index_manager.name_to_internal_name.contains_key(&index_name) {
+    if ctx
+        .index_manager
+        .name_to_internal_name
+        .contains_key(&index_name)
+    {
         return Response::Error(format!("Index '{}' already exists", index_name));
     }
 
@@ -1421,7 +1465,11 @@ pub async fn handle_idx_create(command: Command, ctx: Arc<AppContext>) -> Respon
             drop(entry);
             let version_chain = version_chain_arc.read().await;
 
-            if let Some(version) = version_chain.iter().rev().find(|v| snapshot.is_visible(v, &ctx.tx_status_manager)) {
+            if let Some(version) = version_chain
+                .iter()
+                .rev()
+                .find(|v| snapshot.is_visible(v, &ctx.tx_status_manager))
+            {
                 // This is the latest visible version for this key.
                 let val = match &version.value {
                     DbValue::Json(v) => v.clone(),
@@ -1432,10 +1480,7 @@ pub async fn handle_idx_create(command: Command, ctx: Arc<AppContext>) -> Respon
                 if let Some(indexed_val) = val.pointer(&pointer) {
                     let index_key = serde_json::to_string(indexed_val).unwrap_or_default();
                     let mut index_data = index.write().await;
-                    index_data
-                        .entry(index_key)
-                        .or_default()
-                        .insert(key.clone());
+                    index_data.entry(index_key).or_default().insert(key.clone());
                     backfilled_count += 1;
                 }
             }
@@ -1458,7 +1503,11 @@ pub async fn handle_idx_drop(command: Command, ctx: Arc<AppContext>) -> Response
         Err(_) => return Response::Error("Invalid index name".to_string()),
     };
 
-    if let Some((_, internal_name)) = ctx.index_manager.name_to_internal_name.remove(&index_name_to_drop) {
+    if let Some((_, internal_name)) = ctx
+        .index_manager
+        .name_to_internal_name
+        .remove(&index_name_to_drop)
+    {
         ctx.index_manager.indexes.remove(&internal_name);
         let prefix = internal_name.split('|').next().unwrap().to_string();
         if let Some(mut prefixes) = ctx.index_manager.prefix_to_indexes.get_mut(&prefix) {
@@ -1521,10 +1570,18 @@ async fn handle_commit(
     if ctx.config.isolation_level == crate::config::IsolationLevel::Serializable {
         // SSI: Check for incoming conflicts. If a key we read was changed by a
         // concurrent transaction that has already committed, we must abort.
-        if tx.ssi_in_conflict.load(std::sync::atomic::Ordering::Relaxed) {
+        if tx
+            .ssi_in_conflict
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             ctx.tx_status_manager.abort(tx.txid);
-            println!("Transaction {} ({}) aborted due to serialization conflict.", tx.id, tx.txid);
-            return Response::Error("ABORT: Serialization failure, please retry transaction".to_string());
+            println!(
+                "Transaction {} ({}) aborted due to serialization conflict.",
+                tx.id, tx.txid
+            );
+            return Response::Error(
+                "ABORT: Serialization failure, please retry transaction".to_string(),
+            );
         }
     }
 
@@ -1536,21 +1593,40 @@ async fn handle_commit(
             // For now, we log them and only wait on the final commit marker.
             for (i, entry) in log_entries.iter().enumerate() {
                 let is_last = i == log_entries.len() - 1;
-                let durability = if is_last { ctx.config.durability.clone() } else { DurabilityLevel::None };
+                let durability = if is_last {
+                    ctx.config.durability.clone()
+                } else {
+                    DurabilityLevel::None
+                };
                 let (ack_tx, ack_rx) = oneshot::channel();
-                let log_req = LogRequest { entry: entry.clone(), ack: ack_tx, durability };
+                let log_req = LogRequest {
+                    entry: entry.clone(),
+                    ack: ack_tx,
+                    durability,
+                };
 
-                if ctx.logger.send(PersistenceRequest::Log(log_req)).await.is_err() {
+                if ctx
+                    .logger
+                    .send(PersistenceRequest::Log(log_req))
+                    .await
+                    .is_err()
+                {
                     ctx.tx_status_manager.abort(tx.txid);
-                    return Response::Error("Persistence engine is down, commit failed. Transaction rolled back.".to_string());
+                    return Response::Error(
+                        "Persistence engine is down, commit failed. Transaction rolled back."
+                            .to_string(),
+                    );
                 }
 
                 if is_last {
-                     match ack_rx.await {
+                    match ack_rx.await {
                         Ok(Ok(())) => { /* Continue */ }
                         Ok(Err(e)) => {
                             ctx.tx_status_manager.abort(tx.txid);
-                            return Response::Error(format!("WAL write error during commit: {}. Transaction rolled back.", e));
+                            return Response::Error(format!(
+                                "WAL write error during commit: {}. Transaction rolled back.",
+                                e
+                            ));
                         }
                         Err(_) => {
                             ctx.tx_status_manager.abort(tx.txid);
@@ -1570,8 +1646,12 @@ async fn handle_commit(
             for other_tx_entry in ctx.active_transactions.iter() {
                 let other_tx = other_tx_entry.value();
                 // Check if other_tx is concurrent and has read the key we are writing.
-                if tx.snapshot.xip.contains(&other_tx.txid) && other_tx.reads.contains_key(written_key) {
-                    other_tx.ssi_in_conflict.store(true, std::sync::atomic::Ordering::Relaxed);
+                if tx.snapshot.xip.contains(&other_tx.txid)
+                    && other_tx.reads.contains_key(written_key)
+                {
+                    other_tx
+                        .ssi_in_conflict
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -1586,7 +1666,9 @@ async fn handle_commit(
         // --- Index Maintenance ---
         let old_db_value = {
             let version_chain = version_chain_arc.read().await;
-            version_chain.iter().rev()
+            version_chain
+                .iter()
+                .rev()
                 .find(|v| tx.snapshot.is_visible(v, &ctx.tx_status_manager))
                 .map(|v| v.value.clone())
         };
@@ -1594,15 +1676,17 @@ async fn handle_commit(
         if let Some(old_val) = old_db_value.as_ref().and_then(|v| match v {
             DbValue::Json(val) => Some(val.clone()),
             DbValue::JsonB(b) => serde_json::from_slice(b).ok(),
-            _ => None
+            _ => None,
         }) {
-            ctx.index_manager.remove_key_from_indexes(key, &old_val).await;
+            ctx.index_manager
+                .remove_key_from_indexes(key, &old_val)
+                .await;
         }
 
         if let Some(new_val) = value.as_ref().and_then(|v| match v {
             DbValue::Json(val) => Some(val.clone()),
             DbValue::JsonB(b) => serde_json::from_slice(b).ok(),
-            _ => None
+            _ => None,
         }) {
             ctx.index_manager.add_key_to_indexes(key, &new_val).await;
         }
@@ -1611,10 +1695,11 @@ async fn handle_commit(
         let mut version_chain = version_chain_arc.write().await;
 
         // Find the version that was visible to this transaction and expire it.
-        if let Some(latest_version) = version_chain.iter_mut().rev().find(|v| {
-            tx.snapshot
-                .is_visible(v, &ctx.tx_status_manager)
-        }) {
+        if let Some(latest_version) = version_chain
+            .iter_mut()
+            .rev()
+            .find(|v| tx.snapshot.is_visible(v, &ctx.tx_status_manager))
+        {
             latest_version.expirer_txid = tx.txid;
         }
 
@@ -1646,7 +1731,9 @@ async fn handle_rollback(
     let mut tx_guard = transaction_handle.write().await;
     if let Some(tx) = tx_guard.take() {
         if ctx.memory.is_enabled() {
-            let reserved = tx.reserved_memory.load(std::sync::atomic::Ordering::Relaxed);
+            let reserved = tx
+                .reserved_memory
+                .load(std::sync::atomic::Ordering::Relaxed);
             if reserved > 0 {
                 ctx.memory.decrease_memory(reserved as u64);
             } else {
@@ -1682,13 +1769,20 @@ async fn handle_savepoint(
             return Response::Error(format!("Savepoint '{}' already exists", savepoint_name));
         }
         let log_entries = tx.log_entries.read().await.clone();
-        let reserved_memory = tx.reserved_memory.load(std::sync::atomic::Ordering::Relaxed);
+        let reserved_memory = tx
+            .reserved_memory
+            .load(std::sync::atomic::Ordering::Relaxed);
         savepoints.insert(
             savepoint_name.clone(),
             (log_entries, tx.writes.clone(), reserved_memory),
         );
-        tx.log_entries.write().await.push(LogEntry::Savepoint { name: savepoint_name.clone() });
-        println!("Savepoint '{}' created for transaction {}.", savepoint_name, tx.id);
+        tx.log_entries.write().await.push(LogEntry::Savepoint {
+            name: savepoint_name.clone(),
+        });
+        println!(
+            "Savepoint '{}' created for transaction {}.",
+            savepoint_name, tx.id
+        );
         Response::Ok
     } else {
         Response::Error("No transaction in progress".to_string())
@@ -1711,16 +1805,21 @@ async fn handle_rollback_to_savepoint(
     let mut tx_guard = transaction_handle.write().await;
     if let Some(tx) = tx_guard.as_mut() {
         let savepoints = tx.savepoints.read().await;
-        if let Some((saved_log_entries, saved_writes, saved_reserved_memory)) = savepoints.get(&savepoint_name) {
+        if let Some((saved_log_entries, saved_writes, saved_reserved_memory)) =
+            savepoints.get(&savepoint_name)
+        {
             if _ctx.memory.is_enabled() {
-                let current_reserved_memory = tx.reserved_memory.load(std::sync::atomic::Ordering::Relaxed);
+                let current_reserved_memory = tx
+                    .reserved_memory
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 let diff = current_reserved_memory - saved_reserved_memory;
                 if diff > 0 {
                     _ctx.memory.decrease_memory(diff as u64);
                 } else {
                     _ctx.memory.increase_memory(-diff as u64);
                 }
-                tx.reserved_memory.store(*saved_reserved_memory, std::sync::atomic::Ordering::Relaxed);
+                tx.reserved_memory
+                    .store(*saved_reserved_memory, std::sync::atomic::Ordering::Relaxed);
             }
 
             // Revert log_entries and writes to the savepoint state
@@ -1736,8 +1835,13 @@ async fn handle_rollback_to_savepoint(
             tx.read_cache.clear();
             tx.reads.clear();
 
-            log_entries.push(LogEntry::RollbackToSavepoint { name: savepoint_name.clone() });
-            println!("Transaction {} rolled back to savepoint '{}'.", tx.id, savepoint_name);
+            log_entries.push(LogEntry::RollbackToSavepoint {
+                name: savepoint_name.clone(),
+            });
+            println!(
+                "Transaction {} rolled back to savepoint '{}'.",
+                tx.id, savepoint_name
+            );
             Response::Ok
         } else {
             Response::Error(format!("Savepoint '{}' not found", savepoint_name))
@@ -1762,9 +1866,23 @@ async fn handle_release_savepoint(
 
     let mut tx_guard = transaction_handle.write().await;
     if let Some(tx) = tx_guard.as_mut() {
-        if tx.savepoints.write().await.remove(&savepoint_name).is_some() {
-            tx.log_entries.write().await.push(LogEntry::ReleaseSavepoint { name: savepoint_name.clone() });
-            println!("Savepoint '{}' released for transaction {}.", savepoint_name, tx.id);
+        if tx
+            .savepoints
+            .write()
+            .await
+            .remove(&savepoint_name)
+            .is_some()
+        {
+            tx.log_entries
+                .write()
+                .await
+                .push(LogEntry::ReleaseSavepoint {
+                    name: savepoint_name.clone(),
+                });
+            println!(
+                "Savepoint '{}' released for transaction {}.",
+                savepoint_name, tx.id
+            );
             Response::Ok
         } else {
             Response::Error(format!("Savepoint '{}' not found", savepoint_name))

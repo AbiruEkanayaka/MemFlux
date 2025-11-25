@@ -1,6 +1,5 @@
-use anyhow::Result;
 use crate::types::{AppContext, TransactionStatus};
-
+use anyhow::Result;
 
 /// Scans the database and removes dead data versions to reclaim space.
 /// A version is "dead" if it was expired by a transaction that has committed,
@@ -23,7 +22,6 @@ pub async fn vacuum(ctx: &AppContext) -> Result<(usize, usize)> {
     // Create a special snapshot for vacuuming. xmax = u64::MAX ensures that all committed
     // transactions are considered 'old enough' for visibility checks, effectively making
     // the snapshot see all committed history up to the current point.
-
 
     let mut versions_removed = 0;
     let mut keys_to_remove = Vec::new();
@@ -53,7 +51,8 @@ pub async fn vacuum(ctx: &AppContext) -> Result<(usize, usize)> {
                     return true; // Not expired, keep.
                 }
 
-                let expirer_committed = tx_status_manager.get_status(version.expirer_txid) == Some(TransactionStatus::Committed);
+                let expirer_committed = tx_status_manager.get_status(version.expirer_txid)
+                    == Some(TransactionStatus::Committed);
                 if !expirer_committed {
                     return true; // Expiring transaction not committed, keep.
                 }
@@ -76,7 +75,11 @@ pub async fn vacuum(ctx: &AppContext) -> Result<(usize, usize)> {
 
     let mut keys_removed_count = 0;
     for key in keys_to_remove {
-        if ctx.db.remove_if(&key, |_, v| v.try_read().map_or(false, |g| g.is_empty())).is_some() {
+        if ctx
+            .db
+            .remove_if(&key, |_, v| v.try_read().map_or(false, |g| g.is_empty()))
+            .is_some()
+        {
             keys_removed_count += 1;
         }
     }

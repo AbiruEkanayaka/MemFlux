@@ -1,13 +1,13 @@
-use anyhow::{anyhow, Result};
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use anyhow::{Result, anyhow};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::query_engine::ast::TableConstraint;
+use crate::query_engine::logical_plan::Expression;
 use crate::types::{
     Db, DbValue, SchemaCache, TransactionIdManager, TransactionStatusManager, VersionedValue,
 };
-use crate::query_engine::logical_plan::Expression;
-use crate::query_engine::ast::{TableConstraint};
 
 use std::fmt;
 
@@ -100,8 +100,10 @@ impl DataType {
             if let Some(rest) = upper.strip_prefix("NUMERIC") {
                 let trimmed = rest.trim();
                 if trimmed.starts_with('(') && trimmed.ends_with(')') {
-                    let parts: Vec<&str> =
-                        trimmed[1..trimmed.len() - 1].split(',').map(|p| p.trim()).collect();
+                    let parts: Vec<&str> = trimmed[1..trimmed.len() - 1]
+                        .split(',')
+                        .map(|p| p.trim())
+                        .collect();
                     if let Some(p_str) = parts.get(0) {
                         if !p_str.is_empty() {
                             precision = Some(p_str.parse::<u32>()?);
