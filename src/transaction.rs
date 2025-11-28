@@ -54,5 +54,7 @@ impl Transaction {
     }
 }
 
+use crate::storage::StorageTransaction;
+
 /// A handle to a transaction, managed per-connection.
-pub type TransactionHandle = Arc<RwLock<Option<Arc<Transaction>>>>;
+pub type TransactionHandle = Arc<RwLock<Option<Box<dyn StorageTransaction>>>>;

@@ -364,7 +364,7 @@ impl Expression {
                         if let Expression::Subquery(subquery_plan) = &**right {
                             let physical_plan = super::physical_plan::logical_to_physical_plan(
                                 subquery_plan.as_ref().clone(),
-                                &ctx.index_manager,
+                                &ctx,
                             )?;
                             let results: Vec<Value> =
                                 execute(physical_plan, ctx, Some(row), None, transaction_handle)
@@ -567,7 +567,7 @@ impl Expression {
                         if let Expression::Subquery(subquery_plan) = arg {
                             let physical_plan = super::physical_plan::logical_to_physical_plan(
                                 subquery_plan.as_ref().clone(),
-                                &ctx.index_manager,
+                                &ctx,
                             )?;
                             let results: Vec<Value> = execute(
                                 physical_plan,
@@ -631,7 +631,7 @@ impl Expression {
                 Expression::Subquery(subquery_plan) => {
                     let physical_plan = super::physical_plan::logical_to_physical_plan(
                         subquery_plan.as_ref().clone(),
-                        &ctx.index_manager,
+                        &ctx,
                     )?;
 
                     let results: Vec<Value> =
@@ -1057,7 +1057,7 @@ pub(crate) fn simple_expr_to_expression(
         }
         SimpleExpression::AggregateFunction { func, arg } => {
             let arg_expr = if arg == "*" {
-                Expression::Literal(Value::String("* ".to_string()))
+                Expression::Literal(Value::String("*".to_string()))
             } else {
                 Expression::Column(arg)
             };

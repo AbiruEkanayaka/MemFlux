@@ -3,10 +3,10 @@ use crate::cypher_engine::physical_plan::PhysicalPlan;
 use crate::storage_executor::get_visible_db_value;
 use crate::transaction::TransactionHandle;
 use crate::types::{AppContext, DbValue};
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_stream::try_stream;
 use futures::stream::{Stream, StreamExt, TryStreamExt};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 async fn evaluate_expression(
@@ -209,7 +209,7 @@ async fn evaluate_expression(
             visited.insert(start_id.clone());
 
             let tx_guard = transaction_handle.read().await;
-            let tx_opt = tx_guard.as_ref();
+            let tx_opt = tx_guard.as_deref();
 
             let mut found = false;
 
@@ -226,9 +226,14 @@ async fn evaluate_expression(
                 }
 
                 let out_prefix_base = format!("_edge:out:{}:", current_node_id);
-                for entry in ctx.db.iter() {
-                    if entry.key().starts_with(&out_prefix_base) {
-                        let parts: Vec<&str> = entry.key().split(':').collect();
+                let scanned = if let Some(tx) = tx_opt {
+                    tx.prefix_scan(&out_prefix_base).await
+                } else {
+                    ctx.storage.prefix_scan(&out_prefix_base).await
+                };
+
+                for (key, _) in scanned {
+                        let parts: Vec<&str> = key.split(':').collect();
                         if parts.len() < 6 {
                             continue;
                         } // _edge:out:start_id:type:end_id:rel_id
@@ -242,7 +247,7 @@ async fn evaluate_expression(
                             if !visited.contains(&neighbor_id) {
                                 visited.insert(neighbor_id.clone());
                                 if let Some(DbValue::JsonB(rel_bytes)) =
-                                    get_visible_db_value(entry.key(), &ctx, tx_opt).await
+                                    get_visible_db_value(&key, &ctx, tx_opt).await
                                 {
                                     let mut rel_props =
                                         serde_json::from_slice::<Value>(&rel_bytes)?;
@@ -259,7 +264,6 @@ async fn evaluate_expression(
                                 }
                             }
                         }
-                    }
                 }
             }
 
@@ -353,12 +357,18 @@ pub fn execute<'a>(
                     if schema.source == crate::schema::SchemaSource::Native {
                         let prefix = format!("{}:", label);
                         let tx_guard = transaction_handle.read().await;
-                        let tx_opt = tx_guard.as_ref();
+                        let tx_opt = tx_guard.as_deref();
 
                         let mut keys_to_process: std::collections::HashSet<String> = std::collections::HashSet::new();
-                        for r in ctx.db.iter() { if r.key().starts_with(&prefix) { keys_to_process.insert(r.key().clone()); } }
-                        if let Some(tx) = tx_opt {
-                            for item in tx.writes.iter() { if item.key().starts_with(&prefix) { keys_to_process.insert(item.key().clone()); } }
+                        
+                        let scanned = if let Some(tx) = tx_opt {
+                            tx.prefix_scan(&prefix).await
+                        } else {
+                            ctx.storage.prefix_scan(&prefix).await
+                        };
+                        
+                        for (k, _) in scanned {
+                            keys_to_process.insert(k);
                         }
 
                         for key in keys_to_process {
@@ -383,24 +393,19 @@ pub fn execute<'a>(
 
                 let prefix = format!("_node:{}:", label);
                 let tx_guard = transaction_handle.read().await;
-                let tx_opt = tx_guard.as_ref();
+                let tx_opt = tx_guard.as_deref();
 
                 let mut keys_to_process: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-                // Get keys from main DB
-                for entry in ctx.db.iter() {
-                    if entry.key().starts_with(&prefix) {
-                        keys_to_process.insert(entry.key().clone());
-                    }
-                }
-
-                // Get keys from transaction writeset
-                if let Some(tx) = tx_opt {
-                    for entry in tx.writes.iter() {
-                        if entry.key().starts_with(&prefix) {
-                            keys_to_process.insert(entry.key().clone());
-                        }
-                    }
+                // Get keys from storage (handles both DB and TX writes if TX is provided)
+                let scanned = if let Some(tx) = tx_opt {
+                    tx.prefix_scan(&prefix).await
+                } else {
+                    ctx.storage.prefix_scan(&prefix).await
+                };
+                
+                for (k, _) in scanned {
+                    keys_to_process.insert(k);
                 }
 
                 for key in keys_to_process {
@@ -431,7 +436,7 @@ pub fn execute<'a>(
                     if let Some(keys) = index_data.get(&index_key) {
                         let tx_guard = transaction_handle.read().await;
                         for db_key in keys {
-                            if let Some(db_val) = get_visible_db_value(db_key, &ctx, tx_guard.as_ref()).await {
+                            if let Some(db_val) = get_visible_db_value(db_key, &ctx, tx_guard.as_deref()).await {
                                 if let DbValue::JsonB(bytes) = db_val {
                                     if let Ok(mut props) = serde_json::from_slice::<Value>(&bytes) {
                                         if let Some(obj) = props.as_object_mut() {
@@ -497,7 +502,7 @@ pub fn execute<'a>(
                                                 let referenced_db_key = format!("{}:{}", referenced_table, pk_val_str);
 
                                                 let tx_guard = transaction_handle.read().await;
-                                                if let Some(db_val) = get_visible_db_value(&referenced_db_key, &ctx, tx_guard.as_ref()).await {
+                                                if let Some(db_val) = get_visible_db_value(&referenced_db_key, &ctx, tx_guard.as_deref()).await {
                                                     if let DbValue::JsonB(bytes) = db_val {
                                                         let mut end_node_props: Value = serde_json::from_slice(&bytes)?;
                                                         if let Some(obj) = end_node_props.as_object_mut() {
@@ -576,60 +581,70 @@ pub fn execute<'a>(
 
                             let tx_guard = transaction_handle.read().await;
                             for edge_prefix in prefixes_to_scan {
-                                for entry in ctx.db.iter() {
-                                    if entry.key().starts_with(&edge_prefix) {
-                                        let parts: Vec<&str> = entry.key().split(':').collect();
-                                        if parts.len() < 6 { continue; }
-                                        let end_node_id = parts[4];
+                                let scanned = if let Some(tx) = tx_guard.as_deref() {
+                                    tx.prefix_scan(&edge_prefix).await
+                                } else {
+                                    ctx.storage.prefix_scan(&edge_prefix).await
+                                };
+                                
+                                for (key, _) in scanned {
+                                    let parts: Vec<&str> = key.split(':').collect();
+                                    if parts.len() < 6 { continue; }
+                                    let end_node_id = parts[4];
 
-                                        if visited_nodes.contains(end_node_id) { continue; }
+                                    if visited_nodes.contains(end_node_id) { continue; }
 
-                                        if let Some(DbValue::JsonB(rel_bytes)) = get_visible_db_value(entry.key(), &ctx, tx_guard.as_ref()).await {
-                                            let pk_key = format!("_pk_node:{}", end_node_id);
-                                            if let Some(DbValue::Bytes(label_bytes)) = get_visible_db_value(&pk_key, &ctx, tx_guard.as_ref()).await {
-                                                let end_node_label = String::from_utf8(label_bytes)?;
-                                                let end_node_key = format!("_node:{}:{}", end_node_label, end_node_id);
+                                    if let Some(DbValue::JsonB(rel_bytes)) = get_visible_db_value(&key, &ctx, tx_guard.as_deref()).await {
+                                        let pk_key = format!("_pk_node:{}", end_node_id);
+                                        if let Some(DbValue::Bytes(label_bytes)) = get_visible_db_value(&pk_key, &ctx, tx_guard.as_deref()).await {
+                                            let end_node_label = String::from_utf8(label_bytes)?;
+                                            let end_node_key = format!("_node:{}:{}", end_node_label, end_node_id);
 
-                                                if let Some(DbValue::JsonB(end_node_bytes)) = get_visible_db_value(&end_node_key, &ctx, tx_guard.as_ref()).await {
-                                                    let next_depth = current_depth + 1;
+                                            if let Some(DbValue::JsonB(end_node_bytes)) = get_visible_db_value(&end_node_key, &ctx, tx_guard.as_deref()).await {
+                                                let next_depth = current_depth + 1;
 
-                                                    let mut end_node_props = serde_json::from_slice::<Value>(&end_node_bytes)?;
-                                                    if let Some(obj) = end_node_props.as_object_mut() {
-                                                        obj.insert("_id".to_string(), json!(end_node_id));
-                                                        obj.insert("_label".to_string(), json!(end_node_label.clone()));
-                                                    }
-                                                    let mut rel_props = serde_json::from_slice::<Value>(&rel_bytes)?;
-                                                    if let Some(obj) = rel_props.as_object_mut() {
-                                                        obj.insert("_type".to_string(), json!(rel_type.clone()));
-                                                        if edge_prefix.starts_with("_edge:in:") {
-                                                            obj.insert("_start_id".to_string(), json!(end_node_id));
-                                                            obj.insert("_end_id".to_string(), json!(current_id.clone()));
-                                                        } else {
-                                                            obj.insert("_start_id".to_string(), json!(current_id.clone()));
-                                                            obj.insert("_end_id".to_string(), json!(end_node_id));
-                                                        }
-                                                    }
-
-                                                    let mut new_path = current_path.clone();
-                                                    new_path.push(rel_props.clone());
-                                                    new_path.push(end_node_props.clone());
-
-                                                    if next_depth >= min_depth {
-                                                        matched_once = true;
-                                                        let mut new_row = start_row.clone();
-                                                        if let Some(obj) = new_row.as_object_mut() {
-                                                            obj.insert(end_node_var.clone(), end_node_props.clone());
-                                                            obj.insert(rel_var.clone(), rel_props.clone());
-                                                            if let Some(path_var) = &path_variable {
-                                                                obj.insert(path_var.clone(), json!(new_path));
-                                                            }
-                                                        }
-                                                        yield new_row;
-                                                    }
-
-                                                    q.push_back((end_node_id.to_string(), next_depth, new_path));
-                                                    visited_nodes.insert(end_node_id.to_string());
+                                                let mut end_node_props = serde_json::from_slice::<Value>(&end_node_bytes)?;
+                                                if let Some(obj) = end_node_props.as_object_mut() {
+                                                    obj.insert("_id".to_string(), json!(end_node_id));
+                                                    obj.insert("_label".to_string(), json!(end_node_label.clone()));
                                                 }
+                                                let mut rel_props = serde_json::from_slice::<Value>(&rel_bytes)?;
+                                                if let Some(obj) = rel_props.as_object_mut() {
+                                                    let parts: Vec<&str> = key.split(':').collect();
+                                                    if let Some(rel_id) = parts.get(5) {
+                                                        obj.insert("_id".to_string(), json!(*rel_id));
+                                                    }
+                                                    
+                                                    let current_rel_type = key.split(':').nth(3).unwrap_or("");
+                                                    obj.insert("_type".to_string(), json!(current_rel_type));
+                                                    if edge_prefix.starts_with("_edge:in:") {
+                                                        obj.insert("_start_id".to_string(), json!(end_node_id));
+                                                        obj.insert("_end_id".to_string(), json!(current_id.clone()));
+                                                    } else {
+                                                        obj.insert("_start_id".to_string(), json!(current_id.clone()));
+                                                        obj.insert("_end_id".to_string(), json!(end_node_id));
+                                                    }
+                                                }
+
+                                                let mut new_path = current_path.clone();
+                                                new_path.push(rel_props.clone());
+                                                new_path.push(end_node_props.clone());
+
+                                                if next_depth >= min_depth {
+                                                    matched_once = true;
+                                                    let mut new_row = start_row.clone();
+                                                    if let Some(obj) = new_row.as_object_mut() {
+                                                        obj.insert(end_node_var.clone(), end_node_props.clone());
+                                                        obj.insert(rel_var.clone(), rel_props.clone());
+                                                        if let Some(path_var) = &path_variable {
+                                                            obj.insert(path_var.clone(), json!(new_path));
+                                                        }
+                                                    }
+                                                    yield new_row;
+                                                }
+
+                                                q.push_back((end_node_id.to_string(), next_depth, new_path));
+                                                visited_nodes.insert(end_node_id.to_string());
                                             }
                                         }
                                     }
@@ -639,7 +654,7 @@ pub fn execute<'a>(
                     } else {
                         // Single-step expansion
                         let tx_guard = transaction_handle.read().await;
-                        let tx_opt = tx_guard.as_ref();
+                        let tx_opt = tx_guard.as_deref();
 
                         let mut prefixes_to_scan = Vec::new();
                         match direction {
@@ -673,23 +688,15 @@ pub fn execute<'a>(
                                 let mut in_degree = 0;
 
                                 let mut visible_keys = std::collections::HashSet::new();
-                                for entry in ctx.db.iter() {
-                                    if entry.key().starts_with(&out_prefix) || entry.key().starts_with(&in_prefix) {
-                                        visible_keys.insert(entry.key().clone());
-                                    }
-                                }
-                                if let Some(tx) = tx_opt {
-                                    for entry in tx.writes.iter() {
-                                        let key = entry.key();
-                                        if key.starts_with(&out_prefix) || key.starts_with(&in_prefix) {
-                                            if entry.value().is_some() {
-                                                visible_keys.insert(key.clone());
-                                            } else {
-                                                visible_keys.remove(key);
-                                            }
-                                        }
-                                    }
-                                }
+                                
+                                // Scan prefixes to count degree. This is potentially expensive.
+                                // Optimization: prefix_scan returns vector of keys.
+                                
+                                let scanned_out = if let Some(tx) = tx_opt { tx.prefix_scan(&out_prefix).await } else { ctx.storage.prefix_scan(&out_prefix).await };
+                                for (k, _) in scanned_out { visible_keys.insert(k); }
+                                
+                                let scanned_in = if let Some(tx) = tx_opt { tx.prefix_scan(&in_prefix).await } else { ctx.storage.prefix_scan(&in_prefix).await };
+                                for (k, _) in scanned_in { visible_keys.insert(k); }
 
                                 for key in &visible_keys {
                                     if key.starts_with(&out_prefix) { out_degree += 1; }
@@ -708,21 +715,14 @@ pub fn execute<'a>(
 
                         for edge_prefix in prefixes_to_scan {
                             let mut keys_to_process: std::collections::HashSet<String> = std::collections::HashSet::new();
-                            for entry in ctx.db.iter() {
-                                if entry.key().starts_with(&edge_prefix) {
-                                    keys_to_process.insert(entry.key().clone());
-                                }
-                            }
-                            if let Some(tx) = tx_opt {
-                                for entry in tx.writes.iter() {
-                                    if entry.key().starts_with(&edge_prefix) {
-                                        if entry.value().is_some() {
-                                            keys_to_process.insert(entry.key().clone());
-                                        } else {
-                                            keys_to_process.remove(entry.key());
-                                        }
-                                    }
-                                }
+                            let scanned = if let Some(tx) = tx_opt {
+                                tx.prefix_scan(&edge_prefix).await
+                            } else {
+                                ctx.storage.prefix_scan(&edge_prefix).await
+                            };
+                            
+                            for (k, _) in scanned {
+                                keys_to_process.insert(k);
                             }
 
                             for key in keys_to_process {
@@ -748,6 +748,11 @@ pub fn execute<'a>(
                                         if let Some(DbValue::JsonB(rel_bytes)) = get_visible_db_value(&key, &ctx, tx_opt).await {
                                             let mut rel_props = serde_json::from_slice::<Value>(&rel_bytes)?;
                                             if let Some(obj) = rel_props.as_object_mut() {
+                                                let parts: Vec<&str> = key.split(':').collect();
+                                                if let Some(rel_id) = parts.get(5) {
+                                                    obj.insert("_id".to_string(), json!(*rel_id));
+                                                }
+
                                                 let current_rel_type = key.split(':').nth(3).unwrap_or("");
                                                 obj.insert("_type".to_string(), json!(current_rel_type));
                                                 if edge_prefix.starts_with("_edge:in:") {
@@ -860,10 +865,10 @@ pub fn execute<'a>(
                                 // This is a match, not a create. We need to fetch the node data.
                                 let pk_key = format!("_pk_node:{}", id);
                                 let tx_guard = transaction_handle.read().await;
-                                if let Some(DbValue::Bytes(label_bytes)) = get_visible_db_value(&pk_key, &ctx, tx_guard.as_ref()).await {
+                                if let Some(DbValue::Bytes(label_bytes)) = get_visible_db_value(&pk_key, &ctx, tx_guard.as_deref()).await {
                                     let label = String::from_utf8(label_bytes)?;
                                     let node_key = format!("_node:{}:{}", label, id);
-                                    if let Some(DbValue::JsonB(props_bytes)) = get_visible_db_value(&node_key, &ctx, tx_guard.as_ref()).await {
+                                    if let Some(DbValue::JsonB(props_bytes)) = get_visible_db_value(&node_key, &ctx, tx_guard.as_deref()).await {
                                         let mut node_obj: Value = serde_json::from_slice(&props_bytes)?;
                                         if let Some(obj) = node_obj.as_object_mut() {
                                             obj.insert("_id".to_string(), json!(id.clone()));
@@ -1060,26 +1065,17 @@ pub fn execute<'a>(
 
                                 {
                                     let tx_guard = transaction_handle.read().await;
-                                    let tx_ref = tx_guard.as_ref();
+                                    let tx_ref = tx_guard.as_deref();
 
                                     let mut keys_to_check = std::collections::HashSet::new();
-                                    for entry in ctx.db.iter() {
-                                        if entry.key().starts_with(&out_prefix) || entry.key().starts_with(&in_prefix) {
-                                            keys_to_check.insert(entry.key().clone());
-                                        }
-                                    }
-                                    if let Some(tx) = tx_ref {
-                                        for entry in tx.writes.iter() {
-                                            let key = entry.key();
-                                            if key.starts_with(&out_prefix) || key.starts_with(&in_prefix) {
-                                                if entry.value().is_some() {
-                                                    keys_to_check.insert(key.clone());
-                                                } else {
-                                                    keys_to_check.remove(key);
-                                                }
-                                            }
-                                        }
-                                    }
+                                    
+                                    // Scan OUT
+                                    let scanned_out = if let Some(tx) = tx_ref { tx.prefix_scan(&out_prefix).await } else { ctx.storage.prefix_scan(&out_prefix).await };
+                                    for (k, _) in scanned_out { keys_to_check.insert(k); }
+                                    
+                                    // Scan IN
+                                    let scanned_in = if let Some(tx) = tx_ref { tx.prefix_scan(&in_prefix).await } else { ctx.storage.prefix_scan(&in_prefix).await };
+                                    for (k, _) in scanned_in { keys_to_check.insert(k); }
 
                                     for key in keys_to_check {
                                         if let Some(DbValue::JsonB(bytes)) = get_visible_db_value(&key, &ctx, tx_ref).await {

@@ -38,6 +38,7 @@ base64 = "0.22.1"
 libc = "0.2"
 once_cell = "1.19.0"
 shlex = "1.3.0"
+async-trait = "0.1.89"
 
 [profile.release]
 opt-level = 3

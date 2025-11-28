@@ -107,7 +107,7 @@ impl PersistenceEngine {
                         if let Some(version) = version_chain
                             .iter()
                             .rev()
-                            .find(|v| snapshot.is_visible(v, &tx_status_manager))
+                            .find(|v| snapshot.is_visible(v, &*tx_status_manager))
                         {
                             let serializable_value =
                                 SerializableDbValue::from_db_value(&version.value).await;
@@ -498,6 +498,22 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
             LogEntry::SetJsonB { key, value } => {
                 let new_version = VersionedValue {
                     value: DbValue::JsonB(value),
+                    creator_txid: 0,
+                    expirer_txid: 0,
+                };
+                db.insert(key, Arc::new(RwLock::new(vec![new_version])));
+            }
+            LogEntry::SetList { key, value } => {
+                let new_version = VersionedValue {
+                    value: DbValue::List(RwLock::new(value)),
+                    creator_txid: 0,
+                    expirer_txid: 0,
+                };
+                db.insert(key, Arc::new(RwLock::new(vec![new_version])));
+            }
+            LogEntry::SetSet { key, value } => {
+                let new_version = VersionedValue {
+                    value: DbValue::Set(RwLock::new(value)),
                     creator_txid: 0,
                     expirer_txid: 0,
                 };

@@ -17,6 +17,7 @@ pub mod persistence;
 pub mod protocol;
 pub mod query_engine;
 pub mod schema;
+pub mod storage;
 pub mod storage_executor;
 pub mod transaction;
 pub mod types;
@@ -71,6 +72,7 @@ impl MemFluxDB {
 
         let tx_id_manager = Arc::new(TransactionIdManager::new());
         let tx_status_manager = Arc::new(TransactionStatusManager::new());
+        let active_transactions = Arc::new(DashMap::new());
 
         let (logger, persistence_handle) = if config.persistence {
             let (persistence_engine, logger) = PersistenceEngine::new(
@@ -97,30 +99,6 @@ impl MemFluxDB {
             (tx, None)
         };
 
-        let schema_cache = Arc::new(DashMap::new());
-        if let Err(e) =
-            load_schemas_from_db(&db, &schema_cache, &tx_status_manager, &tx_id_manager).await
-        {
-            eprintln!("Warning: Could not load virtual schemas: {}.", e);
-        } else if !schema_cache.is_empty() {
-            println!("Loaded {} virtual schemas.", schema_cache.len());
-        }
-
-        if let Err(e) =
-            load_graph_schemas_from_db(&db, &schema_cache, &tx_status_manager, &tx_id_manager).await
-        {
-            eprintln!("Warning: Could not load graph virtual schemas: {}.", e);
-        }
-
-        let view_cache = Arc::new(DashMap::new());
-        if let Err(e) =
-            load_views_from_db(&db, &view_cache, &tx_status_manager, &tx_id_manager).await
-        {
-            eprintln!("Warning: Could not load views: {}.", e);
-        } else if !view_cache.is_empty() {
-            println!("Loaded {} views.", view_cache.len());
-        }
-
         let memory_manager = Arc::new(MemoryManager::new(
             config.maxmemory_mb,
             config.eviction_policy.clone(),
@@ -135,19 +113,51 @@ impl MemFluxDB {
                 config.isolation_level
             );
         }
+
+        let backend = crate::storage::legacy::LegacyDashMapBackend::new(
+            db.clone(),
+            tx_id_manager.clone(),
+            tx_status_manager.clone(),
+            logger.clone(),
+            config.durability.clone(),
+            active_transactions.clone(),
+            memory_manager.clone(),
+        );
+        let storage: Arc<dyn crate::storage::StorageEngine> = Arc::new(backend);
+
+        let schema_cache = Arc::new(DashMap::new());
+        if let Err(e) =
+            load_schemas_from_db(&storage, &schema_cache).await
+        {
+            eprintln!("Warning: Could not load virtual schemas: {}.", e);
+        } else if !schema_cache.is_empty() {
+            println!("Loaded {} virtual schemas.", schema_cache.len());
+        }
+
+        if let Err(e) =
+            load_graph_schemas_from_db(&storage, &schema_cache).await
+        {
+            eprintln!("Warning: Could not load graph virtual schemas: {}.", e);
+        }
+
+        let view_cache = Arc::new(DashMap::new());
+        if let Err(e) =
+            load_views_from_db(&storage, &view_cache).await
+        {
+            eprintln!("Warning: Could not load views: {}.", e);
+        } else if !view_cache.is_empty() {
+            println!("Loaded {} views.", view_cache.len());
+        }
+        
+        // Memory priming - uses storage scan now
         println!("Calculating initial memory usage...");
         let mut initial_mem: u64 = 0;
+        let all_data = storage.prefix_scan("").await;
         let mut keys = Vec::new();
-        for item in db.iter() {
-            let key_size = item.key().len() as u64;
-            let version_chain_arc = item.value().clone();
-            let key = item.key().clone();
-            drop(item);
-            let version_chain = version_chain_arc.read().await;
-            if let Some(version) = version_chain.last() {
-                let value_size = memory::estimate_db_value_size(&version.value).await;
-                initial_mem += key_size + value_size;
-            }
+        for (key, value) in all_data {
+            let key_size = key.len() as u64;
+            let value_size = memory::estimate_db_value_size(&value).await;
+            initial_mem += key_size + value_size;
             keys.push(key);
         }
         memory_manager.increase_memory(initial_mem);
@@ -168,7 +178,7 @@ impl MemFluxDB {
         let function_registry = Arc::new(function_registry);
 
         let app_context = Arc::new(AppContext {
-            db,
+            storage: storage.clone(),
             logger,
             index_manager,
             json_cache,
@@ -177,9 +187,6 @@ impl MemFluxDB {
             function_registry,
             config: config.clone(),
             memory: memory_manager,
-            tx_id_manager,
-            tx_status_manager,
-            active_transactions: Arc::new(DashMap::new()),
             table_locks: Arc::new(DashMap::new()),
         });
 
@@ -201,14 +208,14 @@ impl MemFluxDB {
             }
         }
 
-        let vacuum_app_context = app_context.clone();
+        let vacuum_storage = storage.clone();
         let vacuum_handle = tokio::spawn(async move {
             // Run vacuum every 60 seconds.
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 interval.tick().await;
                 println!("Running background vacuum...");
-                match vacuum::vacuum(&vacuum_app_context).await {
+                match vacuum_storage.vacuum().await {
                     Ok((versions, keys)) => {
                         if versions > 0 || keys > 0 {
                             println!(
@@ -253,7 +260,7 @@ impl MemFluxDB {
                     &self.app_context.view_cache,
                     &self.app_context.function_registry,
                 )?;
-                logical_to_physical_plan(logical_plan, &self.app_context.index_manager)
+                logical_to_physical_plan(logical_plan, &self.app_context)
             })();
 
             match physical_plan_result {
@@ -390,32 +397,13 @@ impl MemFluxDB {
 
 /// Loads view definitions from the database.
 pub async fn load_views_from_db(
-    db: &Db,
+    storage: &Arc<dyn crate::storage::StorageEngine>,
     view_cache: &ViewCache,
-    tx_status_manager: &TransactionStatusManager,
-    tx_id_manager: &TransactionIdManager,
 ) -> Result<()> {
-    let startup_snapshot = types::Snapshot::new(0, tx_status_manager, tx_id_manager);
-    let items_to_process: Vec<(String, types::VersionedValue)> = db
-        .iter()
-        .filter(|item| item.key().starts_with(VIEW_PREFIX))
-        .filter_map(|item| {
-            item.value()
-                .try_read()
-                .ok()
-                .and_then(|guard| {
-                    guard
-                        .iter()
-                        .rev()
-                        .find(|version| startup_snapshot.is_visible(version, tx_status_manager))
-                        .cloned()
-                })
-                .map(|version| (item.key().clone(), version))
-        })
-        .collect();
+    let items_to_process = storage.prefix_scan(VIEW_PREFIX).await;
 
-    for (key, latest_version) in items_to_process {
-        let view_def_result: std::result::Result<ViewDefinition, _> = match &latest_version.value {
+    for (key, db_value) in items_to_process {
+        let view_def_result: std::result::Result<ViewDefinition, _> = match &db_value {
             types::DbValue::Bytes(bytes) => serde_json::from_slice(bytes),
             _ => {
                 eprintln!(
@@ -444,38 +432,28 @@ pub async fn load_views_from_db(
 }
 
 pub async fn load_graph_schemas_from_db(
-    db: &Db,
+    storage: &Arc<dyn crate::storage::StorageEngine>,
     schema_cache: &SchemaCache,
-    tx_status_manager: &TransactionStatusManager,
-    tx_id_manager: &TransactionIdManager,
 ) -> Result<()> {
-    let startup_snapshot = crate::types::Snapshot::new(0, tx_status_manager, tx_id_manager);
     let mut node_labels = HashSet::new();
     let mut rel_types = HashSet::new();
 
-    let keys: Vec<String> = db.iter().map(|item| item.key().clone()).collect();
+    // Scan for nodes
+    let node_keys = storage.prefix_scan("_pk_node:").await;
+    for (_, value) in node_keys {
+        if let DbValue::Bytes(label_bytes) = value {
+            if let Ok(label) = String::from_utf8(label_bytes) {
+                node_labels.insert(label);
+            }
+        }
+    }
 
-    for key in keys {
-        if key.starts_with("_pk_node:") {
-            if let Some(version_chain_lock) = db.get(&key) {
-                let version_chain = version_chain_lock.read().await;
-                if let Some(version) = version_chain
-                    .iter()
-                    .rev()
-                    .find(|v| startup_snapshot.is_visible(v, tx_status_manager))
-                {
-                    if let DbValue::Bytes(label_bytes) = &version.value {
-                        if let Ok(label) = String::from_utf8(label_bytes.clone()) {
-                            node_labels.insert(label);
-                        }
-                    }
-                }
-            }
-        } else if key.starts_with("_edge:out:") {
-            let parts: Vec<&str> = key.split(':').collect();
-            if parts.len() >= 4 {
-                rel_types.insert(parts[3].to_string());
-            }
+    // Scan for relationships
+    let edge_keys = storage.prefix_scan("_edge:out:").await;
+    for (key, _) in edge_keys {
+        let parts: Vec<&str> = key.split(':').collect();
+        if parts.len() >= 4 {
+            rel_types.insert(parts[3].to_string());
         }
     }
 

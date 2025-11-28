@@ -1,3 +1,4 @@
+use crate::types::AppContext;
 use anyhow::Result;
 use serde_json::Value;
 
@@ -135,12 +136,29 @@ pub enum PhysicalPlan {
 
 pub fn logical_to_physical_plan(
     plan: LogicalPlan,
-    index_manager: &IndexManager,
+    ctx: &AppContext,
 ) -> Result<PhysicalPlan> {
+    let index_manager = &ctx.index_manager;
     match plan {
-        LogicalPlan::TableScan { table_name } => Ok(PhysicalPlan::TableScan {
-            prefix: format!("{}:", table_name),
-        }),
+        LogicalPlan::TableScan { table_name } => {
+            let prefix = if let Some(schema) = ctx.schema_cache.get(&table_name) {
+                match schema.source {
+                    crate::schema::SchemaSource::GraphNode => {
+                        format!("_node:{}:", table_name)
+                    }
+                    crate::schema::SchemaSource::GraphRelationship => {
+                        // This is a simplification. A full implementation would need to
+                        // handle different query patterns on relationships. For now,
+                        // scanning outgoing edges is a reasonable default for `SELECT *`.
+                        format!("_edge:out:")
+                    }
+                    _ => format!("{}:", table_name),
+                }
+            } else {
+                format!("{}:", table_name)
+            };
+            Ok(PhysicalPlan::TableScan { prefix })
+        }
         LogicalPlan::Filter { input, predicate } => {
             if let Some((col, val)) = extract_col_eq_literal(&predicate) {
                 if let LogicalPlan::TableScan { ref table_name } = *input {
@@ -155,12 +173,12 @@ pub fn logical_to_physical_plan(
                 }
             }
             Ok(PhysicalPlan::Filter {
-                input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+                input: Box::new(logical_to_physical_plan(*input, ctx)?),
                 predicate,
             })
         }
         LogicalPlan::Projection { input, expressions } => Ok(PhysicalPlan::Projection {
-            input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+            input: Box::new(logical_to_physical_plan(*input, ctx)?),
             expressions,
         }),
         LogicalPlan::Join {
@@ -169,8 +187,8 @@ pub fn logical_to_physical_plan(
             condition,
             join_type,
         } => Ok(PhysicalPlan::Join {
-            left: Box::new(logical_to_physical_plan(*left, index_manager)?),
-            right: Box::new(logical_to_physical_plan(*right, index_manager)?),
+            left: Box::new(logical_to_physical_plan(*left, ctx)?),
+            right: Box::new(logical_to_physical_plan(*right, ctx)?),
             condition,
             join_type,
         }),
@@ -179,7 +197,7 @@ pub fn logical_to_physical_plan(
             group_expressions,
             agg_expressions,
         } => Ok(PhysicalPlan::HashAggregate {
-            input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+            input: Box::new(logical_to_physical_plan(*input, ctx)?),
             group_expressions,
             agg_expressions,
         }),
@@ -187,7 +205,7 @@ pub fn logical_to_physical_plan(
             input,
             sort_expressions,
         } => Ok(PhysicalPlan::Sort {
-            input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+            input: Box::new(logical_to_physical_plan(*input, ctx)?),
             sort_expressions,
         }),
         LogicalPlan::Limit {
@@ -195,7 +213,7 @@ pub fn logical_to_physical_plan(
             limit,
             offset,
         } => Ok(PhysicalPlan::Limit {
-            input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+            input: Box::new(logical_to_physical_plan(*input, ctx)?),
             limit,
             offset,
         }),
@@ -256,7 +274,7 @@ pub fn logical_to_physical_plan(
             Ok(PhysicalPlan::Insert {
                 table_name,
                 columns,
-                source: Box::new(logical_to_physical_plan(*source, index_manager)?),
+                source: Box::new(logical_to_physical_plan(*source, ctx)?),
                 source_column_names,
                 on_conflict,
                 returning,
@@ -268,7 +286,7 @@ pub fn logical_to_physical_plan(
             returning,
         } => Ok(PhysicalPlan::Delete {
             table_name,
-            from: Box::new(logical_to_physical_plan(*from, index_manager)?),
+            from: Box::new(logical_to_physical_plan(*from, ctx)?),
             returning,
         }),
         LogicalPlan::Update {
@@ -278,7 +296,7 @@ pub fn logical_to_physical_plan(
             returning,
         } => Ok(PhysicalPlan::Update {
             table_name,
-            from: Box::new(logical_to_physical_plan(*from, index_manager)?),
+            from: Box::new(logical_to_physical_plan(*from, ctx)?),
             set,
             returning,
         }),
@@ -286,26 +304,26 @@ pub fn logical_to_physical_plan(
             Ok(PhysicalPlan::AlterTable { table_name, action })
         }
         LogicalPlan::UnionAll { left, right } => Ok(PhysicalPlan::UnionAll {
-            left: Box::new(logical_to_physical_plan(*left, index_manager)?),
-            right: Box::new(logical_to_physical_plan(*right, index_manager)?),
+            left: Box::new(logical_to_physical_plan(*left, ctx)?),
+            right: Box::new(logical_to_physical_plan(*right, ctx)?),
         }),
         LogicalPlan::Intersect { left, right } => Ok(PhysicalPlan::Intersect {
-            left: Box::new(logical_to_physical_plan(*left, index_manager)?),
-            right: Box::new(logical_to_physical_plan(*right, index_manager)?),
+            left: Box::new(logical_to_physical_plan(*left, ctx)?),
+            right: Box::new(logical_to_physical_plan(*right, ctx)?),
         }),
         LogicalPlan::Except { left, right } => Ok(PhysicalPlan::Except {
-            left: Box::new(logical_to_physical_plan(*left, index_manager)?),
-            right: Box::new(logical_to_physical_plan(*right, index_manager)?),
+            left: Box::new(logical_to_physical_plan(*left, ctx)?),
+            right: Box::new(logical_to_physical_plan(*right, ctx)?),
         }),
         LogicalPlan::CreateIndex { statement } => Ok(PhysicalPlan::CreateIndex { statement }),
         LogicalPlan::Values { values } => Ok(PhysicalPlan::Values { values }),
         LogicalPlan::DistinctOn { input, expressions } => Ok(PhysicalPlan::DistinctOn {
-            input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+            input: Box::new(logical_to_physical_plan(*input, ctx)?),
             expressions,
         }),
         LogicalPlan::SubqueryScan { alias, input } => Ok(PhysicalPlan::SubqueryScan {
             alias,
-            input: Box::new(logical_to_physical_plan(*input, index_manager)?),
+            input: Box::new(logical_to_physical_plan(*input, ctx)?),
         }),
         LogicalPlan::RecursiveCteScan {
             alias,
@@ -316,8 +334,8 @@ pub fn logical_to_physical_plan(
         } => Ok(PhysicalPlan::RecursiveCteScan {
             alias,
             column_aliases,
-            non_recursive: Box::new(logical_to_physical_plan(*non_recursive, index_manager)?),
-            recursive: Box::new(logical_to_physical_plan(*recursive, index_manager)?),
+            non_recursive: Box::new(logical_to_physical_plan(*non_recursive, ctx)?),
+            recursive: Box::new(logical_to_physical_plan(*recursive, ctx)?),
             union_all,
         }),
         LogicalPlan::WorkingTableScan { cte_name, alias } => {

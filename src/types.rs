@@ -15,6 +15,7 @@ use crate::memory::MemoryManager;
 use crate::query_engine::ast::SelectStatement;
 use crate::schema::VirtualSchema;
 use crate::transaction::Transaction;
+use crate::storage::StorageEngine;
 
 // --- Core Data Structures ---
 
@@ -276,6 +277,14 @@ pub enum LogEntry {
         key: String,
         value: Vec<u8>,
     },
+    SetList {
+        key: String,
+        value: VecDeque<Vec<u8>>,
+    },
+    SetSet {
+        key: String,
+        value: HashSet<Vec<u8>>,
+    },
     Delete {
         key: String,
     },
@@ -432,7 +441,8 @@ impl FunctionRegistry {
 
 #[derive(Clone)]
 pub struct AppContext {
-    pub db: Db,
+    pub storage: Arc<dyn StorageEngine>, 
+    
     pub logger: Logger,
     pub index_manager: Arc<IndexManager>,
     pub json_cache: JsonCache,
@@ -441,9 +451,6 @@ pub struct AppContext {
     pub function_registry: Arc<FunctionRegistry>,
     pub config: Arc<Config>,
     pub memory: Arc<MemoryManager>,
-    pub tx_id_manager: Arc<TransactionIdManager>,
-    pub tx_status_manager: Arc<TransactionStatusManager>,
-    pub active_transactions: Arc<DashMap<TxId, Arc<Transaction>>>,
     pub table_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 

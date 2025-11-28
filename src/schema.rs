@@ -200,33 +200,25 @@ pub struct VirtualSchema {
     pub source: SchemaSource,
 }
 
-pub async fn load_schemas_from_db(
-    db: &Db,
-    schema_cache: &SchemaCache,
-    tx_status_manager: &TransactionStatusManager,
-    tx_id_manager: &TransactionIdManager,
-) -> Result<()> {
-    let startup_snapshot = crate::types::Snapshot::new(0, tx_status_manager, tx_id_manager);
-    let items_to_process: Vec<(String, VersionedValue)> = db
-        .iter()
-        .filter(|item| item.key().starts_with(SCHEMA_PREFIX))
-        .filter_map(|item| {
-            item.value()
-                .try_read()
-                .ok()
-                .and_then(|guard| {
-                    guard
-                        .iter()
-                        .rev()
-                        .find(|version| startup_snapshot.is_visible(version, tx_status_manager))
-                        .cloned()
-                })
-                .map(|version| (item.key().clone(), version))
-        })
-        .collect();
+impl VirtualSchema {
+    pub fn get_primary_key_column(&self) -> Option<String> {
+        for constraint in &self.constraints {
+            if let TableConstraint::PrimaryKey { columns, .. } = constraint {
+                return columns.first().cloned();
+            }
+        }
+        None
+    }
+}
 
-    for (key, latest_version) in items_to_process {
-        let schema_result: Result<VirtualSchema, _> = match &latest_version.value {
+pub async fn load_schemas_from_db(
+    storage: &Arc<dyn crate::storage::StorageEngine>,
+    schema_cache: &SchemaCache,
+) -> Result<()> {
+    let items_to_process = storage.prefix_scan(SCHEMA_PREFIX).await;
+
+    for (key, db_value) in items_to_process {
+        let schema_result: Result<VirtualSchema, _> = match &db_value {
             DbValue::Bytes(bytes) => serde_json::from_slice(bytes),
             DbValue::Json(json_value) => serde_json::from_value(json_value.clone()),
             _ => {

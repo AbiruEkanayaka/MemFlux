@@ -434,13 +434,12 @@ impl MemoryManager {
             };
 
             if let Some((key, old_freq)) = key_to_evict_info {
-                let old_value_for_index = if let Some(version_chain_lock) = ctx.db.get(&key) {
-                    let version_chain = version_chain_lock.read().await;
-                    version_chain.last().and_then(|v| match &v.value {
+                let old_value_for_index = if let Some(db_value) = ctx.storage.get(&key).await {
+                    match &db_value {
                         DbValue::Json(val) => Some(val.clone()),
                         DbValue::JsonB(b) => serde_json::from_slice(b).ok(),
                         _ => None,
-                    })
+                    }
                 } else {
                     None
                 };
@@ -482,14 +481,47 @@ impl MemoryManager {
                 }
 
                 // WAL write successful or persistence disabled, now evict from memory
-                if let Some(entry) = ctx.db.remove(&key) {
-                    let version_chain = entry.1.read().await;
-                    let mut total_size = 0;
-                    for version in version_chain.iter() {
-                        total_size += estimate_db_value_size(&version.value).await;
+                // Storage engine delete will handle memory decrement if it's the LegacyBackend
+                // But wait, LegacyBackend delete DECREMENTS memory.
+                // And WE are decrementing memory here too?
+                // Yes: `self.decrease_memory`.
+                // If `LegacyDashMapBackend::delete` also decrements, we double count.
+                
+                // `LegacyDashMapBackend::delete`:
+                // if self.memory_manager.is_enabled() { self.memory_manager.decrease_memory(old_size); }
+                
+                // So we should NOT decrement here if the backend does it.
+                // But `StorageEngine` is abstract. We don't know if it does.
+                // However, we are migrating. The target FluxMap backend handles memory internally.
+                // So `MemoryManager` shouldn't manually decrement.
+                // BUT `MemoryManager` logic here was for the OLD direct DashMap access.
+                // Now we delegate to `ctx.storage.delete`.
+                
+                // So: We should call `ctx.storage.delete(&key)`.
+                // And we should REMOVE the manual `decrease_memory` call here.
+                // Because `LegacyDashMapBackend` does it.
+                // And we should REMOVE the manual index update here?
+                // No, `LegacyDashMapBackend` does not update indexes (StorageExecutor did).
+                // Wait, `StorageExecutor::delete` updated indexes?
+                // `StorageExecutor` does index updates in `delete_rows` (for SQL) but `delete` (raw) just deletes.
+                // `MemoryManager` did index update?
+                // Yes:
+                /*
+                    if let Some(ref old_val) = old_value_for_index {
+                        ctx.index_manager
+                            .remove_key_from_indexes(&key, old_val)
+                            .await;
                     }
-                    self.decrease_memory(total_size + key.len() as u64);
-
+                */
+                // So we should keep the index update here.
+                
+                // The `old_size` calculation was also here.
+                // `LegacyDashMapBackend` calculates `old_size`.
+                
+                if let Ok(_) = ctx.storage.delete(&key).await {
+                    // Memory decrement is handled by storage engine (Legacy) or internally (FluxMap).
+                    // We just handle index cleanup.
+                    
                     if let Some(ref old_val) = old_value_for_index {
                         ctx.index_manager
                             .remove_key_from_indexes(&key, old_val)
