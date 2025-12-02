@@ -11,7 +11,9 @@ use crate::indexing::IndexManager;
 #[derive(Debug, Clone)]
 pub enum PhysicalPlan {
     TableScan {
+        table_name: String,
         prefix: String,
+        source: crate::schema::SchemaSource,
     },
     GraphMatch {
         query: String,
@@ -141,23 +143,23 @@ pub fn logical_to_physical_plan(
     let index_manager = &ctx.index_manager;
     match plan {
         LogicalPlan::TableScan { table_name } => {
-            let prefix = if let Some(schema) = ctx.schema_cache.get(&table_name) {
-                match schema.source {
+            let (prefix, source) = if let Some(schema) = ctx.schema_cache.get(&table_name) {
+                let p = match schema.source {
                     crate::schema::SchemaSource::GraphNode => {
                         format!("_node:{}:", table_name)
                     }
                     crate::schema::SchemaSource::GraphRelationship => {
-                        // This is a simplification. A full implementation would need to
-                        // handle different query patterns on relationships. For now,
-                        // scanning outgoing edges is a reasonable default for `SELECT *`.
+                        // Scanning outgoing edges is a reasonable default for `SELECT *`.
+                        // We will filter by type in execution.
                         format!("_edge:out:")
                     }
                     _ => format!("{}:", table_name),
-                }
+                };
+                (p, schema.source.clone())
             } else {
-                format!("{}:", table_name)
+                (format!("{}:", table_name), crate::schema::SchemaSource::Native)
             };
-            Ok(PhysicalPlan::TableScan { prefix })
+            Ok(PhysicalPlan::TableScan { table_name, prefix, source })
         }
         LogicalPlan::Filter { input, predicate } => {
             if let Some((col, val)) = extract_col_eq_literal(&predicate) {

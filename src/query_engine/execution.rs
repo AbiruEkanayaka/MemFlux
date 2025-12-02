@@ -198,17 +198,15 @@ pub fn execute<'a>(
     transaction_handle: Option<TransactionHandle>,
 ) -> Pin<Box<dyn Stream<Item = Result<Row>> + Send + 'a>> {
     Box::pin(try_stream! {        match plan {
-            PhysicalPlan::TableScan { prefix } => {
-                let table_name = prefix.strip_suffix(':').unwrap_or(&prefix).to_string();
+            PhysicalPlan::TableScan { table_name, prefix, source } => {
+                // Extract table name from prefix if it's a simple scan, but for Graph scans we rely on table_name from the plan
+                // let table_name = ...; // We use the passed table_name
 
                 let tx_guard_read = if let Some(handle) = &transaction_handle {
                     Some(handle.read().await)
                 } else {
                     None
                 };
-                // tx_opt is Option<&Box<dyn StorageTransaction>>
-                // We need Option<&dyn StorageTransaction> for get_visible_db_value
-                // deref of Box<dyn T> is dyn T.
                 let tx_ref = tx_guard_read.as_ref().map(|guard| guard.as_deref()).flatten();
 
                 let scanned_items = if let Some(tx) = tx_ref {
@@ -218,23 +216,74 @@ pub fn execute<'a>(
                 };
 
                 for (key, db_value) in scanned_items {
-                        let mut value = match db_value {
-                            DbValue::Json(v) => v.clone(),
-                            DbValue::JsonB(b) => serde_json::from_slice(&b)?,
-                            _ => json!({}), // Or handle error for non-json types in tables
-                        };
-                        if let Some(obj) = value.as_object_mut() {
-                            let key_without_prefix = key.strip_prefix(&prefix).unwrap_or(&key);
-                            let id_from_key =
-                                key_without_prefix.strip_suffix(':').unwrap_or(key_without_prefix);
-                            if !obj.contains_key("id") {
-                                obj.insert("id".to_string(), json!(id_from_key));
-                            }
-                            obj.insert("_key".to_string(), json!(key));
+                    match source {
+                        SchemaSource::GraphNode => {
+                            let properties = match db_value {
+                                DbValue::Json(v) => v.clone(),
+                                DbValue::JsonB(b) => serde_json::from_slice(&b).unwrap_or(json!({})),
+                                _ => continue,
+                            };
+                            
+                            let id = key.split(':').last().unwrap_or("");
+                            
+                            // Structure: {_id, properties}
+                            let mut row_val = json!({});
+                            row_val["_id"] = json!(id);
+                            row_val["properties"] = properties;
+                            
+                            let mut new_row = json!({});
+                            new_row[table_name.clone()] = row_val;
+                            yield new_row;
                         }
-                        let mut new_row = json!({});
-                        new_row[table_name.clone()] = value;
-                        yield new_row;
+                        SchemaSource::GraphRelationship => {
+                            // Key: _edge:out:StartID:Type:EndID:ID
+                            let parts: Vec<&str> = key.split(':').collect();
+                            if parts.len() < 6 { continue; }
+                            let rel_type = parts[3];
+                            
+                            if rel_type != table_name { continue; }
+                            
+                            let start_id = parts[2];
+                            let end_id = parts[4];
+                            let id = parts[5];
+                            
+                            let properties = match db_value {
+                                DbValue::Json(v) => v.clone(),
+                                DbValue::JsonB(b) => serde_json::from_slice(&b).unwrap_or(json!({})),
+                                _ => continue,
+                            };
+                            
+                            // Structure: {_id, _from_id, _to_id, properties}
+                            let mut row_val = json!({});
+                            row_val["_id"] = json!(id);
+                            row_val["_from_id"] = json!(start_id);
+                            row_val["_to_id"] = json!(end_id);
+                            row_val["properties"] = properties;
+                            
+                            let mut new_row = json!({});
+                            new_row[table_name.clone()] = row_val;
+                            yield new_row;
+                        }
+                        _ => {
+                            let mut value = match db_value {
+                                DbValue::Json(v) => v.clone(),
+                                DbValue::JsonB(b) => serde_json::from_slice(&b)?,
+                                _ => json!({}),
+                            };
+                            if let Some(obj) = value.as_object_mut() {
+                                let key_without_prefix = key.strip_prefix(&prefix).unwrap_or(&key);
+                                let id_from_key =
+                                    key_without_prefix.strip_suffix(':').unwrap_or(key_without_prefix);
+                                if !obj.contains_key("id") {
+                                    obj.insert("id".to_string(), json!(id_from_key));
+                                }
+                                obj.insert("_key".to_string(), json!(key));
+                            }
+                            let mut new_row = json!({});
+                            new_row[table_name.clone()] = value;
+                            yield new_row;
+                        }
+                    }
                 }
             }
             PhysicalPlan::IndexScan { index_name, key } => {
