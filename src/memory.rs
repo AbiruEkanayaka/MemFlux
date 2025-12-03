@@ -14,13 +14,11 @@ pub async fn estimate_db_value_size(value: &DbValue) -> u64 {
     match value {
         DbValue::Json(v) => v.to_string().len() as u64,
         DbValue::Bytes(b) => b.len() as u64,
-        DbValue::List(lock) => {
-            let list = lock.read().await;
+        DbValue::List(list) => {
             list.iter()
                 .fold(0u64, |acc, v| acc.saturating_add(v.len() as u64))
         }
-        DbValue::Set(lock) => {
-            let set = lock.read().await;
+        DbValue::Set(set) => {
             set.iter()
                 .fold(0u64, |acc, v| acc.saturating_add(v.len() as u64))
         }

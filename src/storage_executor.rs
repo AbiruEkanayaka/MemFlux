@@ -344,7 +344,7 @@ impl StorageExecutor {
         let current_db_val = get_visible_db_value(&key, &self.ctx, tx_opt).await;
         
         let mut current_list = match current_db_val {
-            Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
+            Some(DbValue::List(list)) => list.clone(),
             Some(_) => {
                 return Response::Error(
                     "WRONGTYPE Operation against a non-list value".to_string(),
@@ -357,7 +357,7 @@ impl StorageExecutor {
             current_list.push_front(v);
         }
         let new_len = current_list.len() as i64;
-        let new_val = DbValue::List(RwLock::new(current_list));
+        let new_val = DbValue::List(current_list);
 
         if let Some(tx) = tx_guard.as_mut() {
             if let Err(e) = tx.set(key, new_val).await {
@@ -379,7 +379,7 @@ impl StorageExecutor {
         
         let current_db_val = get_visible_db_value(&key, &self.ctx, tx_opt).await;
         let mut current_list = match current_db_val {
-            Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
+            Some(DbValue::List(list)) => list.clone(),
             Some(_) => {
                 return Response::Error(
                     "WRONGTYPE Operation against a non-list value".to_string(),
@@ -392,7 +392,7 @@ impl StorageExecutor {
             current_list.push_back(v);
         }
         let new_len = current_list.len() as i64;
-        let new_val = DbValue::List(RwLock::new(current_list));
+        let new_val = DbValue::List(current_list);
 
         if let Some(tx) = tx_guard.as_mut() {
             if let Err(e) = tx.set(key, new_val).await {
@@ -414,7 +414,7 @@ impl StorageExecutor {
         
         let current_db_val = get_visible_db_value(&key, &self.ctx, tx_opt).await;
         let mut current_list = match current_db_val {
-            Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
+            Some(DbValue::List(list)) => list.clone(),
             Some(_) => {
                 return Response::Error(
                     "WRONGTYPE Operation against a non-list value".to_string(),
@@ -436,7 +436,7 @@ impl StorageExecutor {
             }
         }
         
-        let new_val = DbValue::List(RwLock::new(current_list));
+        let new_val = DbValue::List(current_list);
 
         if let Some(tx) = tx_guard.as_mut() {
             if let Err(e) = tx.set(key, new_val).await {
@@ -459,7 +459,7 @@ impl StorageExecutor {
         
         let current_db_val = get_visible_db_value(&key, &self.ctx, tx_opt).await;
         let mut current_list = match current_db_val {
-            Some(DbValue::List(list_lock)) => list_lock.read().await.clone(),
+            Some(DbValue::List(list)) => list.clone(),
             Some(_) => {
                 return Response::Error(
                     "WRONGTYPE Operation against a non-list value".to_string(),
@@ -481,7 +481,7 @@ impl StorageExecutor {
             }
         }
         
-        let new_val = DbValue::List(RwLock::new(current_list));
+        let new_val = DbValue::List(current_list);
 
         if let Some(tx) = tx_guard.as_mut() {
             if let Err(e) = tx.set(key, new_val).await {
@@ -504,7 +504,7 @@ impl StorageExecutor {
         
         let current_db_val = get_visible_db_value(&key, &self.ctx, tx_opt).await;
         let mut current_set = match current_db_val {
-            Some(DbValue::Set(set_lock)) => set_lock.read().await.clone(),
+            Some(DbValue::Set(set)) => set.clone(),
             Some(_) => {
                 return Response::Error(
                     "WRONGTYPE Operation against a non-set value".to_string(),
@@ -520,7 +520,7 @@ impl StorageExecutor {
             }
         }
         
-        let new_val = DbValue::Set(RwLock::new(current_set));
+        let new_val = DbValue::Set(current_set);
 
         if let Some(tx) = tx_guard.as_mut() {
             if let Err(e) = tx.set(key, new_val).await {
@@ -542,7 +542,7 @@ impl StorageExecutor {
         
         let current_db_val = get_visible_db_value(&key, &self.ctx, tx_opt).await;
         let mut current_set = match current_db_val {
-            Some(DbValue::Set(set_lock)) => set_lock.read().await.clone(),
+            Some(DbValue::Set(set)) => set.clone(),
             Some(_) => {
                 return Response::Error(
                     "WRONGTYPE Operation against a non-set value".to_string(),
@@ -558,7 +558,7 @@ impl StorageExecutor {
             }
         }
         
-        let new_val = DbValue::Set(RwLock::new(current_set));
+        let new_val = DbValue::Set(current_set);
 
         if let Some(tx) = tx_guard.as_mut() {
             if let Err(e) = tx.set(key, new_val).await {

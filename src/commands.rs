@@ -962,8 +962,7 @@ async fn handle_llen(
 
     let tx_guard = transaction_handle.read().await;
     match get_visible_db_value(&key, &ctx, tx_guard.as_deref()).await {
-        Some(DbValue::List(list_lock)) => {
-            let list = list_lock.read().await;
+        Some(DbValue::List(list)) => {
             Response::Integer(list.len() as i64)
         }
         Some(_) => Response::Error("WRONGTYPE Operation against a non-list value".to_string()),
@@ -1000,8 +999,7 @@ async fn handle_lrange(
 
     let tx_guard = transaction_handle.read().await;
     match get_visible_db_value(&key, &ctx, tx_guard.as_deref()).await {
-        Some(DbValue::List(list_lock)) => {
-            let list = list_lock.read().await;
+        Some(DbValue::List(list)) => {
             let len = list.len() as i64;
             let start = if start < 0 { len + start } else { start };
             let stop = if stop < 0 { len + stop } else { stop };
@@ -1077,8 +1075,7 @@ async fn handle_smembers(
 
     let tx_guard = transaction_handle.read().await;
     match get_visible_db_value(&key, &ctx, tx_guard.as_deref()).await {
-        Some(DbValue::Set(set_lock)) => {
-            let set = set_lock.read().await;
+        Some(DbValue::Set(set)) => {
             let members: Vec<Vec<u8>> = set.iter().cloned().collect();
             Response::MultiBytes(members)
         }
@@ -1102,8 +1099,7 @@ async fn handle_scard(
 
     let tx_guard = transaction_handle.read().await;
     match get_visible_db_value(&key, &ctx, tx_guard.as_deref()).await {
-        Some(DbValue::Set(set_lock)) => {
-            let set = set_lock.read().await;
+        Some(DbValue::Set(set)) => {
             Response::Integer(set.len() as i64)
         }
         Some(_) => Response::Error("WRONGTYPE Operation against a non-set value".to_string()),
@@ -1127,8 +1123,7 @@ async fn handle_sismember(
 
     let tx_guard = transaction_handle.read().await;
     match get_visible_db_value(&key, &ctx, tx_guard.as_deref()).await {
-        Some(DbValue::Set(set_lock)) => {
-            let set = set_lock.read().await;
+        Some(DbValue::Set(set)) => {
             if set.contains(member) {
                 Response::Integer(1)
             } else {

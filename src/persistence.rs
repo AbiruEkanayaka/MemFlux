@@ -505,7 +505,7 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
             }
             LogEntry::SetList { key, value } => {
                 let new_version = VersionedValue {
-                    value: DbValue::List(RwLock::new(value)),
+                    value: DbValue::List(value),
                     creator_txid: 0,
                     expirer_txid: 0,
                 };
@@ -513,7 +513,7 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
             }
             LogEntry::SetSet { key, value } => {
                 let new_version = VersionedValue {
-                    value: DbValue::Set(RwLock::new(value)),
+                    value: DbValue::Set(value),
                     creator_txid: 0,
                     expirer_txid: 0,
                 };
@@ -602,15 +602,15 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                     .entry(key)
                     .or_insert_with(|| {
                         Arc::new(RwLock::new(vec![VersionedValue {
-                            value: DbValue::List(RwLock::new(VecDeque::new())),
+                            value: DbValue::List(VecDeque::new()),
                             creator_txid: 0,
                             expirer_txid: 0,
                         }]))
                     })
                     .clone();
-                if let Some(latest_version) = version_chain_arc.write().await.last_mut() {
-                    if let DbValue::List(list_lock) = &mut latest_version.value {
-                        let mut list = list_lock.write().await;
+                let mut version_chain = version_chain_arc.write().await;
+                if let Some(latest_version) = version_chain.last_mut() {
+                    if let DbValue::List(list) = &mut latest_version.value {
                         for v in values {
                             list.push_front(v);
                         }
@@ -622,15 +622,15 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                     .entry(key)
                     .or_insert_with(|| {
                         Arc::new(RwLock::new(vec![VersionedValue {
-                            value: DbValue::List(RwLock::new(VecDeque::new())),
+                            value: DbValue::List(VecDeque::new()),
                             creator_txid: 0,
                             expirer_txid: 0,
                         }]))
                     })
                     .clone();
-                if let Some(latest_version) = version_chain_arc.write().await.last_mut() {
-                    if let DbValue::List(list_lock) = &mut latest_version.value {
-                        let mut list = list_lock.write().await;
+                let mut version_chain = version_chain_arc.write().await;
+                if let Some(latest_version) = version_chain.last_mut() {
+                    if let DbValue::List(list) = &mut latest_version.value {
                         for v in values {
                             list.push_back(v);
                         }
@@ -641,9 +641,9 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                 if let Some(entry) = db.get(&key) {
                     let version_chain_arc = entry.value().clone();
                     drop(entry);
-                    if let Some(latest_version) = version_chain_arc.write().await.last_mut() {
-                        if let DbValue::List(list_lock) = &mut latest_version.value {
-                            let mut list = list_lock.write().await;
+                    let mut version_chain = version_chain_arc.write().await;
+                    if let Some(latest_version) = version_chain.last_mut() {
+                        if let DbValue::List(list) = &mut latest_version.value {
                             for _ in 0..count {
                                 if list.pop_front().is_none() {
                                     break;
@@ -657,9 +657,9 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                 if let Some(entry) = db.get(&key) {
                     let version_chain_arc = entry.value().clone();
                     drop(entry);
-                    if let Some(latest_version) = version_chain_arc.write().await.last_mut() {
-                        if let DbValue::List(list_lock) = &mut latest_version.value {
-                            let mut list = list_lock.write().await;
+                    let mut version_chain = version_chain_arc.write().await;
+                    if let Some(latest_version) = version_chain.last_mut() {
+                        if let DbValue::List(list) = &mut latest_version.value {
                             for _ in 0..count {
                                 if list.pop_back().is_none() {
                                     break;
@@ -674,15 +674,15 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                     .entry(key)
                     .or_insert_with(|| {
                         Arc::new(RwLock::new(vec![VersionedValue {
-                            value: DbValue::Set(RwLock::new(HashSet::new())),
+                            value: DbValue::Set(HashSet::new()),
                             creator_txid: 0,
                             expirer_txid: 0,
                         }]))
                     })
                     .clone();
-                if let Some(latest_version) = version_chain_arc.write().await.last_mut() {
-                    if let DbValue::Set(set_lock) = &mut latest_version.value {
-                        let mut set = set_lock.write().await;
+                let mut version_chain = version_chain_arc.write().await;
+                if let Some(latest_version) = version_chain.last_mut() {
+                    if let DbValue::Set(set) = &mut latest_version.value {
                         for m in members {
                             set.insert(m);
                         }
@@ -693,9 +693,9 @@ async fn replay_wal(wal_path: &str, db: &Db) -> Result<()> {
                 if let Some(entry) = db.get(&key) {
                     let version_chain_arc = entry.value().clone();
                     drop(entry);
-                    if let Some(latest_version) = version_chain_arc.write().await.last_mut() {
-                        if let DbValue::Set(set_lock) = &mut latest_version.value {
-                            let mut set = set_lock.write().await;
+                    let mut version_chain = version_chain_arc.write().await;
+                    if let Some(latest_version) = version_chain.last_mut() {
+                        if let DbValue::Set(set) = &mut latest_version.value {
                             for m in members {
                                 set.remove(&m);
                             }

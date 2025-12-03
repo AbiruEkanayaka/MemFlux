@@ -72,31 +72,26 @@ impl MemFluxDB {
 
         let tx_id_manager = Arc::new(TransactionIdManager::new());
         let tx_status_manager = Arc::new(TransactionStatusManager::new());
-        let active_transactions = Arc::new(DashMap::new());
+        // let active_transactions = Arc::new(DashMap::new()); // No longer used with FluxMap
 
-        let (logger, persistence_handle) = if config.persistence {
-            let (persistence_engine, logger) = PersistenceEngine::new(
-                &config,
-                db.clone(),
-                tx_status_manager.clone(),
-                tx_id_manager.clone(),
-            );
-            let handle = tokio::spawn(async move {
-                if let Err(e) = persistence_engine.run().await {
-                    eprintln!("Fatal error in persistence engine: {}", e);
-                }
-            });
-            (logger, Some(handle))
-        } else {
+        // Create a dummy logger channel to satisfy AppContext.
+        // FluxMap handles its own logging internally if configured.
+        let (logger, persistence_handle) = {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<PersistenceRequest>(1024);
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 while let Some(req) = rx.recv().await {
-                    if let PersistenceRequest::Log(log_req) = req {
-                        let _ = log_req.ack.send(Ok(()));
+                    match req {
+                        PersistenceRequest::Log(log_req) => {
+                            // Auto-ack legacy log requests so they don't hang if called
+                            let _ = log_req.ack.send(Ok(()));
+                        }
+                        PersistenceRequest::Sync(ack) => {
+                            let _ = ack.send(Ok(()));
+                        }
                     }
                 }
             });
-            (tx, None)
+            (tx, Some(handle))
         };
 
         let memory_manager = Arc::new(MemoryManager::new(
@@ -114,15 +109,15 @@ impl MemFluxDB {
             );
         }
 
-        let backend = crate::storage::legacy::LegacyDashMapBackend::new(
-            db.clone(),
-            tx_id_manager.clone(),
-            tx_status_manager.clone(),
-            logger.clone(),
-            config.durability.clone(),
-            active_transactions.clone(),
-            memory_manager.clone(),
-        );
+        // Initialize FluxMap database (in-memory for Phase 1)
+        // Note: Persistence and full memory management integration will be completed in later phases.
+        // For now, we initialize an in-memory FluxMap database.
+        let flux_db = match fluxmap::db::Database::new_in_memory().await {
+            Ok(db) => Arc::new(db),
+            Err(e) => return Err(anyhow::anyhow!("Failed to initialize FluxMap: {}", e)),
+        };
+
+        let backend = crate::storage::flux::FluxMapBackend::new(flux_db.clone());
         let storage: Arc<dyn crate::storage::StorageEngine> = Arc::new(backend);
 
         let schema_cache = Arc::new(DashMap::new());

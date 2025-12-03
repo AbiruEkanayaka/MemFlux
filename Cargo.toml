@@ -33,6 +33,7 @@ rayon = "1.11.0"
 rand = "0.8"
 hex = "0.4"
 base64 = "0.22.1"
+fluxmap = { path = "./fluxmap" }
 
 # FFI dependencies
 libc = "0.2"

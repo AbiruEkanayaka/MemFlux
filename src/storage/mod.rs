@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use crate::types::{DbValue, TxId};
 use anyhow::Result;
 
-pub mod legacy;
+pub mod flux;
 
 // Abstract the concept of a Transaction
 #[async_trait]

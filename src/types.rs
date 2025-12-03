@@ -17,6 +17,8 @@ use crate::schema::VirtualSchema;
 use crate::transaction::Transaction;
 use crate::storage::StorageEngine;
 
+use fluxmap::mem::MemSize;
+
 // --- Core Data Structures ---
 
 // NEW: MVCC Types
@@ -186,32 +188,15 @@ impl Snapshot {
 // END NEW
 // END NEW
 
+#[derive(Clone, Serialize, Deserialize)]
 pub enum DbValue {
     Json(Value),
     JsonB(Vec<u8>),
-    List(RwLock<VecDeque<Vec<u8>>>),
-    Set(RwLock<HashSet<Vec<u8>>>),
+    // Removed RwLock. Values are now immutable versions.
+    List(VecDeque<Vec<u8>>),
+    Set(HashSet<Vec<u8>>),
     Bytes(Vec<u8>),
     Array(Vec<Value>),
-}
-
-impl Clone for DbValue {
-    fn clone(&self) -> Self {
-        match self {
-            DbValue::Json(v) => DbValue::Json(v.clone()),
-            DbValue::JsonB(b) => DbValue::JsonB(b.clone()),
-            DbValue::Bytes(b) => DbValue::Bytes(b.clone()),
-            DbValue::Array(a) => DbValue::Array(a.clone()),
-            DbValue::List(lock) => {
-                let list = tokio::task::block_in_place(|| lock.blocking_read().clone());
-                DbValue::List(RwLock::new(list))
-            }
-            DbValue::Set(lock) => {
-                let set = tokio::task::block_in_place(|| lock.blocking_read().clone());
-                DbValue::Set(RwLock::new(set))
-            }
-        }
-    }
 }
 
 impl fmt::Debug for DbValue {
@@ -219,10 +204,29 @@ impl fmt::Debug for DbValue {
         match self {
             DbValue::Json(v) => write!(f, "Json({:?})", v),
             DbValue::JsonB(b) => write!(f, "JsonB({:?})", b),
-            DbValue::List(_) => write!(f, "List(<RwLock>)"),
-            DbValue::Set(_) => write!(f, "Set(<RwLock>)"),
+            DbValue::List(l) => write!(f, "List(len={})", l.len()),
+            DbValue::Set(s) => write!(f, "Set(len={})", s.len()),
             DbValue::Bytes(b) => write!(f, "Bytes({:?})", String::from_utf8_lossy(b)),
             DbValue::Array(a) => write!(f, "Array({:?})", a),
+        }
+    }
+}
+
+impl MemSize for DbValue {
+    fn mem_size(&self) -> usize {
+        match self {
+            DbValue::Json(v) => v.to_string().capacity(),
+            DbValue::JsonB(b) => b.mem_size(),
+            DbValue::Bytes(b) => b.mem_size(),
+            DbValue::List(list) => {
+                std::mem::size_of::<VecDeque<Vec<u8>>>() + list.iter().map(|v| v.mem_size()).sum::<usize>()
+            }
+            DbValue::Set(set) => {
+                std::mem::size_of::<HashSet<Vec<u8>>>() + set.iter().map(|v| v.mem_size()).sum::<usize>()
+            }
+            DbValue::Array(a) => {
+                std::mem::size_of::<Vec<Value>>() + a.iter().map(|v| v.to_string().capacity()).sum::<usize>()
+            }
         }
     }
 }
@@ -243,12 +247,10 @@ impl SerializableDbValue {
             DbValue::Json(v) => SerializableDbValue::Json(v.clone()),
             DbValue::JsonB(b) => SerializableDbValue::JsonB(b.clone()),
             DbValue::Bytes(b) => SerializableDbValue::Bytes(b.clone()),
-            DbValue::List(lock) => {
-                let list = lock.read().await;
+            DbValue::List(list) => {
                 SerializableDbValue::List(list.clone())
             }
-            DbValue::Set(lock) => {
-                let set = lock.read().await;
+            DbValue::Set(set) => {
                 SerializableDbValue::Set(set.iter().cloned().collect())
             }
             DbValue::Array(a) => SerializableDbValue::Array(a.clone()),
@@ -260,8 +262,8 @@ impl SerializableDbValue {
             SerializableDbValue::Json(v) => DbValue::Json(v),
             SerializableDbValue::JsonB(b) => DbValue::JsonB(b),
             SerializableDbValue::Bytes(b) => DbValue::Bytes(b),
-            SerializableDbValue::List(v) => DbValue::List(RwLock::new(v)),
-            SerializableDbValue::Set(v) => DbValue::Set(RwLock::new(v.into_iter().collect())),
+            SerializableDbValue::List(v) => DbValue::List(v),
+            SerializableDbValue::Set(v) => DbValue::Set(v.into_iter().collect()),
             SerializableDbValue::Array(a) => DbValue::Array(a),
         }
     }
